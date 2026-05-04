@@ -22,6 +22,7 @@ use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
 type RemoteCacheKey = (Url, Option<SocketAddr>);
 type RemoteSlot = Arc<Mutex<Option<Remote>>>;
 type TrackCacheKey = (TrackNamespace, String);
+type TrackSlot = Arc<Mutex<Option<TrackReader>>>;
 
 /// Manages connections to remote relays.
 ///
@@ -104,41 +105,62 @@ impl RemoteManager {
             })?,
         };
 
-        // The manager lock only protects the map. The per-key slot lock protects
-        // that key's connection state, so unrelated remotes can connect in parallel.
-        let slot = {
-            let mut remotes = self.remotes.lock().await;
-            remotes
-                .entry(cache_key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(None)))
-                .clone()
-        };
+        loop {
+            // The manager lock only protects the map. The per-key slot lock protects
+            // that key's connection state, so unrelated remotes can connect in parallel.
+            let slot = {
+                let mut remotes = self.remotes.lock().await;
+                remotes
+                    .entry(cache_key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(None)))
+                    .clone()
+            };
 
-        let mut cached = slot.lock().await;
+            let mut cached = slot.lock().await;
 
-        if let Some(remote) = cached.as_ref() {
-            if remote.is_connected() {
-                return Ok(remote.clone());
+            let is_current_slot = {
+                let remotes = self.remotes.lock().await;
+                matches!(remotes.get(&cache_key), Some(current) if Arc::ptr_eq(current, &slot))
+            };
+
+            if !is_current_slot {
+                continue;
             }
 
-            tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
-        };
+            if let Some(remote) = cached.as_ref() {
+                if remote.is_connected() {
+                    return Ok(remote.clone());
+                }
 
-        if let Some(remote) = cached.take() {
-            remote.shutdown().await;
+                tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
+            };
+
+            if let Some(remote) = cached.take() {
+                remote.shutdown().await;
+            }
+
+            tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
+            let remote = match Remote::connect(
+                cache_key.0.clone(),
+                cache_key.1,
+                client,
+                Arc::downgrade(&self.remotes),
+                cache_key.clone(),
+                Arc::downgrade(&slot),
+            )
+            .await
+            {
+                Ok(remote) => remote,
+                Err(err) => {
+                    drop(cached);
+                    remove_empty_remote_slot(&self.remotes, &cache_key, &slot).await;
+                    return Err(err);
+                }
+            };
+
+            *cached = Some(remote.clone());
+            return Ok(remote);
         }
-
-        tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
-        let remote = Remote::connect(
-            cache_key.0.clone(),
-            cache_key.1,
-            client,
-            Arc::downgrade(&slot),
-        )
-        .await?;
-
-        *cached = Some(remote.clone());
-        Ok(remote)
     }
 
     async fn remove_if_same_remote(&self, cache_key: &RemoteCacheKey, remote: &Remote) {
@@ -147,18 +169,19 @@ impl RemoteManager {
             remotes.get(cache_key).cloned()
         };
 
-        let removed = if let Some(slot) = slot {
-            let mut cached = slot.lock().await;
-            match cached.as_ref() {
-                Some(current) if current.is_same_connection(remote) => cached.take(),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        if let Some(slot) = slot {
+            let removed = {
+                let mut cached = slot.lock().await;
+                match cached.as_ref() {
+                    Some(current) if current.is_same_connection(remote) => cached.take(),
+                    _ => None,
+                }
+            };
 
-        if let Some(remote) = removed {
-            remote.shutdown().await;
+            if let Some(remote) = removed {
+                remote.shutdown().await;
+                remove_empty_remote_slot(&self.remotes, cache_key, &slot).await;
+            }
         }
     }
 
@@ -179,13 +202,45 @@ impl RemoteManager {
     }
 }
 
+async fn remove_empty_remote_slot(
+    remotes: &Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+    cache_key: &RemoteCacheKey,
+    slot: &RemoteSlot,
+) {
+    let cached = slot.lock().await;
+    if cached.is_some() {
+        return;
+    }
+
+    let mut remotes = remotes.lock().await;
+    if matches!(remotes.get(cache_key), Some(current) if Arc::ptr_eq(current, slot)) {
+        remotes.remove(cache_key);
+    }
+}
+
+async fn remove_empty_track_slot(
+    tracks: &Arc<Mutex<HashMap<TrackCacheKey, TrackSlot>>>,
+    key: &TrackCacheKey,
+    slot: &TrackSlot,
+) {
+    let cached = slot.lock().await;
+    if cached.is_some() {
+        return;
+    }
+
+    let mut tracks = tracks.lock().await;
+    if matches!(tracks.get(key), Some(current) if Arc::ptr_eq(current, slot)) {
+        tracks.remove(key);
+    }
+}
+
 /// A connection to a single remote relay with its own QUIC client.
 #[derive(Clone)]
 struct Remote {
     url: Url,
     subscriber: moq_transport::session::Subscriber,
     /// Track subscriptions keyed by full track name.
-    tracks: Arc<Mutex<HashMap<TrackCacheKey, TrackReader>>>,
+    tracks: Arc<Mutex<HashMap<TrackCacheKey, TrackSlot>>>,
     /// Flag indicating if the connection is still alive.
     connected: Arc<AtomicBool>,
     /// Cancellation token for the session task.
@@ -198,6 +253,8 @@ impl Remote {
         url: Url,
         addr: Option<SocketAddr>,
         client: &quic::Client,
+        remotes: Weak<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+        cache_key: RemoteCacheKey,
         cache_slot: Weak<Mutex<Option<Remote>>>,
     ) -> anyhow::Result<Self> {
         let (session, _quic_client_initial_cid, transport) = match client.connect(&url, addr).await
@@ -246,11 +303,20 @@ impl Remote {
             session_connected.store(false, Ordering::Release);
 
             if let Some(cache_slot) = cache_slot.upgrade() {
+                let mut cleared = false;
                 let mut cached = cache_slot.lock().await;
                 if matches!(cached.as_ref(), Some(remote) if Arc::ptr_eq(&remote.connected, &session_connected))
                 {
                     cached.take();
+                    cleared = true;
                     tracing::info!(remote_url = %session_url, "cleared closed remote connection from cache");
+                }
+                drop(cached);
+
+                if cleared {
+                    if let Some(remotes) = remotes.upgrade() {
+                        remove_empty_remote_slot(&remotes, &cache_key, &cache_slot).await;
+                    }
                 }
             }
         });
@@ -286,76 +352,102 @@ impl Remote {
         namespace: TrackNamespace,
         track_name: String,
     ) -> anyhow::Result<Option<TrackReader>> {
-        if !self.is_connected() {
-            anyhow::bail!("remote connection to {} is closed", self.url);
-        }
-
         let key = (namespace.clone(), track_name.clone());
 
-        {
-            let mut tracks = self.tracks.lock().await;
-            if let Some(reader) = tracks.get(&key) {
+        loop {
+            if !self.is_connected() {
+                anyhow::bail!("remote connection to {} is closed", self.url);
+            }
+
+            let slot = {
+                let mut tracks = self.tracks.lock().await;
+                tracks
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(None)))
+                    .clone()
+            };
+
+            let mut cached = slot.lock().await;
+
+            let is_current_slot = {
+                let tracks = self.tracks.lock().await;
+                matches!(tracks.get(&key), Some(current) if Arc::ptr_eq(current, &slot))
+            };
+
+            if !is_current_slot {
+                continue;
+            }
+
+            if let Some(reader) = cached.as_ref() {
                 if !reader.is_closed() {
                     return Ok(Some(reader.clone()));
                 }
 
                 tracing::debug!(remote_url = %self.url, namespace = %key.0, track = %key.1, "removing closed remote track from cache");
-                tracks.remove(&key);
             }
-        }
 
-        let mut subscriber = self.subscriber.clone();
-        let url = self.url.clone();
-        let tracks = Arc::downgrade(&self.tracks);
-        let cancel = self.cancel.clone();
+            cached.take();
 
-        tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
+            let mut subscriber = self.subscriber.clone();
+            let url = self.url.clone();
+            let tracks = Arc::downgrade(&self.tracks);
+            let cancel = self.cancel.clone();
 
-        let (writer, reader) = Track::new(namespace, track_name).produce();
-        let subscribe = subscriber.subscribe_open(writer).await?;
+            tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
-        {
-            let mut tracks = self.tracks.lock().await;
-            if let Some(current) = tracks.get(&key) {
-                if !current.is_closed() {
-                    return Ok(Some(current.clone()));
+            let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+            let subscribe = match subscriber.subscribe_open(writer).await {
+                Ok(subscribe) => subscribe,
+                Err(err) => {
+                    drop(cached);
+                    remove_empty_track_slot(&self.tracks, &key, &slot).await;
+                    return Err(err.into());
                 }
+            };
 
-                tracks.remove(&key);
+            if !self.is_connected() {
+                drop(cached);
+                remove_empty_track_slot(&self.tracks, &key, &slot).await;
+                anyhow::bail!("remote connection to {} is closed", self.url);
             }
 
-            tracks.insert(key.clone(), reader.clone());
-        }
+            *cached = Some(reader.clone());
+            drop(cached);
 
-        let cleanup_key = key.clone();
-        let cleanup_reader = reader.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                result = subscribe.closed() => {
-                    match result {
-                        Ok(()) => {
-                            tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription ended");
-                        }
-                        Err(err) => {
-                            tracing::warn!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, error = %err, "remote track subscription ended with error: {}", err);
+            let cleanup_key = key.clone();
+            let cleanup_reader = reader.clone();
+            let cleanup_slot = slot.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    result = subscribe.closed() => {
+                        match result {
+                            Ok(()) => {
+                                tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription ended");
+                            }
+                            Err(err) => {
+                                tracing::warn!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, error = %err, "remote track subscription ended with error: {}", err);
+                            }
                         }
                     }
+                    _ = cancel.cancelled() => {
+                        tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
+                    }
                 }
-                _ = cancel.cancelled() => {
-                    tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
-                }
-            }
 
-            if let Some(tracks) = tracks.upgrade() {
-                let mut tracks = tracks.lock().await;
-                if matches!(tracks.get(&cleanup_key), Some(current) if Arc::ptr_eq(&current.info, &cleanup_reader.info))
-                {
-                    tracks.remove(&cleanup_key);
-                }
-            }
-        });
+                if let Some(tracks) = tracks.upgrade() {
+                    let mut cached = cleanup_slot.lock().await;
+                    if matches!(cached.as_ref(), Some(current) if Arc::ptr_eq(&current.info, &cleanup_reader.info))
+                    {
+                        cached.take();
+                    }
+                    drop(cached);
 
-        Ok(Some(reader))
+                    remove_empty_track_slot(&tracks, &cleanup_key, &cleanup_slot).await;
+                }
+            });
+
+            return Ok(Some(reader));
+        }
     }
 }
 
