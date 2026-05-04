@@ -48,6 +48,6 @@ pub use coordinator::*;
 pub use local::*;
 pub use producer::*;
 pub use relay::*;
-pub use remote::*;
+pub use remote::RemoteManager;
 pub use session::*;
 pub use web::*;

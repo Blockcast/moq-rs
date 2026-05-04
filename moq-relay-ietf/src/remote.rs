@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
@@ -20,6 +20,8 @@ use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
 /// Keyed by both URL and destination address so that connections are reused
 /// only when both match.
 type RemoteCacheKey = (Url, Option<SocketAddr>);
+type RemoteSlot = Arc<Mutex<Option<Remote>>>;
+type TrackCacheKey = (TrackNamespace, String);
 
 /// Manages connections to remote relays.
 ///
@@ -30,7 +32,7 @@ type RemoteCacheKey = (Url, Option<SocketAddr>);
 pub struct RemoteManager {
     coordinator: Arc<dyn Coordinator>,
     clients: Vec<quic::Client>,
-    remotes: Arc<Mutex<HashMap<RemoteCacheKey, Remote>>>,
+    remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
 }
 
 impl RemoteManager {
@@ -71,7 +73,6 @@ impl RemoteManager {
             Ok(remote) => remote,
             Err(err) => {
                 tracing::error!(remote_url = %url, error = %err, "failed to connect to remote relay: {}", err);
-                self.remove(&cache_key).await;
                 return Err(err);
             }
         };
@@ -82,10 +83,8 @@ impl RemoteManager {
         {
             Ok(reader) => Ok(reader),
             Err(err) => {
-                if !remote.is_connected() {
-                    tracing::warn!(remote_url = %url, "remote connection is dead, removing from cache");
-                    self.remove(&cache_key).await;
-                }
+                tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
+                self.remove_if_same_remote(&cache_key, &remote).await;
 
                 Err(err)
             }
@@ -98,17 +97,6 @@ impl RemoteManager {
         cache_key: RemoteCacheKey,
         client: Option<&quic::Client>,
     ) -> anyhow::Result<Remote> {
-        let mut remotes = self.remotes.lock().await;
-
-        if let Some(remote) = remotes.get(&cache_key) {
-            if remote.is_connected() {
-                return Ok(remote.clone());
-            }
-
-            tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
-            remotes.remove(&cache_key);
-        }
-
         let client = match client {
             Some(client) => client,
             None => self.clients.first().ok_or_else(|| {
@@ -116,41 +104,91 @@ impl RemoteManager {
             })?,
         };
 
-        tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
-        let remote = Remote::connect(cache_key.0.clone(), cache_key.1, client).await?;
-        remotes.insert(cache_key, remote.clone());
+        // The manager lock only protects the map. The per-key slot lock protects
+        // that key's connection state, so unrelated remotes can connect in parallel.
+        let slot = {
+            let mut remotes = self.remotes.lock().await;
+            remotes
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
 
+        let mut cached = slot.lock().await;
+
+        if let Some(remote) = cached.as_ref() {
+            if remote.is_connected() {
+                return Ok(remote.clone());
+            }
+
+            tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
+        };
+
+        if let Some(remote) = cached.take() {
+            remote.shutdown().await;
+        }
+
+        tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
+        let remote = Remote::connect(
+            cache_key.0.clone(),
+            cache_key.1,
+            client,
+            Arc::downgrade(&slot),
+        )
+        .await?;
+
+        *cached = Some(remote.clone());
         Ok(remote)
     }
 
-    /// Remove a remote connection (called when connection fails).
-    async fn remove(&self, cache_key: &RemoteCacheKey) {
-        let mut remotes = self.remotes.lock().await;
-        if let Some(remote) = remotes.remove(cache_key) {
-            remote.shutdown();
+    async fn remove_if_same_remote(&self, cache_key: &RemoteCacheKey, remote: &Remote) {
+        let slot = {
+            let remotes = self.remotes.lock().await;
+            remotes.get(cache_key).cloned()
+        };
+
+        let removed = if let Some(slot) = slot {
+            let mut cached = slot.lock().await;
+            match cached.as_ref() {
+                Some(current) if current.is_same_connection(remote) => cached.take(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(remote) = removed {
+            remote.shutdown().await;
         }
     }
 
     /// Shutdown all remote connections.
-    pub async fn shutdown(&self) {
-        let mut remotes = self.remotes.lock().await;
-        for (cache_key, remote) in remotes.drain() {
+    pub(crate) async fn shutdown(&self) {
+        let remotes = {
+            let mut remotes = self.remotes.lock().await;
+            remotes.drain().collect::<Vec<_>>()
+        };
+
+        for (cache_key, slot) in remotes {
             tracing::info!(remote_url = %cache_key.0, "shutting down remote connection");
-            remote.shutdown();
+            let mut remote = slot.lock().await;
+            if let Some(remote) = remote.take() {
+                remote.shutdown().await;
+            }
         }
     }
 }
 
 /// A connection to a single remote relay with its own QUIC client.
 #[derive(Clone)]
-pub struct Remote {
+struct Remote {
     url: Url,
     subscriber: moq_transport::session::Subscriber,
-    /// Track subscriptions - maps (namespace, track_name) to track reader
-    tracks: Arc<Mutex<HashMap<(TrackNamespace, String), TrackReader>>>,
-    /// Flag indicating if the connection is still alive
+    /// Track subscriptions keyed by full track name.
+    tracks: Arc<Mutex<HashMap<TrackCacheKey, TrackReader>>>,
+    /// Flag indicating if the connection is still alive.
     connected: Arc<AtomicBool>,
-    /// Cancellation token for the session task
+    /// Cancellation token for the session task.
     cancel: CancellationToken,
 }
 
@@ -160,6 +198,7 @@ impl Remote {
         url: Url,
         addr: Option<SocketAddr>,
         client: &quic::Client,
+        cache_slot: Weak<Mutex<Option<Remote>>>,
     ) -> anyhow::Result<Self> {
         let (session, _quic_client_initial_cid, transport) = match client.connect(&url, addr).await
         {
@@ -205,6 +244,15 @@ impl Remote {
             }
 
             session_connected.store(false, Ordering::Release);
+
+            if let Some(cache_slot) = cache_slot.upgrade() {
+                let mut cached = cache_slot.lock().await;
+                if matches!(cached.as_ref(), Some(remote) if Arc::ptr_eq(&remote.connected, &session_connected))
+                {
+                    cached.take();
+                    tracing::info!(remote_url = %session_url, "cleared closed remote connection from cache");
+                }
+            }
         });
 
         Ok(Self {
@@ -217,18 +265,23 @@ impl Remote {
     }
 
     /// Check if the connection is still alive.
-    pub fn is_connected(&self) -> bool {
+    fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
     }
 
+    fn is_same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.connected, &other.connected)
+    }
+
     /// Shutdown the remote connection.
-    pub fn shutdown(&self) {
+    async fn shutdown(&self) {
         self.cancel.cancel();
         self.connected.store(false, Ordering::Release);
+        self.tracks.lock().await.clear();
     }
 
     /// Subscribe to a track on this remote relay.
-    pub async fn subscribe(
+    async fn subscribe(
         &self,
         namespace: TrackNamespace,
         track_name: String,
@@ -238,29 +291,68 @@ impl Remote {
         }
 
         let key = (namespace.clone(), track_name.clone());
-        let mut tracks = self.tracks.lock().await;
 
-        if let Some(reader) = tracks.get(&key) {
-            return Ok(Some(reader.clone()));
+        {
+            let mut tracks = self.tracks.lock().await;
+            if let Some(reader) = tracks.get(&key) {
+                if !reader.is_closed() {
+                    return Ok(Some(reader.clone()));
+                }
+
+                tracing::debug!(remote_url = %self.url, namespace = %key.0, track = %key.1, "removing closed remote track from cache");
+                tracks.remove(&key);
+            }
         }
 
-        let (writer, reader) = Track::new(namespace, track_name).produce();
-        tracks.insert(key.clone(), reader.clone());
-        drop(tracks);
-
         let mut subscriber = self.subscriber.clone();
-        let tracks = self.tracks.clone();
         let url = self.url.clone();
+        let tracks = Arc::downgrade(&self.tracks);
+        let cancel = self.cancel.clone();
 
-        tokio::spawn(async move {
-            tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
+        tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
-            if let Err(err) = subscriber.subscribe(writer).await {
-                tracing::warn!(remote_url = %url, namespace = %key.0, track = %key.1, error = %err, "failed subscribing to remote track: {}", err);
+        let (writer, reader) = Track::new(namespace, track_name).produce();
+        let subscribe = subscriber.subscribe_open(writer).await?;
+
+        {
+            let mut tracks = self.tracks.lock().await;
+            if let Some(current) = tracks.get(&key) {
+                if !current.is_closed() {
+                    return Ok(Some(current.clone()));
+                }
+
+                tracks.remove(&key);
             }
 
-            tracks.lock().await.remove(&key);
-            tracing::debug!(remote_url = %url, namespace = %key.0, track = %key.1, "remote track subscription ended");
+            tracks.insert(key.clone(), reader.clone());
+        }
+
+        let cleanup_key = key.clone();
+        let cleanup_reader = reader.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = subscribe.closed() => {
+                    match result {
+                        Ok(()) => {
+                            tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription ended");
+                        }
+                        Err(err) => {
+                            tracing::warn!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, error = %err, "remote track subscription ended with error: {}", err);
+                        }
+                    }
+                }
+                _ = cancel.cancelled() => {
+                    tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
+                }
+            }
+
+            if let Some(tracks) = tracks.upgrade() {
+                let mut tracks = tracks.lock().await;
+                if matches!(tracks.get(&cleanup_key), Some(current) if Arc::ptr_eq(&current.info, &cleanup_reader.info))
+                {
+                    tracks.remove(&cleanup_key);
+                }
+            }
         });
 
         Ok(Some(reader))

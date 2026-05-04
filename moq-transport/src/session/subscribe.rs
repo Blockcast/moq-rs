@@ -140,6 +140,25 @@ impl Subscribe {
             .await;
         }
     }
+
+    pub async fn ok(&self) -> Result<(), ServeError> {
+        loop {
+            {
+                let state = self.state.lock();
+                state.closed.clone()?;
+
+                if state.ok {
+                    return Ok(());
+                }
+
+                match state.modified() {
+                    Some(notify) => notify,
+                    None => return Err(ServeError::Done),
+                }
+            }
+            .await;
+        }
+    }
 }
 
 impl Drop for Subscribe {

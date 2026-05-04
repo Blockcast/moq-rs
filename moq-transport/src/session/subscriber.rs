@@ -123,11 +123,20 @@ impl Subscriber {
 
     /// Subscribe to a track by creating a new subscribe request to the publisher.  Block until subscription is closed.
     pub async fn subscribe(&mut self, track: serve::TrackWriter) -> Result<(), ServeError> {
+        let subscribe = self.subscribe_open(track).await?;
+        subscribe.closed().await
+    }
+
+    /// Subscribe to a track and wait until the publisher acknowledges it.
+    pub async fn subscribe_open(
+        &mut self,
+        track: serve::TrackWriter,
+    ) -> Result<Subscribe, ServeError> {
         let request_id = self.get_next_request_id();
         let (send, recv) = Subscribe::new(self.clone(), request_id, track);
         self.subscribes.lock().unwrap().insert(request_id, recv);
-
-        send.closed().await
+        send.ok().await?;
+        Ok(send)
     }
 
     /// Send a message to the publisher via the control stream.

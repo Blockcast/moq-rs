@@ -46,7 +46,6 @@ impl Producer {
 
     /// Run the producer to serve subscribe requests.
     pub async fn run(self) -> Result<(), SessionError> {
-        //let mut tasks = FuturesUnordered::new();
         let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
             FuturesUnordered::new();
 
