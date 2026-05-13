@@ -396,7 +396,16 @@ impl Remote {
             tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
-            let subscribe = match subscriber.subscribe_open(writer).await {
+            let subscribe_result = tokio::select! {
+                result = subscriber.subscribe_open(writer) => result,
+                _ = cancel.cancelled() => {
+                    drop(cached);
+                    remove_empty_track_slot(&self.tracks, &key, &slot).await;
+                    anyhow::bail!("subscribe cancelled, remote connection to {} is closed", self.url);
+                }
+            };
+
+            let subscribe = match subscribe_result {
                 Ok(subscribe) => subscribe,
                 Err(err) => {
                     drop(cached);
