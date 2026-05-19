@@ -244,7 +244,7 @@ impl Subscriber {
     }
 
     /// Remove a subscribe from our map of active subscribes, and the alias map if present.
-    fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
+    pub(super) fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
         if let Some(subscribe) = self.subscribes.lock().unwrap().remove(&id) {
             // Remove from alias map if present
             if let Some(track_alias) = subscribe.track_alias() {
@@ -732,5 +732,88 @@ impl Subscriber {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::atomic, task::Poll};
+
+    use super::*;
+    use crate::{
+        message::{self, GroupOrder},
+        serve::Track,
+    };
+
+    fn subscriber() -> Subscriber {
+        Subscriber::new(Queue::default(), Arc::new(atomic::AtomicU64::new(0)), None)
+    }
+
+    #[tokio::test]
+    async fn subscribe_open_cleans_up_when_cancelled_before_ok() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        {
+            let subscribe = subscriber.subscribe_open(writer);
+            futures::pin_mut!(subscribe);
+
+            assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+            assert_eq!(observer.subscribes.lock().unwrap().len(), 1);
+        }
+
+        assert!(observer.subscribes.lock().unwrap().is_empty());
+        assert!(observer.subscribe_alias_map.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_open_subscribe_removes_recv_state() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        let subscribe = subscriber.subscribe_open(writer);
+        futures::pin_mut!(subscribe);
+
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+        assert_eq!(observer.subscribes.lock().unwrap().len(), 1);
+
+        let mut receiver = observer.clone();
+        receiver
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 10,
+                expires: 0,
+                group_order: GroupOrder::Publisher,
+                content_exists: false,
+                largest_location: None,
+                params: Default::default(),
+            })
+            .unwrap();
+
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(subscribe)) => subscribe,
+            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
+            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
+        };
+
+        assert_eq!(observer.subscribes.lock().unwrap().len(), 1);
+        assert_eq!(
+            observer
+                .subscribe_alias_map
+                .lock()
+                .unwrap()
+                .get(&10)
+                .copied(),
+            Some(0)
+        );
+
+        drop(subscribe);
+
+        assert!(observer.subscribes.lock().unwrap().is_empty());
+        assert!(observer.subscribe_alias_map.lock().unwrap().is_empty());
     }
 }

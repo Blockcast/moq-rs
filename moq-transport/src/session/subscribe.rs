@@ -165,6 +165,7 @@ impl Drop for Subscribe {
     fn drop(&mut self) {
         self.subscriber
             .send_message(message::Unsubscribe { id: self.info.id });
+        self.subscriber.remove_subscribe(self.info.id);
     }
 }
 
