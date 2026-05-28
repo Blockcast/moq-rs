@@ -1,0 +1,7 @@
+[2m2026-05-28T03:15:37.507244Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:52906 [3mdual_stack[0m[2m=[0mtrue
+[2m2026-05-28T03:15:37.515755Z[0m [32m INFO[0m [2mmoq_sub[0m[2m:[0m connected with CID: cfc2fcf895b020059a2943808be46722 (use this to look up qlog/mlog on server)
+[2m2026-05-28T03:15:37.520534Z[0m [33m WARN[0m [2mmoq_sub::media[0m[2m:[0m failed to subscribe to catalog track: Closed(0)
+Error: media error
+
+Caused by:
+    closed, code=0

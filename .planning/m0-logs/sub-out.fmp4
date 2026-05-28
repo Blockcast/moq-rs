@@ -1,0 +1,3 @@
+[2m2026-05-28T02:58:08.161181Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:52874 [3mdual_stack[0m[2m=[0mtrue
+[2m2026-05-28T02:58:08.174551Z[0m [32m INFO[0m [2mmoq_sub[0m[2m:[0m connected with CID: c1b8bc5ece096120c40d51e104e5bb74 (use this to look up qlog/mlog on server)
+[2m2026-05-28T02:58:08.178651Z[0m [33m WARN[0m [2mmoq_sub::media[0m[2m:[0m failed to subscribe to init track: Closed(0)
