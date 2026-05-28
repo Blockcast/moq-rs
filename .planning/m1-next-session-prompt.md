@@ -1,8 +1,21 @@
-M.1 + most of M.1b of BLO-4020 (Cloudflare moq-rs MMTP migration) is COMPLETE,
-plus M.4 ADR drafted with locked A0-A3 decisions. Four open PRs stacked on
-`blockcast/blo-4020-m1`; one fork-only branch with the M.4 ADR; one upstream
-issue draft awaiting external filing; one M.1b sub-task deferred. Working
-directory: /home/oramadan/src/pim-multicast-gateway/moq-rs
+M.1 + most of M.1b of BLO-4020 is COMPLETE, plus M.4 ADR fully signed off
+(A0-A6, C1, Q3-Q8) AND M.4 §T0 (publisher draft-16 bump) implemented +
+smoke-validated. Five open PRs stacked on `blockcast/blo-4020-m1`; one
+fork-only branch with the M.4 ADR; one upstream issue draft awaiting
+external filing; one M.1b sub-task deferred. Working directory:
+/home/oramadan/src/pim-multicast-gateway/moq-rs
+
+NEXT SESSION PICKUP: T1 (Shaka MMTP container) — see PICK list below.
+
+PRs as of 2026-05-28 (5 stacked on blo-4020-m1):
+  #1 BLO-4020 M.1 (base, 12 commits)
+  #2 BLO-8047 §B1 raw-passthrough fragmentation contract — 1 commit (ec8e4b7)
+  #3 BLO-8047 §B3 object_id_delta forensics — 1 commit (1cf8bb4)
+  #4 BLO-8047 §B4 wire-format diff — 1 commit (8c404c9)
+  #5 BLO-4020 M.4 §T0 publisher draft-16 bump — 1 commit (9336e4a)
+
+M.4 ADR on fork branch blo-4020-m4-adr (commits 5ffd5e1+1b0c577+cc62f9d),
+not opened as PR.
 
 State as of 2026-05-28 (M.1 + B1+B3+B4 closed; B2 deferred to M.4; pick M.2 / upstream / receiver next):
 
@@ -107,23 +120,51 @@ C. M.2 — Cast bridge port (per umbrella BLO-4020)
      moq-pub-mmtp speaks (IETF moq-transport), so M.2 = porting MMTP packetization
      into Rust + replacing moq_lite with moq_transport.
 
-D. M.4 ADR sign-off + T0 (publisher draft-16 bump)
-   - M.4 ADR drafted 2026-05-28 on branch `blo-4020-m4-adr` (commits ec8e4b7 +
-     5ffd5e1 + 1b0c577). A0-A3 locked; Q3-Q8 still open (Pure-JS vs WASM
-     reassembler, tier latency, transportFactory wiring, multicast extern,
-     Track 3 FFI strategy, track sequencing).
-   - START WITH: answer Q3-Q8, then T0 = bump moq-pub-mmtp to negotiate
-     IETF moq-transport draft-16. Single change in moq-transport version
-     negotiation; gates T1+T2+T3 receivers (all draft-16).
-   - Track 1 (Shaka MMTP container support) recommended as first
-     post-T0 implementation track — smallest, mirrors existing LOCParser/
-     LocTransmuxer pattern, no other receivers touched.
+D. M.4 Track 1 — Shaka MMTP container support (RECOMMENDED next, smallest)
+   - PR #5 (T0) unblocks T1. Mirror Shaka's existing LOC pattern:
+     shaka.msf.MMTPParser (mirror loc_parser.js) + shaka.transmuxer.MmtpTransmuxer
+     (mirror loc_transmuxer.js). Pure-JS MFU reassembler (~200 LOC, per Q3).
+     Wire `@blockcast/transport` as transportFactory (Q5: minimal v1, defer
+     SSM/AMT/DRIAD to T1.6b). Add Closure-extern shim
+     shaka-player/lib/externs/multicast.js (Q6).
+   - ALSO: receiver-side object_id_delta reconstruction (per A5/B3) — running
+     last_object_id+delta in shaka.msf.Reader; sidesteps the publisher's
+     upstream bug without waiting on cloudflare/moq-rs fix.
+   - End-to-end smoke against moq-pub-mmtp post-T0 (DRAFT_16 negotiated;
+     wire is byte-stable per T0 verification).
+   - START FILES: shaka-player/lib/msf/loc_parser.js, lib/transmuxer/loc_transmuxer.js
+     (templates). M.4 ADR §T1.1-T1.7 has the task breakdown.
 
-E. M.4 Track 1 (Shaka MMTP) — implementation after D's T0 lands
-   - shaka.msf.MMTPParser + shaka.transmuxer.MmtpTransmuxer (mirror LOC pattern).
-   - Receiver-side object_id_delta reconstruction (per A5/B3 sidesteps).
-   - @blockcast/transport wired as transportFactory.
-   - End-to-end smoke against moq-pub-mmtp (post-T0).
+E. M.4 Track 2 — moqtail tier-switching + interop
+   - Interop smoke: post-T0 moq-pub-mmtp ↔ moqtail (draft-16) end-to-end.
+     Today's M.1 smoke does NOT exercise moqtail. T2.1.
+   - Audit moqtail's object_id_delta reconstruction (A5). T2.2.
+   - Extend multi-track-wiring.ts base/delta into multi-resolution tier
+     subscription; integrate @blockcast/transport/abr-controller.ts to demote
+     tiers on FEC failure. One-GOP demotion boundary per Q4. T2.3-T2.5.
+
+F. M.4 Track 3 — port MoqWatch onto moqtail-ts (per Q7 reshape)
+   - SKIPPED in M.4: T3.1/T3.2 (Rust IETF subscriber fix at
+     hang-mmt-fec/rs/moq-lite/src/ietf/subscriber.rs:673-676 — dead path,
+     no production receiver consumes it).
+   - DO: T3.1 inventory moqtail-ts transport interface; T3.2 thin adapter so
+     @blockcast/transport satisfies it; T3.3 port MoqWatch off
+     window.multicast.subscribeTransportAware() onto moqtail-ts; T3.4 adapt
+     fec-repair.ts to consume moqtail-ts TrackReader; T3.5 end-to-end smoke.
+
+G. PR review / merge prep (likely fastest)
+   - Address review comments on any of PRs #1-#5 as they come in.
+   - When #1 merges, rebase #2/#3/#4/#5 onto blockcast/main per the recipe
+     below and re-push.
+
+H. File the upstream object_id_delta issue at cloudflare/moq-rs
+   - Draft body captured in BLO-8047 (latest comment).
+   - Watch for upstream response; sync vendored moq-transport when fix lands.
+   - Add regression test in moq-pub-mmtp after the fix: parse FRAGMENT=3 smoke
+     mlog, assert publisher-side subgroup_object_parsed shows object_id ∈ {0,1,2,3}.
+
+I. M.2 — Cast bridge port (per umbrella BLO-4020)
+   - Biggest blast radius. Needs separate ADR + plan-phase before any code.
 
 READ FIRST (for any of the above):
 1. .planning/moq-rs-m1-adr.md — full ADR with A1-A5/C1 decisions, T1-T9 Implementation
