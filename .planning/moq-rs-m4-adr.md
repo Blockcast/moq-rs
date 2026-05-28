@@ -2,7 +2,7 @@
 
 **Issue:** [BLO-4020](https://paperclip.blockcast.net/BLO/issues/BLO-4020) M.4 phase.
 **Date:** 2026-05-28
-**Status:** **DRAFT — awaiting sign-off.**
+**Status:** **DRAFT — A0+A1+A2+A3 (Track 3 included, T0 publisher draft-16 bump added) signed off 2026-05-28; tactical questions 3-8 still open.**
 **Prereqs:**
 - M.1 complete (PR #1 — MMTP publisher on IETF moq-transport draft-14).
 - M.1b §B1=C complete (PR #2 — raw-passthrough fragmentation contract).
@@ -10,15 +10,22 @@
 - M.1b §B4 complete (PR #4 — moq-lite vs IETF wire format diff).
 - M.1b §B2 deferred to M.4 prerequisite.
 
-## TL;DR — the scope just got much smaller than expected
+## TL;DR — scope is three sequenced tracks plus a pre-task
 
-The original BLO-4020 framing assumed receiver migration meant rewriting hang-mmt-fec, moqtail, and Shaka onto the IETF wire. Inventory of the codebase reveals **most of that work is already done**:
+The original BLO-4020 framing assumed receiver migration meant rewriting hang-mmt-fec, moqtail, and Shaka onto the IETF wire. Inventory reveals two of the three are partly done:
 
-- **moqtail** is already on IETF MoQ Transport **draft-16** with MMTP container parsing already wired via `@blockcast/mmt-container`. The only M.4 gap is tier-switching fallback + verifying draft-14↔draft-16 version negotiation against `moq-pub-mmtp`.
+- **moqtail** is already on IETF MoQ Transport **draft-16** with MMTP container parsing wired via `@blockcast/mmt-container`. Gap: tier-switching fallback + draft-14↔draft-16 mismatch with `moq-pub-mmtp`.
 - **Shaka** (Blockcast fork) has full MSF integration speaking **drafts 14 AND 16** with ALPN negotiation, plus the LOC parser/transmuxer pattern that the MMTP equivalent can mirror.
-- **hang-mmt-fec** is the actual migration burden — it speaks moq-lite for production paths, and its IETF subscriber `hard-rejects multi-object subgroups` (`rs/moq-lite/src/ietf/subscriber.rs:673-676`). But **moqtail and Shaka together cover the production receiver set**; hang-mmt-fec migration is now a "legacy receiver" question, not a blocker.
+- **hang-mmt-fec** is the actual migration burden — speaks moq-lite for production paths; IETF subscriber hard-rejects multi-object subgroups (`rs/moq-lite/src/ietf/subscriber.rs:673-676`). Production paths (the `@moq/hang` web component in `js/watch/src/element.ts`) need migration — confirmed in scope per session decision 2026-05-28.
 
-This ADR locks the scope around **two small surgical tracks** and proposes deferring the hang-mmt-fec migration.
+This ADR locks **three sequenced tracks** preceded by a **draft-16 publisher bump pre-task (T0)**:
+
+- **T0**: bump `moq-pub-mmtp` (and `moq-transport` configuration) to negotiate draft-16. Single moving part; unblocks T1+T2 which target draft-16 receivers.
+- **Track 1 (T1)**: Shaka MMTP container support. Fastest.
+- **Track 2 (T2)**: moqtail tier-switching + version-negotiation verification.
+- **Track 3 (T3)**: hang-mmt-fec migration to IETF multi-object subgroups. Biggest.
+
+Estimated total scope: ~6-8 weeks across the three tracks. T0 lands first (days, not weeks); T1/T2 can run in parallel; T3 follows or runs alongside.
 
 ## Inventory findings (input to the decisions below)
 
@@ -58,22 +65,36 @@ This ADR locks the scope around **two small surgical tracks** and proposes defer
 
 ## Locked decisions
 
-### A1 — Track 1 (Shaka MMTP container) is the primary M.4 deliverable
+### A0 — Bump `moq-pub-mmtp` to negotiate IETF moq-transport draft-16 (T0 pre-task)
 
-Shaka MSF already speaks the IETF wire `moq-pub-mmtp` emits. The only missing piece is the MMTP container parser + transmuxer — a small surgical patch that mirrors the existing LOC pattern. Track 1 produces a working browser receiver against the M.1 publisher without modifying any other receiver.
+`moq-pub-mmtp` today negotiates draft-14 only. moqtail is draft-16 native; Shaka MSF speaks 14+16. To minimize draft-skew across receivers and align all M.4 wiring around the same draft, bump the publisher to **negotiate draft-16 as the floor** (and accept draft-14 fallback if a relay/receiver requires it). `moq-transport`'s version negotiation already supports both. This lands as **T0** before T1/T2.
 
-### A2 — Track 2 (moqtail tier-switching + version-negotiation verification) is the secondary M.4 deliverable
+Single moving part; cleaner than teaching each receiver a draft-14 fallback path.
 
-moqtail already has MMTP container parsing and speaks IETF draft-16. The M.4 work for moqtail is small:
+### A1 — Track 1 (Shaka MMTP container) — primary M.4 deliverable, lands first
 
-- Verify `moq-pub-mmtp` (draft-14) ↔ moqtail (draft-16) version negotiation works end-to-end (the M.1 smoke does NOT exercise this — moqtail wasn't a smoke participant). If broken, choose: (a) bump `moq-pub-mmtp` to draft-16, (b) teach moqtail draft-14 fallback, (c) document the incompatibility for upstream coordination.
+Shaka MSF already speaks the IETF wire after T0. The only missing piece is the MMTP container parser + transmuxer — a small surgical patch mirroring the existing LOC pattern. Track 1 produces a working browser receiver against the M.1 publisher without modifying any other receiver, and serves as the canonical reference for the Tracks 2 + 3 patterns.
+
+### A2 — Track 2 (moqtail tier-switching) — runs in parallel with Track 1
+
+moqtail already has MMTP container parsing and speaks IETF draft-16. Post-T0, the version-negotiation gap closes. M.4 work for moqtail:
+
+- Interop smoke: `moq-pub-mmtp` (post-T0 draft-16) ↔ moqtail (draft-16). Verify end-to-end playback; today's M.1 smoke does NOT exercise moqtail.
+- Audit moqtail's `last_object_id` reconstruction; verify A5 honored, fix if not.
 - Wire tier-switching: extend `multi-track-wiring.ts`'s base/delta/repair pattern into multi-resolution tier subscription; integrate with `@blockcast/transport`'s `abr-controller.ts` so FEC failure events demote tiers.
 
-### A3 — Track 3 (hang-mmt-fec migration to IETF) is DEFERRED beyond M.4
+### A3 — Track 3 (hang-mmt-fec migration) — included in M.4 scope, lands after T1/T2 or alongside
 
-hang-mmt-fec is a research / legacy receiver path. Production receivers are moqtail + Shaka, both of which are on the IETF side. Migrating hang-mmt-fec's `rs/moq-lite/src/ietf/subscriber.rs:673-676` to accept multi-object subgroups + porting the JS `MoqWatch` element to a IETF-native client is substantial work that does not unblock any production receiver. It's tracked separately as a future workstream.
+hang-mmt-fec is the @moq/hang web component (`js/watch/src/element.ts:131 MoqWatch`) and underlying Rust crates. Production receivers in pim-multicast-gateway include both moqtail and `@moq/hang` — per session decision 2026-05-28, M.4 must migrate hang-mmt-fec to IETF moq-transport to retain `@moq/hang` parity with moqtail and Shaka.
 
-**If hang-mmt-fec is needed for M.4 production, this decision must be flipped before sign-off.** I am marking this as the highest-impact open question below.
+Track 3 work:
+
+- Fix `rs/moq-lite/src/ietf/subscriber.rs:673-676` to accept multi-object subgroups (remove the `Err(Error::Unsupported)` short-circuit; invoke per-object decode loop).
+- Implement multi-object decoder in `rs/moq-lite/src/ietf/`; today SubgroupHeader decode exists but subscriber rejects before any object loop.
+- Port `js/watch/src/element.ts MoqWatch` off `window.multicast.subscribeTransportAware()` onto an IETF-native client surface (likely a new export from `hang-mmt-fec/rs/moq-lite/src/ietf/`).
+- Migrate `js/watch/src/fec-repair.ts` to consume per-FEC-block (SBN) grouping from the publisher (depends on M.1b §B2; see "NOT in scope" below — SBN is still deferred from M.4 publisher work, but Track 3 lifts the receiver-side decoupling).
+
+This is the largest of the three tracks (~4-6 weeks estimated). It runs in parallel with T1/T2 if staffed independently, or sequentially after them on a single-pipeline schedule.
 
 ### A4 — Receiver-side MFU reassembly is canonical (B1=C contract)
 
@@ -95,6 +116,14 @@ Implementation: `abr-controller.ts` handles tier selection. The integration poin
 
 Both Shaka MSF (via `transportFactory`) and moqtail (via `MOQtailClient`'s connection layer) must route all transport variants (WebTransport, SSM multicast, AMT tunnel, DRIAD-discovered relay paths) through `@blockcast/transport`. The factory selects per endpoint based on `multicast.endpoints[].protocol` field in the catalog.
 
+## Implementation Tasks — T0 (publisher draft-16 bump pre-task)
+
+- **T0.1**: Bump `moq-pub-mmtp` to negotiate draft-16. Modify `moq-transport`'s setup to offer both `0xff000010` (draft-16) and `0xff00000e` (draft-14); prefer draft-16. May require small patches if any draft-14-specific code paths exist in `moq-transport`.
+- **T0.2**: Re-run M.1 smoke at draft-16 wire; confirm per-track sha256 still matches (raw passthrough is wire-version-independent at the SUBGROUP/OBJECT framing level).
+- **T0.3**: Add a regression test pinning the negotiated draft. Smoke parses an mlog dump; asserts `selected_version` is `0xff000010` (or `0xff00000e` if intentional fallback).
+
+T0 is a small pre-task — days, not weeks. T1/T2/T3 cannot start cleanly without it (or they'd have to do version-mismatch workarounds).
+
 ## Implementation Tasks — Track 1 (Shaka MMTP container)
 
 - **T1.1**: Add `shaka.msf.MMTPParser` (mirror of `LOCParser` at `lib/msf/loc_parser.js`). Parses MMTP+MPU header per ISO/IEC 23008-1 §9.2.2 + §A.3; classifies Init vs Mfu via `FragmentType`; extracts payload + per-fragment metadata (`fragmentation_indicator`, `fragment_counter`, `mpu_sequence`).
@@ -113,14 +142,15 @@ Both Shaka MSF (via `transportFactory`) and moqtail (via `MOQtailClient`'s conne
 - **T2.4**: Wire `@blockcast/transport`'s `abr-controller.ts` into moqtail. Subscribe `fec-client.ts` block-failure events into the ABR controller's demotion signal.
 - **T2.5**: Smoke test: simulate 10%+ packet loss at a tier; assert moqtail demotes to lower tier within one I-frame boundary.
 
-## Implementation Tasks — Track 3 (hang-mmt-fec — DEFERRED)
+## Implementation Tasks — Track 3 (hang-mmt-fec migration to IETF)
 
-- **T3.1**: Fix `rs/moq-lite/src/ietf/subscriber.rs:673-676` to accept multi-object subgroups + invoke per-object decode loop.
-- **T3.2**: Implement multi-object SubgroupHeader decoder in `rs/moq-lite/src/ietf/` (today the IETF module decodes SubgroupHeader but the subscriber rejects it before any object loop runs).
-- **T3.3**: Port `js/watch/src/element.ts`'s `MoqWatch` element off `window.multicast.subscribeTransportAware()` onto an IETF-native client surface.
-- **T3.4**: Migrate `js/watch/src/fec-repair.ts` to consume per-FEC-block (SBN) grouping from publisher (depends on M.1b §B2, also deferred).
+- **T3.1**: Fix `rs/moq-lite/src/ietf/subscriber.rs:673-676` to accept multi-object subgroups + invoke per-object decode loop. RED test: synthesize a multi-object subgroup (Init + N MFU fragments at the same `mpu_seq`); assert subscriber emits N+1 objects, not `Err(Error::Unsupported)`.
+- **T3.2**: Implement multi-object SubgroupHeader decoder in `rs/moq-lite/src/ietf/`. Today SubgroupHeader decode exists but the subscriber rejects before any object loop runs. Pattern: walk objects, compute `object_id` per A5 (running `last_object_id + object_id_delta`), surface each object to the consumer.
+- **T3.3**: Port `js/watch/src/element.ts`'s `MoqWatch` element off `window.multicast.subscribeTransportAware()` onto an IETF-native client surface. Likely a new export from `hang-mmt-fec/rs/moq-lite/src/ietf/` exposed via FFI (`moq-ffi` uniffi bindings, NOT wasm-bindgen — hang-mmt-fec has no wasm-bindgen path today).
+- **T3.4**: Migrate `js/watch/src/fec-repair.ts` to consume the IETF wire's repair packets. M.1b §B2 (per-FEC-block SBN grouping in publisher) remains deferred; T3.4 only requires receiver-side compatibility with the publisher's current per-MPU rolling group on `<source>/repair`. SBN grouping is a future publisher improvement that gives finer correlation.
+- **T3.5**: End-to-end smoke: run the moq-watch element against `moq-pub-mmtp` (post-T0 draft-16); verify video + audio render through Web Component playback path.
 
-**T3.1-T3.4 are deferred. Pick up when (a) hang-mmt-fec is needed for production M.4, or (b) M.5 (post-production) wants legacy receiver coverage.**
+Estimated scope: ~4-6 weeks. Largest of the three tracks because it touches both Rust receiver paths AND the JS web component, plus the FFI binding surface. Can run in parallel with T1/T2 if staffed independently.
 
 ## NOT in scope for M.4
 
@@ -128,21 +158,27 @@ Both Shaka MSF (via `transportFactory`) and moqtail (via `MOQtailClient`'s conne
 - **Upstream `object_id_delta` fix at cloudflare/moq-rs.** Tracked as a BLO-8047 §B3 draft (in BLO-8047 description); receiver-side reconstruction (A5) sidesteps it without waiting on upstream.
 - **Per-FEC-block (SBN) grouping in the publisher** (M.1b §B2). Receiver-side correlation works fine with per-MPU grouping today; SBN grouping is a publisher-side improvement that gives the receiver finer control but isn't blocking. Continue to defer.
 - **draft-17+ tracking.** Once `moq-pub-mmtp` bumps to draft-16, plumb that through Shaka MSF (already supports it) and moqtail (already on draft-16). draft-17+ is a future ADR.
-- **hang-mmt-fec migration** (Track 3 above). Deferred pending need.
+- **Per-FEC-block (SBN) grouping in the publisher** is still deferred from M.4 (it remains an M.1b §B2 publisher improvement; T3.4 only requires receiver-side compatibility with current per-MPU repair grouping).
 
-## Open questions for sign-off
+## Resolved during sign-off (2026-05-28)
 
-1. **Is Track 3 (hang-mmt-fec) really deferrable?** Production receivers in pim-multicast-gateway test scenarios reference both `publisher-moq-lib.sh` (which uses `@moq/hang`) and `publisher-moqtail.sh` (which uses moqtail). If `@moq/hang` is required for production playback, T3 cannot defer. The choice here drives whether M.4 is a 2-week scope (Tracks 1+2 only) or a 6+ week scope (Tracks 1+2+3).
+1. ✅ **Track 3 (hang-mmt-fec) is INCLUDED in M.4 scope.** Production paths include both moqtail and `@moq/hang`; the latter requires migration. M.4 total scope: ~6-8 weeks across T0+T1+T2+T3. Reflected in §A3 + Implementation Tasks Track 3.
 
-2. **draft-14 vs draft-16 publisher.** moqtail is draft-16; `moq-pub-mmtp` is draft-14. Either we bump `moq-pub-mmtp` (small change in `moq-transport` version negotiation) or we make moqtail draft-14-compatible. Bumping the publisher is cleaner. This affects sequencing — should happen before or alongside T2.1.
+2. ✅ **draft-14 vs draft-16 mismatch resolved via T0 pre-task.** Publisher bumps to draft-16 (single change in `moq-transport` version negotiation). T1/T2/T3 all target draft-16 receivers. Reflected in §A0 + Implementation Tasks T0.
+
+## Open questions still pending sign-off
 
 3. **Pure-JS vs WASM MFU reassembler in Shaka.** I lean pure-JS (T1.3): smaller bundle, matches moqtail's pattern, easier to debug. Counterargument: drift risk from the Rust source-of-truth.
 
 4. **Tier-switching latency budget.** What's the acceptable lag between FEC failure detection and tier demotion? Sub-frame? One GOP? Project CLAUDE.md mentions A/V drift concerns — relevant here. Default proposal: one-GOP boundary (so the tier change aligns with a keyframe).
 
-5. **`@blockcast/transport` as Shaka transportFactory — actual wiring.** Shaka MSF's `transportFactory` config exists, but I haven't validated end-to-end that `@blockcast/transport` can be dropped in as a factory function. If the interface mismatches, T1.6 grows.
+5. **`@blockcast/transport` as Shaka `transportFactory` — actual wiring.** Shaka MSF's `transportFactory` config exists, but I haven't validated end-to-end that `@blockcast/transport` can be dropped in as a factory function. If the interface mismatches, T1.6 grows.
 
 6. **Multicast catalog extension shape in Shaka.** Currently `@blockcast/multicast` defines the JS types. Shaka would need a `lib/externs/multicast.js` shim. Trivial but worth surfacing.
+
+7. **Track 3 FFI binding strategy.** hang-mmt-fec has no `wasm-bindgen` deps today; the JS side calls into the Rust receiver via `window.multicast.subscribeTransportAware()` (`@blockcast/transport`). T3.3 likely needs to either (a) add wasm-bindgen to `hang-mmt-fec/rs/moq-lite` for direct JS consumption, (b) extend `@blockcast/transport`'s IETF-aware path so the binding stays unchanged from `MoqWatch`'s perspective, or (c) re-implement the IETF subscriber in JS entirely (paralleling `@blockcast/mmt-container`'s pattern). (b) is cleanest if `@blockcast/transport` already has IETF wiring; (a) is most direct but ships a WASM blob; (c) reduces Rust source-of-truth coverage. Worth a sub-discussion before T3 starts.
+
+8. **Track sequencing — parallel vs sequential.** Tracks 1+2+3 are independent in code (different files / packages). Parallel execution shortens calendar to ~6 weeks; sequential keeps focus on one quality bar at a time but stretches to ~8 weeks. Default proposal: T0 (days) → T1+T2 parallel (~2-3 weeks each) → T3 (~4-5 weeks). Total: ~7-8 weeks.
 
 ## Tracking
 
