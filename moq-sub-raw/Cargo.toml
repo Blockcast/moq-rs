@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# moq-sub-raw: subscribe to named tracks on a MoQ broadcast and dump each
+# track's raw object payloads to a file. Companion to moq-sub. Used for
+# per-track wire-level verification (sha256 hashes) in the M.1 smoke test.
+
+[package]
+name = "moq-sub-raw"
+description = "Raw object-payload subscriber for Media over QUIC (IETF draft-14+)"
+authors = ["Blockcast"]
+repository = "https://github.com/Blockcast/pim-multicast-gateway"
+license = "MIT OR Apache-2.0"
+
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.8" }
+moq-transport = { path = "../moq-transport", version = "0.14" }
+
+url = "2"
+bytes = "1"
+tokio = { version = "1", features = ["full"] }
+
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
