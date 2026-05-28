@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# moq-pub-mmtp: publish raw MMTP packets over IETF moq-transport (draft-14+).
+# Companion to moq-pub. Reads length-prefixed MMTP packets from stdin (or UDP),
+# announces a namespace, and writes each packet as a MoQ object on the track
+# corresponding to its MMTP packet_id (per draft-ramadan-moq-mmt §7.1).
+
+[package]
+name = "moq-pub-mmtp"
+description = "MMTP publisher for Media over QUIC (IETF draft-14+)"
+authors = ["Blockcast"]
+repository = "https://github.com/Blockcast/pim-multicast-gateway"
+license = "MIT OR Apache-2.0"
+
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.8" }
+moq-transport = { path = "../moq-transport", version = "0.14" }
+moq-catalog = { path = "../moq-catalog", version = "0.2" }
+
+# Canonical MMTP/MPU header parsers (ISO/IEC 23008-1).
+# Vendored under vendor/mmt-core/ at pinned libmmt commit (see vendor/mmt-core/VENDOR.md).
+mmt-core = { path = "vendor/mmt-core", version = "0.1" }
+
+url = "2"
+bytes = "1"
+
+tokio = { version = "1", features = ["full"] }
+
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
+serde_json = "1"

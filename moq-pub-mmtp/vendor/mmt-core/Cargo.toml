@@ -1,0 +1,23 @@
+[package]
+name = "mmt-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Blockcast Team"]
+license = "MIT OR Apache-2.0"
+description = "MMT protocol core library (ISO/IEC 23008-1) — vendored for moq-pub-mmtp"
+repository = "https://github.com/example/libmmt"
+keywords = ["mmt", "mmtp", "video", "streaming", "protocol"]
+categories = ["multimedia::encoding", "network-programming"]
+
+[dependencies]
+bytes = "1"
+thiserror = "1"
+log = "0.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "header_bench"
+harness = false
