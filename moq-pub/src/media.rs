@@ -262,6 +262,7 @@ impl Media {
             streaming_delta_updates: true,
             common_track_fields: moq_catalog::CommonTrackFields::from_tracks(&mut tracks),
             tracks,
+            multicast: None,
         };
 
         let catalog_str = serde_json::to_string_pretty(&catalog)?;
