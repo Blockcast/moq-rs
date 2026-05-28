@@ -9,6 +9,9 @@
 /// https://www.ietf.org/archive/id/draft-ietf-moq-catalogformat-01.html
 use serde::{Deserialize, Serialize};
 
+pub mod multicast;
+pub use multicast::{MulticastConfig, MulticastEndpoint, MulticastTrackRef, NetworkSource};
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Root {
     pub version: u16,
@@ -26,6 +29,11 @@ pub struct Root {
     pub common_track_fields: CommonTrackFields,
 
     pub tracks: Vec<Track>,
+
+    /// Optional multicast transport descriptor per draft-ramadan-moq-multicast.
+    /// Omitted from serialized output when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multicast: Option<MulticastConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -44,6 +52,12 @@ pub struct Track {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packaging: Option<TrackPackaging>,
 
+    /// Container format per draft-ramadan-moq-mmt §11.1. Optional extension
+    /// to the IETF draft-01 catalog format; parsers that don't understand it
+    /// MUST ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
+
     #[serde(rename = "renderGroup", skip_serializing_if = "Option::is_none")]
     pub render_group: Option<u16>,
 
@@ -61,6 +75,115 @@ pub struct Track {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depends: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_packaging_default_is_cmaf() {
+        let pkg = TrackPackaging::default();
+        assert_eq!(pkg, TrackPackaging::Cmaf);
+    }
+
+    #[test]
+    fn container_serializes_spec_values() {
+        // Per draft-ramadan-moq-mmt §11.1: container values are
+        // "isobmff" | "mmtp" | "mfu" | "fec-repair".
+        for (v, expected) in [
+            (Container::Isobmff, "\"isobmff\""),
+            (Container::Mmtp, "\"mmtp\""),
+            (Container::Mfu, "\"mfu\""),
+            (Container::FecRepair, "\"fec-repair\""),
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            assert_eq!(json, expected, "serialize {v:?}");
+            let back: Container = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v, "round-trip {v:?}");
+        }
+    }
+
+    #[test]
+    fn track_accepts_container_field() {
+        let json = r#"{
+            "name": "video",
+            "container": "mmtp",
+            "selectionParams": {"codec": "avc1.64001f"}
+        }"#;
+        let track: Track = serde_json::from_str(json).unwrap();
+        assert_eq!(track.container, Some(Container::Mmtp));
+    }
+
+    #[test]
+    fn track_without_container_round_trips() {
+        // Containers field is optional — older catalogs that don't carry it
+        // must still parse, and serialization must not emit "container":null.
+        let t = Track {
+            name: "v".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("container"), "json = {json}");
+    }
+
+    #[test]
+    fn root_accepts_optional_multicast_field() {
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {},
+            "tracks": [],
+            "multicast": {
+                "endpoints": [{
+                    "protocol": "ssm",
+                    "sourceAddress": "69.25.95.10",
+                    "groupAddress": "232.0.10.1",
+                    "port": 5004,
+                    "tracks": [{"name":"v","packetId":1}]
+                }]
+            }
+        }"#;
+        let root: Root = serde_json::from_str(json).unwrap();
+        let mc = root.multicast.expect("multicast field present");
+        let eps = mc.endpoints.expect("endpoints present");
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].group_address, "232.0.10.1");
+        assert_eq!(eps[0].tracks[0].packet_id, 1);
+    }
+
+    #[test]
+    fn root_without_multicast_round_trips() {
+        // A pre-multicast-extension catalog must still round-trip cleanly.
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {},
+            "tracks": []
+        }"#;
+        let root: Root = serde_json::from_str(json).unwrap();
+        assert!(root.multicast.is_none());
+        let back = serde_json::to_string(&root).unwrap();
+        // Optional multicast must NOT appear when None.
+        assert!(!back.contains("multicast"), "back = {back}");
+    }
+
+    #[test]
+    fn track_packaging_round_trips_all_variants() {
+        for (v, expected) in [
+            (TrackPackaging::Cmaf, "\"cmaf\""),
+            (TrackPackaging::Loc, "\"loc\""),
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            assert_eq!(json, expected, "serialize {v:?}");
+            let back: TrackPackaging = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v, "round-trip {v:?}");
+        }
+    }
 }
 
 impl Track {
@@ -89,6 +212,35 @@ pub enum TrackPackaging {
 
     #[serde(rename = "loc")]
     Loc,
+}
+
+/// Container format per draft-ramadan-moq-mmt §11.1.
+///
+/// Identifies how media is encapsulated inside MoQ objects. Distinct from
+/// `TrackPackaging` (which describes the streaming format CMAF vs LOC at the
+/// IETF draft-01 catalog level). Tracks MAY carry both fields independently.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub enum Container {
+    /// Raw ISOBMFF/MPU with the MMTP header stripped. Default when MoQ
+    /// transport provides timestamps and FEC out-of-band.
+    #[serde(rename = "isobmff")]
+    Isobmff,
+
+    /// MMTP-encapsulated MPU (Standard MPU mode). Object 0 of each group
+    /// carries the MPU metadata (mmpu+moov+moof). Subsequent objects carry
+    /// MFU payloads.
+    #[serde(rename = "mmtp")]
+    Mmtp,
+
+    /// MMTP MFU mode. Object 0 carries MPU metadata only; each subsequent
+    /// object carries one complete MFU (one coded frame). Enables per-frame
+    /// FEC protection and frame-level prioritization.
+    #[serde(rename = "mfu")]
+    Mfu,
+
+    /// FEC repair track per draft-ramadan-moq-fec.
+    #[serde(rename = "fec-repair")]
+    FecRepair,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
