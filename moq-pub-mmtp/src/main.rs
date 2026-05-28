@@ -39,8 +39,16 @@ async fn main() -> Result<()> {
     let catalog_bytes = tokio::fs::read(&args.catalog_json)
         .await
         .with_context(|| format!("reading catalog JSON {}", args.catalog_json.display()))?;
-    let catalog: Root = serde_json::from_slice(&catalog_bytes)
+    let mut catalog: Root = serde_json::from_slice(&catalog_bytes)
         .with_context(|| format!("parsing catalog JSON {}", args.catalog_json.display()))?;
+
+    // T5: library-level catalog validation (defense in depth — build_state_map
+    // re-checks the publisher-relevant invariants at runtime).
+    catalog
+        .validate()
+        .map_err(|e| anyhow::anyhow!("catalog validation failed: {e}"))?;
+    check_namespace_consistency(&catalog, &args.name)?;
+    catalog.expand_common_fields();
 
     // ---- moq-transport session ----
 
@@ -212,6 +220,25 @@ fn publish_catalog_track(
     // reader sees a complete object.
     drop(subgroup);
     Ok(subgroups)
+}
+
+/// Check that the catalog's embedded namespace (if any) matches the
+/// broadcast name from the `--name` CLI flag.
+///
+/// Catches a class of publisher misconfigurations where the catalog's
+/// `commonTrackFields.namespace` disagrees with the broadcast name the
+/// relay is announcing. If the common namespace is `None`, the
+/// publisher is the source of truth and any name is acceptable.
+fn check_namespace_consistency(catalog: &Root, name: &str) -> Result<()> {
+    if let Some(ns) = &catalog.common_track_fields.namespace {
+        if ns != name {
+            bail!(
+                "catalog namespace `{ns}` disagrees with broadcast --name `{name}`; \
+                 either align commonTrackFields.namespace with --name or omit it from the catalog"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Object-level priority for a source track keyed by container type.
@@ -546,6 +573,38 @@ mod tests {
         mpu.write_to(&mut buf).unwrap();
         buf.put_slice(&[0xAA, 0xBB]); // tiny payload
         buf.to_vec()
+    }
+
+    #[test]
+    fn check_namespace_consistency_passes_when_common_namespace_matches() {
+        // commonTrackFields.namespace = "bbb" matches --name=bbb → OK.
+        let mut cat = catalog_with(vec![track("v", Some(Container::Mmtp))], None);
+        cat.common_track_fields.namespace = Some("bbb".into());
+        check_namespace_consistency(&cat, "bbb").expect("matching namespace is OK");
+    }
+
+    #[test]
+    fn check_namespace_consistency_passes_when_no_common_namespace() {
+        // Common has no namespace → publisher sets it from --name; OK.
+        let cat = catalog_with(vec![track("v", Some(Container::Mmtp))], None);
+        check_namespace_consistency(&cat, "anything").expect("no common namespace is OK");
+    }
+
+    #[test]
+    fn check_namespace_consistency_errors_on_mismatch() {
+        // commonTrackFields.namespace = "foo" but --name=bar → hard error.
+        // Catches publisher misconfiguration where the broadcast name
+        // and the embedded catalog namespace disagree.
+        let mut cat = catalog_with(vec![track("v", Some(Container::Mmtp))], None);
+        cat.common_track_fields.namespace = Some("foo".into());
+        let err = match check_namespace_consistency(&cat, "bar") {
+            Err(e) => e,
+            Ok(()) => panic!("expected Err on mismatched namespace"),
+        };
+        assert!(
+            err.to_string().contains("namespace"),
+            "expected namespace mismatch err, got: {err}"
+        );
     }
 
     #[test]
