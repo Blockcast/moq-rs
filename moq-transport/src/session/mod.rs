@@ -553,7 +553,15 @@ impl Session {
         let mut sender = Writer::new(control.0);
         let mut recver = Reader::new(control.1);
 
-        let versions: setup::Versions = [setup::Version::DRAFT_14].into();
+        // M.4 T0 (BLO-4020 / .planning/moq-rs-m4-adr.md §A0): offer draft-16
+        // alongside draft-14 so receivers that only speak draft-16 (moqtail
+        // via `moqtail-private/libs/moqtail-ts/`, Shaka MSF in negotiated mode)
+        // can negotiate without falling back. `largest_common` picks the highest
+        // version both ends support; draft-14 is retained for compat with
+        // peers that haven't bumped yet. The data-plane encoder still emits
+        // the 0x10-0x1d StreamHeaderType range, which is valid in both drafts.
+        let versions: setup::Versions =
+            [setup::Version::DRAFT_16, setup::Version::DRAFT_14].into();
 
         // TODO SLG - make configurable?
         let mut params = KeyValuePairs::default();
@@ -658,7 +666,14 @@ impl Session {
             let _ = mlog.add_event(event);
         }
 
-        let server_versions = setup::Versions(vec![setup::Version::DRAFT_14]);
+        // M.4 T0 (BLO-4020 / .planning/moq-rs-m4-adr.md §A0): accept both
+        // draft-14 and draft-16. The relay (`moq-relay-ietf`) uses this accept
+        // path; bumping it lets a draft-16 client (post-T0 moq-pub-mmtp,
+        // moqtail, Shaka MSF) negotiate at draft-16 against the same relay.
+        let server_versions = setup::Versions(vec![
+            setup::Version::DRAFT_16,
+            setup::Version::DRAFT_14,
+        ]);
 
         if let Some(largest_common_version) =
             Self::largest_common(&server_versions, &client.versions)
@@ -975,5 +990,50 @@ mod tests {
         // Exactly at the limit (1024 total including leading slash)
         let path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN - 1));
         assert!(Session::normalize_connection_path(&path).is_ok());
+    }
+
+    // ========================================================================
+    // M.4 T0 — version negotiation (BLO-4020 / .planning/moq-rs-m4-adr.md §A0)
+    // ========================================================================
+
+    /// `largest_common` is the negotiation routine used in `Session::accept`.
+    /// Post-T0 both Session::connect and Session::accept offer
+    /// `[DRAFT_16, DRAFT_14]`; the largest common version must be DRAFT_16.
+    /// This pins T0's wire-version contract: the M.1 smoke (and any future
+    /// publisher run in this workspace) must negotiate at draft-16 so M.4
+    /// receivers (moqtail, Shaka MSF) can interop without a draft-14 fallback.
+    #[test]
+    fn largest_common_with_draft_14_and_16_picks_draft_16() {
+        // Both client and server offer [DRAFT_16, DRAFT_14] (post-T0 defaults).
+        let client = [setup::Version::DRAFT_16, setup::Version::DRAFT_14];
+        let server = [setup::Version::DRAFT_16, setup::Version::DRAFT_14];
+        assert_eq!(
+            Session::largest_common(&client, &server),
+            Some(setup::Version::DRAFT_16),
+            "post-T0 negotiation must pick DRAFT_16 when both ends support it"
+        );
+    }
+
+    /// Backwards-compat regression: a draft-14-only peer (e.g., a pre-T0
+    /// moq-pub-mmtp build, or an upstream moq-rs build that hasn't bumped)
+    /// must still negotiate cleanly. Pins the fallback path.
+    #[test]
+    fn largest_common_with_draft_14_only_peer_falls_back_to_draft_14() {
+        let post_t0 = [setup::Version::DRAFT_16, setup::Version::DRAFT_14];
+        let pre_t0 = [setup::Version::DRAFT_14];
+        assert_eq!(
+            Session::largest_common(&post_t0, &pre_t0),
+            Some(setup::Version::DRAFT_14),
+            "post-T0 endpoint must still negotiate with a draft-14-only peer"
+        );
+    }
+
+    /// If both peers somehow offer no common version, negotiation fails
+    /// cleanly (returns None — accept-side will reject the setup).
+    #[test]
+    fn largest_common_returns_none_when_no_overlap() {
+        let client = [setup::Version::DRAFT_16];
+        let server = [setup::Version::DRAFT_13];
+        assert_eq!(Session::largest_common(&client, &server), None);
     }
 }

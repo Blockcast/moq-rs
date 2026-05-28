@@ -27,6 +27,24 @@ impl Version {
 
     /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-14.html
     pub const DRAFT_14: Version = Version(0xff00000e);
+
+    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-15.html
+    ///
+    /// draft-15 is additive over draft-14 at the data plane: it preserves
+    /// the 0x10-0x1d stream-type range (priority present) and adds 0x30-0x3d
+    /// (priority absent, inherits from control message). moq-transport's
+    /// encoder only emits the 0x10-0x1d range today, which is valid
+    /// draft-15 framing.
+    pub const DRAFT_15: Version = Version(0xff00000f);
+
+    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.html
+    ///
+    /// draft-16 continues the additive evolution from draft-14/15. The
+    /// 0x10-0x1d "priority present" stream-type range remains valid, so
+    /// moq-transport's current encoder produces wire bytes that decode
+    /// as conformant draft-16 framing. Required for interop with
+    /// receivers that only speak draft-16 (e.g., moqtail).
+    pub const DRAFT_16: Version = Version(0xff000010);
 }
 
 impl From<u32> for Version {
@@ -150,6 +168,28 @@ mod tests {
             ]
         );
 
+        let decoded = Versions::decode(&mut buf).unwrap();
+        assert_eq!(decoded, versions);
+    }
+
+    /// Pins the IETF moq-transport draft-15 + draft-16 version constants per
+    /// `https://www.ietf.org/archive/id/draft-ietf-moq-transport-{15,16}.html`.
+    /// Added 2026-05-28 for M.4 T0: moqtail (`moqtail-private/libs/moqtail-ts/`)
+    /// speaks `0xff000010` and the Blockcast Shaka fork's MSF integration speaks
+    /// both `0xff00000e` and `0xff000010` via ALPN negotiation. The Display
+    /// formatting must continue to render `"DRAFT_16"` (lowercase hex byte → 16)
+    /// so log lines + mlog events remain readable.
+    #[test]
+    fn draft_15_and_16_constants_pin_ietf_codepoints() {
+        assert_eq!(Version::DRAFT_15.0, 0xff00000f);
+        assert_eq!(Version::DRAFT_16.0, 0xff000010);
+        assert_eq!(format!("{}", Version::DRAFT_15), "DRAFT_15");
+        assert_eq!(format!("{}", Version::DRAFT_16), "DRAFT_16");
+
+        // Round-trip both as a list (matches the actual setup wire shape).
+        let mut buf = BytesMut::new();
+        let versions = Versions(vec![Version::DRAFT_16, Version::DRAFT_14]);
+        versions.encode(&mut buf).unwrap();
         let decoded = Versions::decode(&mut buf).unwrap();
         assert_eq!(decoded, versions);
     }
