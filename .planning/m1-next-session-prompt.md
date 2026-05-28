@@ -1,7 +1,8 @@
-M.1 + most of M.1b of BLO-4020 (Cloudflare moq-rs MMTP migration) is COMPLETE.
-Four open PRs stacked on `blockcast/blo-4020-m1`; one M.1b sub-task deferred to
-M.4; one upstream issue draft awaiting external filing. Working directory:
-/home/oramadan/src/pim-multicast-gateway/moq-rs
+M.1 + most of M.1b of BLO-4020 (Cloudflare moq-rs MMTP migration) is COMPLETE,
+plus M.4 ADR drafted with locked A0-A3 decisions. Four open PRs stacked on
+`blockcast/blo-4020-m1`; one fork-only branch with the M.4 ADR; one upstream
+issue draft awaiting external filing; one M.1b sub-task deferred. Working
+directory: /home/oramadan/src/pim-multicast-gateway/moq-rs
 
 State as of 2026-05-28 (M.1 + B1+B3+B4 closed; B2 deferred to M.4; pick M.2 / upstream / receiver next):
 
@@ -88,10 +89,10 @@ PICK ONE FOR NEXT SESSION (in priority order):
 A. PR review / merge prep (likely fastest)
    - Address review comments on any of PRs #1-#4 as they come in.
    - When #1 merges, rebase the three stacked PRs onto blockcast/main per the
-     recipe above and re-push.
+     recipe below and re-push.
 
 B. File the upstream object_id_delta issue at cloudflare/moq-rs
-   - Draft body captured in BLO-8047 comment (most recent). Edit / send.
+   - Draft body captured in BLO-8047 (latest comment). Edit / send.
    - Watch for upstream response; sync vendored moq-transport when fix lands.
    - Add a regression test in moq-pub-mmtp after the fix:
      parse FRAGMENT=3 smoke mlog, assert publisher-side subgroup_object_parsed
@@ -106,11 +107,23 @@ C. M.2 — Cast bridge port (per umbrella BLO-4020)
      moq-pub-mmtp speaks (IETF moq-transport), so M.2 = porting MMTP packetization
      into Rust + replacing moq_lite with moq_transport.
 
-D. M.4 — Receiver-side draft-14+ client
-   - Inventory hang-mmt-fec, moqtail, Shaka. Design the multi-object SubgroupHeader
-     decoder, object loop, MfuReassembler wiring per B1=C contract, tier-switching
-     fallback. Out of M.1b scope per the ADR but gates production rollout.
-   - START WITH: receiver inventory + ADR. Reference B4 results.
+D. M.4 ADR sign-off + T0 (publisher draft-16 bump)
+   - M.4 ADR drafted 2026-05-28 on branch `blo-4020-m4-adr` (commits ec8e4b7 +
+     5ffd5e1 + 1b0c577). A0-A3 locked; Q3-Q8 still open (Pure-JS vs WASM
+     reassembler, tier latency, transportFactory wiring, multicast extern,
+     Track 3 FFI strategy, track sequencing).
+   - START WITH: answer Q3-Q8, then T0 = bump moq-pub-mmtp to negotiate
+     IETF moq-transport draft-16. Single change in moq-transport version
+     negotiation; gates T1+T2+T3 receivers (all draft-16).
+   - Track 1 (Shaka MMTP container support) recommended as first
+     post-T0 implementation track — smallest, mirrors existing LOCParser/
+     LocTransmuxer pattern, no other receivers touched.
+
+E. M.4 Track 1 (Shaka MMTP) — implementation after D's T0 lands
+   - shaka.msf.MMTPParser + shaka.transmuxer.MmtpTransmuxer (mirror LOC pattern).
+   - Receiver-side object_id_delta reconstruction (per A5/B3 sidesteps).
+   - @blockcast/transport wired as transportFactory.
+   - End-to-end smoke against moq-pub-mmtp (post-T0).
 
 READ FIRST (for any of the above):
 1. .planning/moq-rs-m1-adr.md — full ADR with A1-A5/C1 decisions, T1-T9 Implementation
@@ -119,6 +132,10 @@ READ FIRST (for any of the above):
 3. .planning/moq-rs-m1b-frag-results.md — B1=C smoke verdict (FRAGMENT=0 + FRAGMENT=3).
 4. .planning/moq-rs-m1b-obj-id-delta-results.md — B3 forensics + tentative upstream patch.
 5. .planning/moq-rs-m1b-g6-bytediff-results.md — B4 wire-format diff + M.4 scope implications.
+5b. .planning/moq-rs-m4-adr.md — M.4 ADR draft. A0-A3 locked (T0 publisher draft-16 bump
+    pre-task; Track 1 Shaka MMTP container; Track 2 moqtail tier-switching; Track 3
+    hang-mmt-fec migration INCLUDED in scope per session decision). Q3-Q8 still open.
+    Branch: blockcast/blo-4020-m4-adr (not yet a PR).
 6. moq-pub-mmtp/src/{main.rs,publish.rs,mmtp_parse.rs,framing.rs,udp.rs,cli.rs} — publisher.
 7. moq-sub-raw/src/{main.rs,subscribe.rs,cli.rs} — subscriber.
 8. moq-pub-mmtp/examples/synth_mmtp.rs + .planning/m1-smoke.sh — test pipeline
