@@ -1,39 +1,36 @@
 Resume M.1 of BLO-4020 (Cloudflare moq-rs MMTP migration). Working directory:
 /home/oramadan/src/pim-multicast-gateway/moq-rs
 
-State as of 2026-05-28 (Lane A T1-T4 + T6 all DONE — paused per prompt):
-- 30 unit tests green across moq-pub-mmtp; moq-catalog still at 19 = 49 total.
-- Release build green, zero warnings.
-- T6 ✅ mmt-core vendored at libmmt commit 929e5b0c... under
-  moq-pub-mmtp/vendor/mmt-core/, VENDOR.md + explicit deps, builds standalone.
-- T1 ✅ publisher loop with spec-true grouping. publish.rs has:
+State as of 2026-05-28 (Lane A DONE, committed, rebased, pushed, PR open):
+- Local main = blockcast/blo-4020-m1, 4 commits on top of upstream f0a709a
+  (rebased onto latest upstream cleanly, zero conflicts).
+- 49 unit tests green: moq-pub-mmtp (30) + moq-catalog (19).
+- Commits on the branch (oldest → newest):
+    dbf5ee1 docs(planning): M.0 moq-rs baseline test results
+    6ee40ff feat(moq-catalog): Container enum + multicast catalog extension
+    bde975d docs(planning): M.1 ADR + handoff prompt
+    3101aca feat(moq-pub-mmtp): MMTP publisher for IETF moq-transport (draft-14+)
+- PR open: https://github.com/Blockcast/moq-rs/pull/1
+  Title: "BLO-4020 M.1: MMTP publisher on IETF moq-transport (draft-14+)"
+  Base: Blockcast/moq-rs:main; Head: Blockcast/moq-rs:blo-4020-m1.
+
+Remotes:
+  origin    git@github.com:cloudflare/moq-rs   (upstream, untouched)
+  blockcast git@github.com:Blockcast/moq-rs.git (Blockcast fork; local main
+                                                  tracks blockcast/blo-4020-m1)
+
+What landed this session (T1-T4 + T6):
+- T6 ✅ mmt-core vendored at libmmt commit 929e5b0c7a14f6ffe0ecd50d792fff7cdc44ba0a
+  under moq-pub-mmtp/vendor/mmt-core/, VENDOR.md + explicit deps.
+- T1 ✅ publisher loop with A1/A2/A3 invariants. publish.rs has:
     * TrackSubgroups + SubgroupWrite traits abstracting moq-transport for tests
     * TrackState<T> + RepairSink<T> data structures
     * dispatch() enforcing A1 (Init-only first packet of new MPU), A2 (MPU
       monotonicity hard-error), A3 (unknown packet_id hard-error)
-    * 5 dispatch unit tests RED-first then GREEN
-  main.rs wires Tracks::new → produce → build_state_map → publish_catalog_track
-  → tokio::select! over session.run + publisher.announce + run_publisher.
-  6 build_state_map + priority_for_container tests pin the wiring contract.
-- T2 ✅ .catalog track at startup. publish_catalog_track() creates `.catalog`
-  track, opens group 0 subgroup 0 at priority 127, writes full catalog JSON
-  as one object. Sibling test pins track registration.
-- T3 ✅ FEC repair routing. build_state_map auto-creates `<source>/repair`
-  sibling track for every catalog source. Dispatch's Repair branch routes
-  to RepairSink at priority 7. Repair group_id MIRRORS source MPU group_id
-  so receiver can correlate by MPU sequence. 5 RED-first repair tests +
-  build_state_map repair-registration test.
-- T4 ✅ UDP input mode. run_udp_loop() binds tokio::net::UdpSocket, recv_from
-  loop, each datagram = one MMTP packet (no length prefix). recv_one_udp_packet
-  extracted as testable helper. RED-first integration test sends one synth
-  MPU Init packet via UdpSocket pair, asserts dispatch happened.
-
-BRANCH NOTE: still on `main` with all M.0 + M.1 work UNCOMMITTED. User has
-been working on main throughout; their "go on" after the prior prompt was
-explicit consent. Modified files: Cargo.lock, Cargo.toml, moq-catalog/{Cargo.toml,
-src/lib.rs}, moq-pub/src/media.rs. Untracked: .planning/, moq-catalog/src/
-multicast.rs, moq-pub-mmtp/. If user wants to commit before continuing, ask
-which logical chunks to split into commits.
+- T2 ✅ .catalog track posted at startup (group 0, priority 127).
+- T3 ✅ FEC repair routed to <name>/repair siblings at priority 7; repair
+  group_id mirrors source MPU group_id.
+- T4 ✅ UDP input mode (one datagram = one MMTP packet, no length prefix).
 
 READ FIRST (in order):
 1. /home/oramadan/src/pim-multicast-gateway/moq-rs/.planning/moq-rs-m1-adr.md
@@ -59,8 +56,8 @@ T5 — Catalog validation expansion (P1, ~20min CC)
   RED tests FIRST in moq-catalog/src/lib.rs or a new validation module:
     (a) duplicate packet_id across multicast.endpoints[].tracks[] → error.
     (b) multicast.endpoints[].tracks[].name not in catalog.tracks[].name → error.
-    (c) commonTrackFields expansion: a track inherits namespace/packaging/render_group
-        from common when the track-level field is None.
+    (c) commonTrackFields expansion: a track inherits namespace/packaging/
+        render_group from common when the track-level field is None.
     (d) namespace ≠ --name CLI flag → warn or error (consistency check).
     (e) Container::FecRepair appearing in catalog.tracks[] is a M.1b error
         (sources only in M.1 — repair tracks are publisher-derived).
@@ -100,13 +97,25 @@ T9 — End-to-end smoke + mlog verification (P2, ~20min CC)
   current cast/libmoq MMTP output (NOT M.0 fMP4). Record verdict in
   .planning/moq-rs-m1-results.md.
 
-CONSTRAINTS (carry-forward from prior session):
+WORKFLOW NOTES (for next session):
+- Branch is `main` locally but tracking `blockcast/blo-4020-m1`. New commits
+  on top of this branch land on the existing PR #1. If T5/T7 belong on the
+  same PR, just commit + push. If they should be separate PRs, branch off
+  before committing (e.g., `git checkout -b blo-4020-m1-t5`).
+- Upstream churn: 47 commits landed between f9f51dc and f0a709a (the
+  rebase target). Re-rebase before merge if upstream moves again. Watch
+  for moq-transport API changes — our dispatch uses SubgroupsWriter::create
+  with explicit (group_id, subgroup_id, priority) which is stable today.
+- PR #1 description has the full test plan: `cargo test -p moq-pub-mmtp -p
+  moq-catalog` should keep showing 30 + 19 = 49 green.
+
+CONSTRAINTS (carry-forward):
 - TDD strict per superpowers/test-driven-development: RED test, watch fail,
-  GREEN minimal impl, repeat. T1-T4 all followed this — keep the cadence.
+  GREEN minimal impl, repeat. T1-T4 followed this — keep the cadence.
 - Use mmt-core types: MmtpHeader, MpuHeader, PacketType, FragmentType::Init.
-- moq-transport SubgroupsWriter::create drops subgroups silently if group_id
-  ≤ latest (subgroup.rs:116-128) — A2 monotonicity catches; don't lean on writer.
-- Publisher connect URL: NO path component (root). Subscriber too (M.0 finding).
+- moq-transport SubgroupsWriter::create silently drops group_id ≤ latest
+  (subgroup.rs:116-128) — A2 monotonicity catches; don't lean on writer.
+- Publisher connect URL: NO path component (root). Subscriber too (M.0).
 - Path-deps OK for moq-* workspace crates; mmt-core is vendored.
 - Run cargo test after each TDD cycle; do not batch.
 
