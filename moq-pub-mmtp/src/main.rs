@@ -18,6 +18,7 @@ mod cli;
 mod framing;
 mod mmtp_parse;
 mod publish;
+mod udp;
 
 use cli::{Args, MmtpInput};
 use mmtp_parse::route;
@@ -278,9 +279,10 @@ async fn run_udp_loop(
     bind: std::net::SocketAddr,
     state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>>,
 ) -> Result<()> {
-    let socket = tokio::net::UdpSocket::bind(bind)
-        .await
-        .with_context(|| format!("binding UDP socket on {bind}"))?;
+    // open_udp_socket binds + (for multicast targets) joins the group
+    // and enables loopback so cast/ffmpeg's multicast emission via
+    // `moqenc_mmt` lands here without a separate flag.
+    let socket = udp::open_udp_socket(bind).await?;
     tracing::info!(addr = %socket.local_addr()?, "listening for MMTP datagrams");
     // 65536 covers any IPv4/IPv6 MTU; oversized datagrams get truncated.
     let mut buf = vec![0u8; 65_536];
