@@ -1,141 +1,176 @@
-M.1 of BLO-4020 (Cloudflare moq-rs MMTP migration) is COMPLETE.
-PR #1 open, 9 commits, 69 unit tests + smoke. Working directory:
+M.1 + most of M.1b of BLO-4020 (Cloudflare moq-rs MMTP migration) is COMPLETE.
+Four open PRs stacked on `blockcast/blo-4020-m1`; one M.1b sub-task deferred to
+M.4; one upstream issue draft awaiting external filing. Working directory:
 /home/oramadan/src/pim-multicast-gateway/moq-rs
 
-State as of 2026-05-28 (M.1 closed; pick from M.1b / M.2 / G6 next):
+State as of 2026-05-28 (M.1 + B1+B3+B4 closed; B2 deferred to M.4; pick M.2 / upstream / receiver next):
 
 Branch on fork: https://github.com/Blockcast/moq-rs/tree/blo-4020-m1
-PR #1:        https://github.com/Blockcast/moq-rs/pull/1
-              "BLO-4020 M.1: MMTP publisher on IETF moq-transport (draft-14+)"
-Base:         blockcast/main (latest upstream tip, rebased cleanly)
+Local main:     tracks blockcast/blo-4020-m1 (10 commits over upstream)
+Paperclip tracking:
+  - BLO-4020 (umbrella):  https://paperclip.blockcast.net/BLO/issues/BLO-4020
+  - BLO-8047 (M.1b umbrella, sub of BLO-4020): same path, /BLO-8047
 
-Commits on the branch (oldest → newest):
-  dbf5ee1 docs(planning): M.0 moq-rs baseline test results
-  6ee40ff feat(moq-catalog): Container enum + multicast catalog extension
-  bde975d docs(planning): M.1 ADR + handoff prompt
-  3101aca feat(moq-pub-mmtp): MMTP publisher for IETF moq-transport (draft-14+)
-  3338040 docs(planning): update M.1 handoff — Lane A done, PR #1 open
-  b05dfce feat(moq-catalog,moq-pub-mmtp): T5 catalog validation expansion
-  509c5c8 feat(moq-sub-raw): raw per-track payload subscriber (T7)
-  526f0e9 feat(moq-pub-mmtp): multicast UDP listener (T8.5)
-  5e7310c feat(moq-pub-mmtp): T9 end-to-end smoke + per-track sha256 verification
+OPEN PULL REQUESTS
+==================
+All four PRs stacked on `blo-4020-m1` (PR #1 is the M.1 base). PR #1 must merge first;
+then #2/#3/#4 rebase onto blockcast/main and merge in any order. They are independent.
 
-Remotes:
-  origin    git@github.com:cloudflare/moq-rs   (upstream, untouched)
-  blockcast git@github.com:Blockcast/moq-rs.git (Blockcast fork; local main
-                                                  tracks blockcast/blo-4020-m1)
+  PR #1: BLO-4020 M.1: MMTP publisher on IETF moq-transport (draft-14+)
+         https://github.com/Blockcast/moq-rs/pull/1
+         10 commits, 69 unit tests + smoke green. T1-T9 landed (T8 N/A per pushback).
 
-Total tests across the three crates (all green, zero warnings):
-  - moq-catalog: 24
-  - moq-pub-mmtp: 39 + synth_mmtp example
-  - moq-sub-raw: 6
-  - = 69 unit + smoke pass
+  PR #2: BLO-8047 §B1: raw-passthrough fragmentation contract (stacked on #1)
+         https://github.com/Blockcast/moq-rs/pull/2
+         1 commit (ec8e4b7). 6 files, +431 / -20. Adds 2 characterization tests,
+         synth_mmtp --fragment flag + unit test, m1-smoke FRAGMENT=N env knob,
+         ADR amendment, results doc. Smoke PASS at FRAGMENT=0 (regression baseline,
+         hashes identical to M.1 results) and FRAGMENT=3 (new contract, 960 B/track).
 
-What landed (all T-tasks from the ADR):
-- T1 ✅ publisher loop with A1/A2/A3 invariants. dispatch fn extracted
-  over TrackSubgroups + SubgroupWrite traits for testability.
-- T2 ✅ .catalog track at group 0 / priority 127.
-- T3 ✅ auto `<name>/repair` siblings at priority 7, repair group_id
-  mirrors source MPU group_id.
-- T4 ✅ UDP input mode + T8.5 multicast group auto-join.
-- T5 ✅ Root::validate() (duplicate packet_id, unknown track ref,
-  FecRepair in catalog.tracks) + Root::expand_common_fields() +
-  publisher namespace consistency check.
-- T6 ✅ mmt-core vendored at libmmt 929e5b0c.
-- T7 ✅ moq-sub-raw crate (drain_track_to_writer + CLI validation).
-- T8 ✅ N/A — moqenc_mmt already uses AVIOContext properly; no FFmpeg
-  changes needed (architecture pushback validated mid-session).
-- T9 ✅ end-to-end smoke with synth_mmtp → UDP → moq-pub-mmtp →
-  relay → moq-sub-raw → per-track sha256 PASS, mlog framing captured.
+  PR #3: BLO-8047 §B3: object_id_delta wire-encoding bug forensics (stacked on #1)
+         https://github.com/Blockcast/moq-rs/pull/3
+         1 commit (1cf8bb4). 1 file, +140. Docs-only forensics doc proving the bug
+         at moq-transport/src/session/subscribed.rs:281 ("object_id_delta: 0, //
+         before delta logic"). Includes mlog evidence + suggested upstream patch.
+
+  PR #4: BLO-8047 §B4: G6 byte-diff vs libmoq — wire formats diverge by design
+         https://github.com/Blockcast/moq-rs/pull/4
+         1 commit (8c404c9). 1 file, +138. Docs-only static code comparison
+         between cast/moq_lite and moq-pub-mmtp/IETF. Confirms B2 is moot for the
+         cast path; M.4 receiver migration is a major rewrite.
+
+PRs are stacked-on-#1. When PR #1 merges:
+  1. Rebase main onto blockcast/main: git fetch blockcast && git rebase blockcast/main
+  2. Rebase #2/#3/#4 onto blockcast/main: git checkout blo-4020-m1b-frag &&
+     git rebase blockcast/main && git push -f blockcast HEAD:blo-4020-m1b-frag
+  3. Repeat for blo-4020-m1b-obj-id-delta and blo-4020-m1b-g6-bytediff.
+
+THIS SESSION'S WORK (2026-05-28)
+=================================
+- B1=C closed by architectural pushback (same shape as T8): MMTP fragmentation
+  reassembly stays at the receiver via mmt-core::MfuReassembler (already vendored).
+  Dimensional math: AMT MTU ≈ 1416 B per fragment → 4K I-frames need 220-1100
+  fragments, 8K needs 750-2900. Erroring on FI != 0 would reject all video above
+  1080p audio. Receivers (moqtail @moq/hang, Shaka via WASM) already do reassembly.
+  Pinned by tests + ADR amendment + smoke at FRAGMENT=3. PR #2.
+
+- B3 forensic confirmation of Codex #6: moq-transport's publisher hardcodes
+  object_id_delta=0 for every wire object. Bug masked by moq-relay-ietf's egress
+  next_object_id auto-increment; affects direct publisher-to-subscriber topology.
+  Upstream issue drafted (in BLO-8047 description) but NOT filed — to be sent via
+  a different channel. PR #3.
+
+- B4 static code comparison: cast uses moq_lite (no subgroup/object_id concept);
+  moq-pub-mmtp uses IETF moq-transport draft-14 (multi-object subgroups). Wire
+  formats diverge by design. M.4 receivers need full multi-object subgroup decoder.
+  PR #4.
+
+- B2 re-scoped: per-FEC-block (SBN) grouping was originally framed as "high
+  operational value" but moq-lite (cast's wire) doesn't use subgroups at all.
+  B2 only matters once M.4 lands. Deferred to M.4 prerequisite work in BLO-8047.
+
+DEFERRED / OUT OF M.1b SCOPE
+============================
+- B2 (per-FEC-block SBN grouping): deferred to M.4 prerequisite work.
+- Upstream object_id_delta issue filing at cloudflare/moq-rs: draft captured in
+  BLO-8047, to be filed via different channel.
+- M.2 (cast bridge port): biggest blast radius of any remaining work. Replaces
+  cast's FFmpeg moq_mmt + libmoq C-ABI hop with native Rust pipeline. Separate
+  ADR + plan-phase needed before starting.
+- M.4 (receiver migration): hang-mmt-fec / moqtail / Shaka switch to IETF
+  moq-transport. Includes multi-object subgroup decoder, MfuReassembler wiring,
+  per-FEC-block (SBN) grouping consumption, tier-switching fallback for
+  FEC-irrecoverable 8K I-frames.
 
 PICK ONE FOR NEXT SESSION (in priority order):
+==============================================
 
-A. **PR #1 review / merge prep** (likely fastest)
-   - Wait for / address review comments on the PR.
-   - Re-rebase on blockcast/main if upstream moves.
-   - Optional: squash the 9 commits if reviewer prefers fewer.
-   - Land it.
+A. PR review / merge prep (likely fastest)
+   - Address review comments on any of PRs #1-#4 as they come in.
+   - When #1 merges, rebase the three stacked PRs onto blockcast/main per the
+     recipe above and re-push.
 
-B. **M.1b leftovers from the ADR's "NOT in scope for M.1" list**
-   Pick any of these — they're independent, small-to-medium scope:
-   - **M.1b-frag**: MMTP fragmentation reassembly. Today dispatch
-     errors if `fragmentation_indicator != 0`. Add reassembly state
-     per (packet_id, mpu_sequence). RED tests first: build fragmented
-     packet sequences, dispatch reassembles, single object emitted
-     per logical MPU.
-   - **M.1b-fec-grouping**: per-FEC-block grouping for repair tracks.
-     Today repair lands on a single rolling group per /repair track
-     keyed to source MPU. Spec asks for per-FEC-block (SBN) grouping
-     so receivers can correlate repair symbols with source blocks at
-     finer grain. Requires parsing Source/Repair FEC Payload ID.
-   - **M.1b-object-id-delta**: Codex #6 follow-up. Validate
-     moq-transport's `object_id_delta` encoding against draft-14+
-     in an mlog dump. If broken, file upstream + patch downstream.
-   - **G6 byte-diff**: co-located libmoq + moq-pub-mmtp capture.
-     Run cast/libmoq emission and moq-pub-mmtp side-by-side, capture
-     mlog/qlog on both, diff at the SUBGROUP/OBJECT frame level.
-     If framing differs beyond payload, file the diff for the
-     IETF draft-15+ tracking.
+B. File the upstream object_id_delta issue at cloudflare/moq-rs
+   - Draft body captured in BLO-8047 comment (most recent). Edit / send.
+   - Watch for upstream response; sync vendored moq-transport when fix lands.
+   - Add a regression test in moq-pub-mmtp after the fix:
+     parse FRAGMENT=3 smoke mlog, assert publisher-side subgroup_object_parsed
+     events show object_id ∈ {0,1,2,3} per subgroup. Today: fails (all 0);
+     after upstream fix: passes.
 
-C. **M.2 — Cast bridge port (per umbrella BLO-4020)**
-   Replace cast's ffmpeg moq_mmt muxer + libmoq C-ABI hop with a
-   native Rust pipeline. Biggest blast radius of any remaining
-   work. Plan: separate ADR + plan-phase before starting.
+C. M.2 — Cast bridge port (per umbrella BLO-4020)
+   - Replace cast's ffmpeg moq_mmt muxer + libmoq C-ABI hop with a native Rust
+     pipeline. Biggest blast radius of any remaining work.
+   - START WITH: separate ADR + plan-phase before any code. Reference B4 results
+     for the wire-format constraints: cast must speak the same wire that
+     moq-pub-mmtp speaks (IETF moq-transport), so M.2 = porting MMTP packetization
+     into Rust + replacing moq_lite with moq_transport.
 
-D. **Receiver-side M.4 prep**
-   Inventory the receivers (hang-mmt-fec, moqtail) and design the
-   draft-14+ client they need. Out of M.1 scope per the ADR but
-   gates production rollout.
+D. M.4 — Receiver-side draft-14+ client
+   - Inventory hang-mmt-fec, moqtail, Shaka. Design the multi-object SubgroupHeader
+     decoder, object loop, MfuReassembler wiring per B1=C contract, tier-switching
+     fallback. Out of M.1b scope per the ADR but gates production rollout.
+   - START WITH: receiver inventory + ADR. Reference B4 results.
 
 READ FIRST (for any of the above):
-1. .planning/moq-rs-m1-adr.md — full ADR with A1-A5/C1 decisions,
-   Implementation Tasks T1-T9, GSTACK eng review.
-2. .planning/moq-rs-m1-results.md — smoke verdict + DoD table + the
-   open M.1b items listed above.
-3. .planning/moq-rs-m0-results.md — M.0 baseline + dev/pub vs dev/sub
-   scope-mismatch caveat (still applicable).
-4. moq-pub-mmtp/src/{main.rs,publish.rs,mmtp_parse.rs,framing.rs,
-   udp.rs,cli.rs} — publisher current state.
-5. moq-sub-raw/src/{main.rs,subscribe.rs,cli.rs} — subscriber.
-6. moq-pub-mmtp/examples/synth_mmtp.rs + .planning/m1-smoke.sh —
-   the test pipeline.
-7. moq-pub-mmtp/vendor/mmt-core/src/header.rs — canonical MMTP/MPU
-   parsers; vendored at pinned commit.
+1. .planning/moq-rs-m1-adr.md — full ADR with A1-A5/C1 decisions, T1-T9 Implementation
+   Tasks, GSTACK eng review. Amended 2026-05-28 with the B1=C raw-passthrough contract.
+2. .planning/moq-rs-m1-results.md — M.1 smoke verdict + DoD table.
+3. .planning/moq-rs-m1b-frag-results.md — B1=C smoke verdict (FRAGMENT=0 + FRAGMENT=3).
+4. .planning/moq-rs-m1b-obj-id-delta-results.md — B3 forensics + tentative upstream patch.
+5. .planning/moq-rs-m1b-g6-bytediff-results.md — B4 wire-format diff + M.4 scope implications.
+6. moq-pub-mmtp/src/{main.rs,publish.rs,mmtp_parse.rs,framing.rs,udp.rs,cli.rs} — publisher.
+7. moq-sub-raw/src/{main.rs,subscribe.rs,cli.rs} — subscriber.
+8. moq-pub-mmtp/examples/synth_mmtp.rs + .planning/m1-smoke.sh — test pipeline
+   (now with --fragment N + FRAGMENT=N support).
+9. moq-pub-mmtp/vendor/mmt-core/src/{header.rs,reassembler.rs} — canonical MMTP/MPU
+   parsers; vendored at pinned commit. Note reassembler.rs is the receiver-side
+   reassembly that B1=C pins as the canonical implementation.
+10. moq-transport/src/session/subscribed.rs:281 — B3 bug location; do not patch
+    locally without consulting BLO-8047 §B3.
 
-WORKFLOW NOTES:
-- Local `main` tracks `blockcast/blo-4020-m1`. New commits push to
-  PR #1 automatically. If a follow-up should be a separate PR,
-  branch off first (`git checkout -b blo-4020-m1b-frag` etc).
-- `origin = cloudflare/moq-rs` is upstream and read-only; never
-  push there.
-- M.1 smoke is repeatable: `env -i HOME=$HOME PATH=$PATH
-  bash .planning/m1-smoke.sh`. Without `env -i`, pre-set GROUPS /
-  PACKET_DELAY_MS in the operator's shell silently override the
-  defaults (this bit us once; documented in results.md).
-- `/tmp/moq-coordinator.json` accumulates state across `--dev`
-  runs of moq-relay-ietf. The smoke script cleans it up; ad-hoc
-  runs may need a manual `rm /tmp/moq-coordinator.json` if a
-  namespace shows as `duplicate`.
+WORKFLOW NOTES
+==============
+- Local `main` tracks `blockcast/blo-4020-m1`. Direct commits to main push to PR #1
+  automatically. For follow-up work on PRs #2/#3/#4, check out their branches:
+    git checkout blo-4020-m1b-frag           # PR #2 (B1=C)
+    git checkout blo-4020-m1b-obj-id-delta   # PR #3 (B3)
+    git checkout blo-4020-m1b-g6-bytediff    # PR #4 (B4)
+  Their upstream tracking was deliberately detached as a safety so stray pushes
+  can't land on PR #1's branch. Use explicit `git push blockcast HEAD:<name>` when
+  you want to push.
+- `origin = cloudflare/moq-rs` is upstream and read-only; never push there.
+- M.1 smoke is repeatable: `env -i HOME=$HOME PATH=$PATH bash .planning/m1-smoke.sh`.
+  New env knob: `FRAGMENT=N` (default 0). N >= 1 exercises the raw-passthrough
+  fragmentation path (Init + N MFU fragments per MPU).
+- `/tmp/moq-coordinator.json` accumulates state across `--dev` runs of
+  moq-relay-ietf. The smoke script cleans it up; ad-hoc runs may need a manual
+  `rm /tmp/moq-coordinator.json` if a namespace shows as `duplicate`.
 
-CONSTRAINTS (carry-forward — every TDD cycle this session followed):
-- TDD strict per superpowers/test-driven-development: RED test first,
-  watch it fail, GREEN minimal impl, repeat. The session had one slip
-  (writing impl + tests together in T7) which was caught by the test
-  failing — pinned the SubgroupsReader latest-only semantics as the
-  documented surprise.
-- Use mmt-core types: MmtpHeader, MpuHeader, PacketType,
-  FragmentType::Init. Vendored at moq-pub-mmtp/vendor/mmt-core/.
-- moq-transport SubgroupsWriter::create silently drops group_id ≤
-  latest (subgroup.rs:116-128). A2 monotonicity catches this; don't
-  lean on the writer.
-- Publisher and subscriber connect URLs must match (no path) so they
-  land in the same UNSCOPED tenant bucket on moq-relay-ietf
-  (M.0 dev-scripts finding).
-- SubgroupsReader surfaces only the LATEST subgroup — slow consumers
-  miss intermediates. moq-sub-raw drains with a fast loop; tests
-  pace producers when they need to verify multi-group sequencing.
+CONSTRAINTS (carry-forward)
+============================
+- TDD strict per superpowers/test-driven-development: RED test first, watch it
+  fail, GREEN minimal impl, repeat. Characterization tests pinning existing
+  behavior are OK to pass on first run if explicitly documented as such.
+- Use mmt-core types: MmtpHeader, MpuHeader, PacketType, FragmentType. Vendored
+  at moq-pub-mmtp/vendor/mmt-core/.
+- moq-transport SubgroupsWriter::create silently drops group_id ≤ latest
+  (subgroup.rs:116-128). A2 monotonicity catches this; don't lean on the writer.
+- Publisher and subscriber connect URLs must match (no path) so they land in the
+  same UNSCOPED tenant bucket on moq-relay-ietf (M.0 dev-scripts finding).
+- SubgroupsReader surfaces only the LATEST subgroup — slow consumers miss
+  intermediates. moq-sub-raw drains with a fast loop; tests pace producers when
+  they need to verify multi-group sequencing.
 - Run cargo test after each TDD cycle; do not batch.
+- The publisher is RAW-PASSTHROUGH (B1=C): each MMTP packet — Init and every MFU
+  fragment with FI ∈ {0,1,2,3} — becomes a separate MoQ object in the
+  (packet_id, mpu_sequence) subgroup. Do NOT add reassembly to the publisher; the
+  receiver owns reassembly via mmt-core::MfuReassembler.
 
-ASK BEFORE: cross-AI tensions or new design decisions stop and ask.
-Push back on anything that violates the ADR's locked decisions
-A1-A5/C1.
+ASK BEFORE
+==========
+- Cross-AI tensions or new design decisions: stop and ask.
+- Pushing to remote branches: confirm the destination explicitly.
+- Filing upstream issues at cloudflare/moq-rs: confirm before sending.
+- Push back on anything that violates the ADR's locked decisions A1-A5/C1 + the
+  B1=C raw-passthrough contract.
