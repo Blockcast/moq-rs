@@ -546,6 +546,70 @@ mod tests {
         assert_eq!(group.writes[1], Bytes::from_static(b"frame1"));
         assert_eq!(group.writes[2], Bytes::from_static(b"frame2"));
     }
+
+    #[test]
+    fn fragmented_mfu_packets_share_one_subgroup_raw_passthrough() {
+        // B1=C raw-passthrough fragmentation contract (BLO-8047 §B1):
+        //
+        // A logical MFU larger than the path MTU is split by the source
+        // into N MMTP packets (ISO/IEC 23008-1:2023 §9.2.3.3). On the
+        // wire we see: one Init packet carrying the MPU metadata box,
+        // then N MFU packets with FragmentType=Mfu and
+        // fragmentation_indicator ∈ {1=first, 2=middle, 3=last}, all
+        // sharing the same mpu_sequence and an incrementing
+        // fragment_counter.
+        //
+        // The PUBLISHER does NOT reassemble. Each MMTP packet — Init
+        // included — lands as its own MoQ object in the single subgroup
+        // keyed by (packet_id, mpu_sequence). The receiver reassembles
+        // using `mmt-core::MfuReassembler` (vendored at
+        // moq-pub-mmtp/vendor/mmt-core/src/reassembler.rs).
+        //
+        // Erroring on fragmentation here would reject every video stream
+        // above 1080p audio (4K I-frames at MTU=1416 need 220-1100
+        // fragments; 8K needs 750-2900). See BLO-8047 description for
+        // the full MTU/I-frame fragmentation math.
+        //
+        // This test pins the contract end-to-end on the dispatch layer:
+        // 4 packets at the same (packet_id, mpu_seq) → 1 create_group
+        // call, 4 put_object writes preserved verbatim.
+        let mut map = make_state_map(1, 5);
+        let pkts: &[(FragmentType, &[u8])] = &[
+            // Init: MPU metadata box (FI=0 implicit; PacketRouting carries
+            // only fragment_type, not FI, by design).
+            (FragmentType::Init, b"init-mpu-10"),
+            // First MFU fragment (would carry FI=1 on the wire).
+            (FragmentType::Mfu, b"mfu-fragment-1"),
+            // Middle MFU fragment (FI=2 on the wire).
+            (FragmentType::Mfu, b"mfu-fragment-2"),
+            // Last MFU fragment (FI=3 on the wire). Reassembled by the
+            // receiver into one logical MFU together with fragments 1-2.
+            (FragmentType::Mfu, b"mfu-fragment-3"),
+        ];
+        for (frag, payload) in pkts {
+            dispatch(&mut map, &mpu(1, 10, *frag), Bytes::copy_from_slice(payload))
+                .expect("raw-passthrough must accept all fragments of one MPU");
+        }
+        let state = map.get(&1).unwrap();
+        assert_eq!(
+            state.sink.groups_created,
+            vec![(10, 0, 5)],
+            "exactly one subgroup created for the single MPU (group_id=mpu_seq=10, subgroup_id=0, priority=5)"
+        );
+        let group = state.current_group.as_ref().expect("current_group is open");
+        assert_eq!(
+            group.writes.len(),
+            4,
+            "all 4 MMTP packets (Init + 3 MFU fragments) land as separate MoQ objects"
+        );
+        // Payloads preserved verbatim — raw-passthrough means no
+        // transformation between the inbound MMTP packet bytes and the
+        // outbound MoQ object payload.
+        assert_eq!(group.writes[0], Bytes::from_static(b"init-mpu-10"));
+        assert_eq!(group.writes[1], Bytes::from_static(b"mfu-fragment-1"));
+        assert_eq!(group.writes[2], Bytes::from_static(b"mfu-fragment-2"));
+        assert_eq!(group.writes[3], Bytes::from_static(b"mfu-fragment-3"));
+    }
 }
 
 // ---- moq-transport adapter (wired in main.rs, not used by tests) ----

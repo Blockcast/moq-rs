@@ -143,4 +143,55 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// Build an MMTP packet carrying one MFU fragment with the given
+    /// fragmentation_indicator (FI) and fragment_counter. Used by the
+    /// raw-passthrough contract tests (B1=C) — see
+    /// `accepts_fragmented_mfu_packets_at_fi_1_2_3` below.
+    fn synth_mfu_fragment_packet(
+        packet_id: u16,
+        mpu_sequence: u32,
+        fi: u8,
+        fragment_counter: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let hdr = MmtpHeader::new(packet_id, PacketType::Mpu);
+        let mut mpu = MpuHeader::new(FragmentType::Mfu, mpu_sequence);
+        mpu.fragmentation_indicator = fi;
+        mpu.fragment_counter = fragment_counter;
+        mpu.payload_length = payload.len() as u16;
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+        mpu.write_to(&mut buf).unwrap();
+        buf.put_slice(payload);
+        buf.to_vec()
+    }
+
+    #[test]
+    fn accepts_fragmented_mfu_packets_at_fi_1_2_3() {
+        // B1=C raw-passthrough contract: the parser MUST accept MFU
+        // fragments (FragmentType=Mfu, fragmentation_indicator ∈ {1,2,3})
+        // without error. The publisher does not reassemble; FI is
+        // intentionally absent from PacketRouting because each fragment
+        // is forwarded as its own MoQ object and the receiver
+        // reassembles via mmt-core::MfuReassembler.
+        //
+        // Pinning this contract here prevents future regressions where
+        // the parser starts rejecting FI != 0 (which would reject every
+        // video stream above 1080p audio — see BLO-8047 §B1 for the
+        // MTU/I-frame fragmentation math).
+        for (fi, counter) in [(1u8, 0u8), (2, 1), (3, 2)] {
+            let pkt = synth_mfu_fragment_packet(7, 42, fi, counter, b"frag");
+            let r = route(&pkt)
+                .unwrap_or_else(|e| panic!("route() rejected FI={fi}, counter={counter}: {e}"));
+            assert_eq!(r.packet_id, 7);
+            assert_eq!(r.packet_type, PacketType::Mpu);
+            assert_eq!(r.mpu_sequence, Some(42));
+            assert_eq!(
+                r.fragment_type,
+                Some(FragmentType::Mfu),
+                "FI={fi}: routing key must carry FragmentType::Mfu",
+            );
+        }
+    }
 }
