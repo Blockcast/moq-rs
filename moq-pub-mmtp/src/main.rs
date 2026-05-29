@@ -63,13 +63,15 @@ async fn main() -> Result<()> {
         "built per-track state map from catalog"
     );
 
-    // Publish the catalog JSON on the `.catalog` track. The returned
-    // SubgroupsWriter is bound for the session's lifetime — dropping
-    // it would surface as "catalog gone" to subscribers.
+    // Publish the catalog JSON on the catalog tracks (canonical `catalog` per
+    // draft-ietf-moq-msf-00 §5.2, plus the legacy `.catalog` alias). The
+    // returned SubgroupsWriters are bound for the session's lifetime — dropping
+    // one would surface as "catalog gone" to subscribers using that name.
     let _catalog_subgroups = publish_catalog_track(&mut tracks_writer, &catalog_bytes)?;
     tracing::info!(
         bytes = catalog_bytes.len(),
-        "posted catalog on `.catalog` track"
+        tracks = ?CATALOG_TRACK_NAMES,
+        "posted catalog on catalog tracks"
     );
 
     let tls = args.tls.load()?;
@@ -197,42 +199,59 @@ fn build_state_map(
     Ok(map)
 }
 
-/// Publish the broadcast's catalog JSON on the `.catalog` track.
+/// Catalog track names. The broadcast's catalog JSON is published under each.
 ///
-/// Per the IETF moq-catalog-format draft + Codex review #3: the
-/// catalog is itself a MoQ track named `.catalog`, with the JSON body
-/// posted as a single object on group 0. Priority 127 is the lowest
-/// non-control value — receivers fetch it eagerly on JOIN but it must
+///   - `catalog` — the canonical, REQUIRED name. draft-ietf-moq-msf-00 §5.2:
+///     "The catalog track MUST have a case-sensitive Track Name of `catalog`."
+///     Shaka MSF subscribes to it (`lib/msf/msf_parser.js` `subscribeToCatalog_`).
+///   - `.catalog` — a legacy compatibility alias for the moq.dev/hang
+///     (WARP-lineage) ecosystem (moq-pub, moq-sub, gst-moq-pub subscribe to
+///     `.catalog`). The dot-prefix is reserved at the *namespace* level by
+///     moq-transport §3.2.1, so it is not idiomatic for a media track name; it
+///     is kept only so non-MSF consumers still resolve the catalog.
+///
+/// `catalog` is listed first as the conformant name; drop `.catalog` once the
+/// non-MSF consumers migrate.
+const CATALOG_TRACK_NAMES: [&str; 2] = ["catalog", ".catalog"];
+
+/// Publish the broadcast's catalog JSON on each catalog track name.
+///
+/// The JSON body is posted as a single object on group 0. Priority 127 is the
+/// lowest non-control value — receivers fetch it eagerly on JOIN but it must
 /// not preempt media tracks.
 ///
-/// Returns the `SubgroupsWriter` so the caller can retain it for the
-/// session's lifetime; dropping it would close the track and surface
-/// as "catalog gone" to subscribers.
+/// Returns one `SubgroupsWriter` per catalog track name so the caller can
+/// retain them for the session's lifetime; dropping one would close that
+/// track and surface as "catalog gone" to subscribers using that name.
 fn publish_catalog_track(
     tracks_writer: &mut TracksWriter,
     catalog_bytes: &[u8],
-) -> Result<SubgroupsWriter> {
-    let track = tracks_writer
-        .create(".catalog")
-        .ok_or_else(|| anyhow::anyhow!("TracksWriter::create returned None for `.catalog`"))?;
-    let mut subgroups = track
-        .subgroups()
-        .context("`.catalog` track: subgroups() failed")?;
-    let mut subgroup = subgroups
-        .create(moq_transport::serve::Subgroup {
-            group_id: 0,
-            subgroup_id: 0,
-            priority: 127,
-        })
-        .context("`.catalog` SubgroupsWriter::create failed")?;
-    subgroup
-        .write(Bytes::copy_from_slice(catalog_bytes))
-        .context("writing catalog JSON object failed")?;
-    // Dropping `subgroup` here is intentional — the SubgroupObjectWriter
-    // it produced internally has remain==0 (full payload written) so the
-    // reader sees a complete object.
-    drop(subgroup);
-    Ok(subgroups)
+) -> Result<Vec<SubgroupsWriter>> {
+    let mut writers = Vec::with_capacity(CATALOG_TRACK_NAMES.len());
+    for name in CATALOG_TRACK_NAMES {
+        let track = tracks_writer.create(name).ok_or_else(|| {
+            anyhow::anyhow!("TracksWriter::create returned None for `{name}`")
+        })?;
+        let mut subgroups = track
+            .subgroups()
+            .with_context(|| format!("`{name}` track: subgroups() failed"))?;
+        let mut subgroup = subgroups
+            .create(moq_transport::serve::Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 127,
+            })
+            .with_context(|| format!("`{name}` SubgroupsWriter::create failed"))?;
+        subgroup
+            .write(Bytes::copy_from_slice(catalog_bytes))
+            .with_context(|| format!("writing catalog JSON object failed for `{name}`"))?;
+        // Dropping `subgroup` here is intentional — the SubgroupObjectWriter
+        // it produced internally has remain==0 (full payload written) so the
+        // reader sees a complete object.
+        drop(subgroup);
+        writers.push(subgroups);
+    }
+    Ok(writers)
 }
 
 /// Check that the catalog's embedded namespace (if any) matches the
@@ -512,12 +531,14 @@ mod tests {
     }
 
     #[test]
-    fn publish_catalog_track_registers_dotcatalog_track() {
-        // T2: on startup, the publisher MUST create the special
-        // `.catalog` track and post the full catalog JSON as a single
-        // object on group 0 at priority 127. This test pins the track
-        // registration; the byte-for-byte write contract is covered
-        // end-to-end in T9 smoke.
+    fn publish_catalog_track_registers_both_catalog_track_names() {
+        // T2: on startup, the publisher MUST post the full catalog JSON as a
+        // single object on group 0 at priority 127, under BOTH catalog track
+        // names: `catalog` (canonical/REQUIRED per draft-ietf-moq-msf-00 §5.2;
+        // what Shaka MSF subscribes to) and `.catalog` (legacy WARP-lineage
+        // alias for non-MSF consumers: moq-pub, moq-sub, gst-moq-pub). This test
+        // pins both registrations; the byte-for-byte write contract is covered
+        // in T9 smoke.
         let cat = catalog_with(
             vec![track("v", Some(Container::Mmtp))],
             Some(MulticastConfig {
@@ -528,17 +549,19 @@ mod tests {
         );
         let catalog_bytes = serde_json::to_vec(&cat).unwrap();
         let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();
-        // Retain the returned subgroups writer so the track stays open
-        // during the assertion (TrackReader::is_closed would otherwise
-        // observe writer-drop as stale).
+        // Retain the returned subgroups writers so the tracks stay open during
+        // the assertion (TrackReader::is_closed would otherwise observe
+        // writer-drop as stale).
         let _retained = publish_catalog_track(&mut tw, &catalog_bytes)
             .expect("publish_catalog_track returns Ok");
 
-        let reader = tr
-            .get_track_reader(&ns(), ".catalog")
-            .expect(".catalog track is registered on the broadcast");
-        assert_eq!(reader.name, ".catalog");
-        assert!(!reader.is_closed(), ".catalog track is alive");
+        for name in [".catalog", "catalog"] {
+            let reader = tr
+                .get_track_reader(&ns(), name)
+                .unwrap_or_else(|| panic!("`{name}` track is registered on the broadcast"));
+            assert_eq!(reader.name, name);
+            assert!(!reader.is_closed(), "`{name}` track is alive");
+        }
     }
 
     #[test]
