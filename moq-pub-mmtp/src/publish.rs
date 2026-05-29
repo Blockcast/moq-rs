@@ -67,21 +67,60 @@ pub struct TrackState<T: TrackSubgroups> {
     pub priority: u8,
     /// Subgroup factory wired to one moq-transport TrackWriter::subgroups().
     pub sink: T,
-    /// The subgroup currently open for writes — None until the first
-    /// MPU on this track. Replaced when `last_seen_mpu_seq` advances.
-    pub current_group: Option<T::Group>,
-    /// MPU sequence backing the currently open group; matches the
-    /// group_id we passed to `create_group`.
+    /// MPU sequence backing the currently open group = the MoQ group_id.
+    /// None until the first MPU. Also the group the repair sibling mirrors.
     pub current_group_id: Option<u64>,
     /// Last MPU sequence seen on this track; used for the A2
     /// monotonicity check.
     pub last_seen_mpu_seq: Option<u32>,
+    /// Subgroup 0 of the current group: the FT=Init (MPU metadata) object,
+    /// per draft-ramadan-moq-mmt §4.3. Opened lazily when the Init packet of
+    /// the current group arrives. Reset on group advance.
+    init_group: Option<T::Group>,
+    /// MFU subgroups of the current group, keyed by the per-sample MMTP
+    /// timestamp (Mapping B). The `moq_mmt` muxer sets the timestamp once per
+    /// sample and reuses it for every fragment of that MFU, so it is present on
+    /// every packet — unlike the MFU DU header (`sample_number`), which is
+    /// written only on the first fragment. Keying off the timestamp therefore
+    /// survives first-fragment loss. Reset on group advance.
+    mfu_groups: HashMap<u32, T::Group>,
+    /// Next MFU subgroup_id to assign within the current group. Starts at 1
+    /// (subgroup 0 is reserved for Init) and increments as new MFU timestamps
+    /// are seen. Reset on group advance.
+    next_mfu_subgroup_id: u64,
     /// Sibling `<name>/repair` track for AL-FEC repair packets. Per
     /// draft-ramadan-moq-mmt §7.2 repair tracks run at priority 7 and
     /// inherit the source track's group_id so the receiver can
     /// correlate source/repair by MPU sequence. None means no FEC is
     /// configured for this packet_id (subscriber gets no recovery).
     pub repair: Option<RepairSink<T>>,
+}
+
+impl<T: TrackSubgroups> TrackState<T> {
+    /// Create per-track state with no group open yet.
+    pub fn new(name: String, priority: u8, sink: T, repair: Option<RepairSink<T>>) -> Self {
+        Self {
+            name,
+            priority,
+            sink,
+            current_group_id: None,
+            last_seen_mpu_seq: None,
+            init_group: None,
+            mfu_groups: HashMap::new(),
+            next_mfu_subgroup_id: 1,
+            repair,
+        }
+    }
+
+    /// Advance to a new MPU group: reset all per-group subgroup state. Dropping
+    /// the old subgroup writers closes those subgroups (they are complete).
+    fn advance_to_group(&mut self, mpu_seq: u32) {
+        self.current_group_id = Some(mpu_seq as u64);
+        self.last_seen_mpu_seq = Some(mpu_seq);
+        self.init_group = None;
+        self.mfu_groups.clear();
+        self.next_mfu_subgroup_id = 1;
+    }
 }
 
 /// Repair sibling state for one source packet_id.
@@ -132,53 +171,65 @@ pub fn dispatch<T: TrackSubgroups>(
                 )
             })?;
 
+            // Group boundaries come from the MPU sequence (A2 monotonicity),
+            // not from FragmentType::Init. Init may be lost on the multicast leg
+            // (it also rides the reliable catalog), so — unlike the old flat
+            // mapping — we do NOT require Init to be the first packet of a group.
             match state.last_seen_mpu_seq {
                 Some(last) if mpu_seq < last => {
                     bail!(
                         "MPU sequence regression on packet_id {}: got mpu_seq={}, last seen {} \
-                         (A2: moq-transport's SubgroupsWriter would silently drop this)",
+                         (A2: MPU sequence must be monotonically non-decreasing per track)",
                         routing.packet_id,
                         mpu_seq,
                         last
                     );
                 }
-                Some(last) if mpu_seq == last => {
-                    let group = state.current_group.as_mut().ok_or_else(|| {
-                        anyhow!(
-                            "internal invariant: packet_id {} has last_seen_mpu_seq={} but no \
-                             current_group",
-                            routing.packet_id,
-                            last
-                        )
-                    })?;
-                    group.put_object(payload)?;
-                }
-                _ => {
-                    // First-ever packet on the track OR mpu_seq > last.
-                    // Either way, A1 requires FragmentType::Init for the
-                    // first packet of a new MPU.
-                    if frag != FragmentType::Init {
-                        bail!(
-                            "first packet of MPU mpu_seq={} on packet_id {} has \
-                             fragment_type={:?}, expected Init (A1: MPU metadata must be \
-                             object 0 of the new group)",
-                            mpu_seq,
-                            routing.packet_id,
-                            frag
-                        );
+                Some(last) if mpu_seq == last => { /* same group: keep open subgroups */ }
+                _ => state.advance_to_group(mpu_seq),
+            }
+
+            let group_id = state
+                .current_group_id
+                .expect("advance_to_group sets current_group_id for every MPU group");
+
+            // Mapping B (draft-ramadan-moq-mmt §4.3): subgroup 0 = MPU metadata
+            // (Init), subgroups 1..M = one MFU each, keyed by the per-sample MMTP
+            // timestamp. The publisher routes by (packet_id, MPU sequence, MFU
+            // key) and never acts on the Fragmentation Indicator (§5.1).
+            match frag {
+                FragmentType::Init => {
+                    if state.init_group.is_none() {
+                        let g = state.sink.create_group(group_id, 0, state.priority)?;
+                        state.init_group = Some(g);
                     }
-                    let group =
-                        state
-                            .sink
-                            .create_group(mpu_seq as u64, 0, state.priority)?;
-                    state.current_group = Some(group);
-                    state.current_group_id = Some(mpu_seq as u64);
-                    state.last_seen_mpu_seq = Some(mpu_seq);
                     state
-                        .current_group
+                        .init_group
                         .as_mut()
-                        .expect("just assigned")
+                        .expect("init_group just set")
                         .put_object(payload)?;
+                }
+                FragmentType::Mfu => {
+                    let ts = routing.timestamp;
+                    if !state.mfu_groups.contains_key(&ts) {
+                        let subgroup_id = state.next_mfu_subgroup_id;
+                        let g = state.sink.create_group(group_id, subgroup_id, state.priority)?;
+                        state.next_mfu_subgroup_id += 1;
+                        state.mfu_groups.insert(ts, g);
+                    }
+                    state
+                        .mfu_groups
+                        .get_mut(&ts)
+                        .expect("mfu subgroup just inserted")
+                        .put_object(payload)?;
+                }
+                FragmentType::Fragment => {
+                    bail!(
+                        "packet_id {} carries MPU fragment_type=Fragment (moof), which the \
+                         moq_mmt muxer does not emit on the multicast wire under Mapping B \
+                         (only Init + MFU); refusing to guess its subgroup",
+                        routing.packet_id
+                    );
                 }
             }
         }
@@ -288,20 +339,17 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             packet_id,
-            TrackState {
-                name: format!("track-{packet_id}"),
-                priority,
-                sink: MockSubgroups::default(),
-                current_group: None,
-                current_group_id: None,
-                last_seen_mpu_seq: None,
-                repair,
-            },
+            TrackState::new(format!("track-{packet_id}"), priority, MockSubgroups::default(), repair),
         );
         map
     }
 
     fn mpu(packet_id: u16, mpu_seq: u32, frag: FragmentType) -> PacketRouting {
+        mpu_ts(packet_id, mpu_seq, frag, 0)
+    }
+
+    /// Like `mpu` but with an explicit MMTP timestamp (the Mapping-B MFU key).
+    fn mpu_ts(packet_id: u16, mpu_seq: u32, frag: FragmentType, timestamp: u32) -> PacketRouting {
         PacketRouting {
             packet_id,
             packet_type: PacketType::Mpu,
@@ -309,6 +357,7 @@ mod tests {
             rap_flag: false,
             mpu_sequence: Some(mpu_seq),
             fragment_type: Some(frag),
+            timestamp,
         }
     }
 
@@ -322,6 +371,7 @@ mod tests {
             rap_flag: false,
             mpu_sequence: None,
             fragment_type: None,
+            timestamp: 0,
         }
     }
 
@@ -340,16 +390,38 @@ mod tests {
     }
 
     #[test]
-    fn first_packet_on_track_must_be_init() {
-        // A1: the first MMTP packet of an MPU is FragmentType::Init
-        // (MPU metadata box). Anything else is a caller bug.
+    fn mfu_first_group_is_allowed_and_opens_mfu_subgroup() {
+        // A1 relaxed under Mapping B: a group may start with an MFU (its Init may
+        // be lost on the multicast leg and also rides the reliable catalog). The
+        // MFU opens an MFU subgroup (>=1), NOT subgroup 0.
         let mut map = make_state_map(1, 5);
-        let routing = mpu(1, 1, FragmentType::Mfu);
-        let err = dispatch(&mut map, &routing, Bytes::from_static(b"x")).unwrap_err();
-        assert!(
-            err.to_string().contains("Init"),
-            "expected Init-required err, got: {err}"
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 1, FragmentType::Mfu, 0x100),
+            Bytes::from_static(b"frame"),
+        )
+        .unwrap();
+        let state = map.get(&1).unwrap();
+        assert_eq!(
+            state.sink.groups_created,
+            vec![(1, 1, 5)],
+            "MFU opens subgroup 1 of group 1 (0 reserved for Init)"
         );
+        assert!(state.init_group.is_none(), "no Init seen → subgroup 0 not opened");
+    }
+
+    #[test]
+    fn fragment_type_moof_hard_errors() {
+        // The moq_mmt muxer never emits FT=Fragment (moof) on the multicast wire
+        // under Mapping B; refuse rather than guess a subgroup.
+        let mut map = make_state_map(1, 5);
+        let err = dispatch(
+            &mut map,
+            &mpu_ts(1, 1, FragmentType::Fragment, 0x100),
+            Bytes::from_static(b"moof"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Fragment"), "got: {err}");
     }
 
     #[test]
@@ -377,31 +449,53 @@ mod tests {
     }
 
     #[test]
-    fn mpu_advance_opens_new_subgroup() {
-        // On strictly-increasing MPU seq, dispatch MUST call
-        // SubgroupsWriter::create({group_id: mpu_seq, subgroup_id: 0,
-        // priority}) — NOT append() — per Codex #5.
+    fn init_subgroup_zero_mfus_subgroups_by_timestamp() {
+        // Mapping B: Init -> subgroup 0; each distinct MFU timestamp -> a new
+        // subgroup (1, 2, ...); the same timestamp reuses its subgroup.
         let mut map = make_state_map(1, 5);
-        dispatch(
-            &mut map,
-            &mpu(1, 10, FragmentType::Init),
-            Bytes::from_static(b"a"),
-        )
-        .unwrap();
-        dispatch(
-            &mut map,
-            &mpu(1, 11, FragmentType::Init),
-            Bytes::from_static(b"b"),
-        )
-        .unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"init")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a0")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xB), Bytes::from_static(b"b0")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a1")).unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
-            vec![(10, 0, 5), (11, 0, 5)],
-            "expected two create_group calls with explicit group_ids"
+            vec![(10, 0, 5), (10, 1, 5), (10, 2, 5)],
+            "Init=subgroup 0; MFU ts 0xA=subgroup 1; MFU ts 0xB=subgroup 2; ts 0xA reused"
+        );
+        assert_eq!(
+            state.init_group.as_ref().unwrap().writes,
+            vec![Bytes::from_static(b"init")]
+        );
+        assert_eq!(
+            state.mfu_groups[&0xA].writes,
+            vec![Bytes::from_static(b"a0"), Bytes::from_static(b"a1")]
+        );
+        assert_eq!(state.mfu_groups[&0xB].writes, vec![Bytes::from_static(b"b0")]);
+    }
+
+    #[test]
+    fn mpu_advance_resets_subgroup_indexing() {
+        // Advancing to a new group resets the MFU subgroup counter to 1 and
+        // clears the previous group's subgroups.
+        let mut map = make_state_map(1, 5);
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"i10")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 11, FragmentType::Init, 0), Bytes::from_static(b"i11")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 11, FragmentType::Mfu, 0xC), Bytes::from_static(b"c")).unwrap();
+        let state = map.get(&1).unwrap();
+        assert_eq!(
+            state.sink.groups_created,
+            vec![(10, 0, 5), (10, 1, 5), (11, 0, 5), (11, 1, 5)],
+            "each group restarts MFU subgroups at 1"
         );
         assert_eq!(state.current_group_id, Some(11));
         assert_eq!(state.last_seen_mpu_seq, Some(11));
+        assert!(state.mfu_groups.contains_key(&0xC));
+        assert!(
+            !state.mfu_groups.contains_key(&0xA),
+            "group 10's MFU subgroups cleared on advance to group 11"
+        );
     }
 
     // ---- T3: FEC repair routing RED tests ----
@@ -512,39 +606,31 @@ mod tests {
     }
 
     #[test]
-    fn equal_mpu_appends_to_current_subgroup() {
-        // Same MPU sequence number → continue writing into the open
-        // subgroup. No new create_group call.
+    fn mfu_fragments_same_timestamp_share_one_subgroup() {
+        // A single MFU fragmented across MMTP packets (FI=1,2,3) carries the same
+        // per-sample timestamp on every fragment, so all fragments land as
+        // ordered objects in one subgroup — even though the publisher never reads
+        // the Fragmentation Indicator (§5.1).
         let mut map = make_state_map(1, 5);
-        dispatch(
-            &mut map,
-            &mpu(1, 10, FragmentType::Init),
-            Bytes::from_static(b"init"),
-        )
-        .unwrap();
-        dispatch(
-            &mut map,
-            &mpu(1, 10, FragmentType::Mfu),
-            Bytes::from_static(b"frame1"),
-        )
-        .unwrap();
-        dispatch(
-            &mut map,
-            &mpu(1, 10, FragmentType::Mfu),
-            Bytes::from_static(b"frame2"),
-        )
-        .unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"init")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f1")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f2")).unwrap();
+        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f3")).unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
-            vec![(10, 0, 5)],
-            "exactly one subgroup created for the single MPU"
+            vec![(10, 0, 5), (10, 1, 5)],
+            "one Init subgroup + one MFU subgroup for the fragmented frame"
         );
-        let group = state.current_group.as_ref().expect("current_group is open");
-        assert_eq!(group.writes.len(), 3);
-        assert_eq!(group.writes[0], Bytes::from_static(b"init"));
-        assert_eq!(group.writes[1], Bytes::from_static(b"frame1"));
-        assert_eq!(group.writes[2], Bytes::from_static(b"frame2"));
+        let mfu = &state.mfu_groups[&0xABCD];
+        assert_eq!(
+            mfu.writes,
+            vec![
+                Bytes::from_static(b"f1"),
+                Bytes::from_static(b"f2"),
+                Bytes::from_static(b"f3"),
+            ]
+        );
     }
 }
 

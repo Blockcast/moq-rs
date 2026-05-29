@@ -31,6 +31,14 @@ pub struct PacketRouting {
     /// MUST carry FragmentType::Init (the MPU metadata box). Present
     /// only when `packet_type == PacketType::Mpu`.
     pub fragment_type: Option<FragmentType>,
+    /// MMTP timestamp (NTP short-format, 32 bits). Under Mapping B this is the
+    /// per-MFU subgroup discriminator: the `moq_mmt` muxer sets it once per
+    /// sample and reuses it for every fragment of that MFU, so it is present on
+    /// every packet — unlike the MFU DU header (`sample_number`), which the
+    /// muxer writes only on the first fragment. Keying the MFU subgroup off the
+    /// timestamp survives first-fragment loss. See the M.4 T1.7 findings /
+    /// .planning/m4-b-mig-transport-subgroups-design.md.
+    pub timestamp: u32,
 }
 
 /// Parse routing info from a raw MMTP packet. Does not copy the packet.
@@ -65,6 +73,7 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
         rap_flag: hdr.rap_flag,
         mpu_sequence,
         fragment_type,
+        timestamp: hdr.timestamp,
     })
 }
 
@@ -116,6 +125,22 @@ mod tests {
             r.fragment_type,
             Some(mmt_core::header::FragmentType::Init)
         );
+    }
+
+    #[test]
+    fn surfaces_mmtp_timestamp() {
+        // The MMTP timestamp is the Mapping-B per-MFU subgroup key; route() must
+        // surface it from the MMTP header (it rides on every fragment).
+        let mut hdr = MmtpHeader::new(7, PacketType::Mpu);
+        hdr.timestamp = 0x0002_dddd;
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+        let mut mpu = MpuHeader::new(FragmentType::Mfu, 3);
+        mpu.payload_length = 0;
+        mpu.write_to(&mut buf).unwrap();
+        buf.put_slice(&[0xAA]);
+        let r = route(&buf.to_vec()).unwrap();
+        assert_eq!(r.timestamp, 0x0002_dddd);
     }
 
     #[test]

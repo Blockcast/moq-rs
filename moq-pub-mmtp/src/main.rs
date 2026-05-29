@@ -166,19 +166,16 @@ fn build_state_map(
 
             map.insert(
                 track_ref.packet_id,
-                TrackState {
-                    name: track_ref.name.clone(),
+                TrackState::new(
+                    track_ref.name.clone(),
                     priority,
-                    sink: subgroups,
-                    current_group: None,
-                    current_group_id: None,
-                    last_seen_mpu_seq: None,
-                    repair: Some(RepairSink {
+                    subgroups,
+                    Some(RepairSink {
                         sink: repair_subgroups,
                         current_group: None,
                         current_group_id: None,
                     }),
-                },
+                ),
             );
         }
     }
