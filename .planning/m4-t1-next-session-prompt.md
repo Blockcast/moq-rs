@@ -66,7 +66,49 @@ no SegmentReference / MSE / transmux yet** — that's gated on T1.7.
 `obj.location` carries `{group, subgroup, object}` (from `msf_tracks_manager.js:278`).
 Mapping B uses these as the reassembly key.
 
-## PENDING (next session) — priority order
+## SESSION 2 UPDATE (2026-05-29) — T1.7 done, transport prereq done, ordering corrected
+
+This session completed T1.7's core discovery and the concurrent-subgroup transport
+prerequisite. The PENDING list below is partly SUPERSEDED — read this first.
+
+**T1.7 (real `moq_mmt` wire format) — DONE** (source-read of the FFmpeg fork's
+`libavformat/moqenc_mmt.c` + a live capture, validated by the muxer's own INFO
+traces). Full detail in memory `ffmpeg-moq-mmt-multicast-wire-format.md`. Key facts:
+- Multicast MMTP leg = **Init (FT=0) + MFU (FT=2) only**; FT=1/moof never emitted.
+- MFU DU header (with `sample_number`) on **first fragment only**; and
+  `sample_number` is **always 1** (one sample per movie fragment) → useless as a
+  discriminator.
+- **MMTP `timestamp` is the per-MFU key**: constant across a frame's fragments,
+  distinct/monotonic per frame, on every packet. Frame 0's timestamp is 0 → map
+  `timestamp → per-group index ≥ 1` (0 reserved for Init), don't use raw timestamp.
+- MFU payload = **AVCC length-prefixed NAL units** (not fMP4). → T1.2 transmux must
+  CMAF-wrap raw NAL (the harder branch of D3), NOT passthrough.
+
+**B-MIG-pub design — SETTLED** (architect decisions this session):
+- Group = mpu_sequence (done). Subgroup 0 = FT=INIT (kept, draft §4.3). MFU
+  subgroups = per-group index keyed by the **per-sample MMTP timestamp**
+  (loss-robust; survives first-fragment loss). Object = MMTP packet, FI order.
+- FT=Fragment never on wire → error if seen.
+
+**Transport concurrent-subgroup prerequisite — DONE** (was mis-listed as priority
+6 "B-MIG-relay"; it's actually a PREREQUISITE for B-MIG-pub). Implemented +
+tested in `moq-transport/src/serve/subgroup.rs` (TDD, 5 tests, full crate 114
+pass, clippy-clean, workspace builds). `Subgroups` now delivers all subgroups of a
+group (was latest-wins) with an opt-in `set_history_window(groups)` group-window
+prune. See `.planning/m4-b-mig-transport-subgroups-design.md` for the design +
+"Implementation status / OPEN".
+- **OPEN (deferred to B-MIG-pub by decision):** `set_history_window` is opt-in;
+  unset = retain-all. `main.rs` (publisher) + the relay receive path MUST wire it
+  from a config source (window value source TBD — likely a catalog field) or they
+  leak. Do not run the publisher long until wired.
+
+**Corrected next-task order:** B-MIG-pub (now unblocked: build timestamp-keyed
+subgroup-per-MFU in publish.rs + wire `set_history_window` from catalog/config) →
+T1.7 staged smoke E2E → T1.2 (CMAF-wrap AVCC NAL) → relay receive-path B + window.
+
+---
+
+## PENDING (next session) — priority order [PARTLY SUPERSEDED — see Session 2 update]
 
 1. **B-MIG-pub** (moq-pub-mmtp, `publish.rs`): emit **subgroup-per-MFU** (currently
    single subgroup per MPU at `create_group(mpu_seq, 0, ...)`). Needs the FFmpeg
