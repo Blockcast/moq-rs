@@ -9,10 +9,7 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
 
-use crate::{
-    metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer,
-    RemotesProducer, Session,
-};
+use crate::{metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
 
 // A type alias for boxed future
 type ServerFuture = Pin<
@@ -64,7 +61,7 @@ pub struct Relay {
     announce_url: Option<Url>,
     mlog_dir: Option<PathBuf>,
     locals: Locals,
-    remotes: Option<(RemotesProducer, RemotesConsumer)>,
+    remotes: RemoteManager,
     coordinator: Arc<dyn Coordinator>,
 }
 
@@ -109,260 +106,263 @@ impl Relay {
             .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
-        let remotes = Remotes {
-            coordinator: config.coordinator.clone(),
-            quic: remote_clients[0].clone(),
-        }
-        .produce();
+        let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients);
 
         Ok(Self {
             quic_endpoints: endpoints,
             announce_url: config.announce,
             mlog_dir: config.mlog_dir,
             locals,
-            remotes: Some(remotes),
+            remotes,
             coordinator: config.coordinator,
         })
     }
 
     /// Run the relay server.
     pub async fn run(self) -> anyhow::Result<()> {
-        let mut tasks = FuturesUnordered::new();
+        let Self {
+            quic_endpoints,
+            announce_url,
+            mlog_dir,
+            locals,
+            remotes,
+            coordinator,
+        } = self;
 
-        // Split remotes producer/consumer and spawn producer task
-        let remotes = self.remotes.map(|(producer, consumer)| {
-            tasks.push(producer.run().boxed());
-            consumer
-        });
+        let run_result = async {
+            let mut tasks = FuturesUnordered::new();
 
-        // Start the forwarder, if any
-        let forward_producer = if let Some(url) = &self.announce_url {
-            tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
+            // Use the remote manager for routing to remote relays.
+            let remote_manager = remotes.clone();
 
-            // Establish a QUIC connection to the forward URL
-            let (session, _quic_client_initial_cid, transport) = self.quic_endpoints[0]
-                .client
-                .connect(url, None)
-                .await
-                .context("failed to establish forward connection")?;
+            // Start the forwarder, if any
+            let forward_producer = if let Some(url) = &announce_url {
+                tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
 
-            // Create the MoQ session over the connection
-            let (session, publisher, subscriber) =
-                moq_transport::session::Session::connect(session, None, transport)
+                // Establish a QUIC connection to the forward URL
+                let (session, _quic_client_initial_cid, transport) = quic_endpoints[0]
+                    .client
+                    .connect(url, None)
                     .await
-                    .context("failed to establish forward session")?;
+                    .context("failed to establish forward connection")?;
 
-            // Use the connection path already validated and stored by Session::connect().
-            // The forward session is scoped to whatever path the announce URL specifies.
-            //
-            // Note: the forward connection intentionally does not call
-            // coordinator.resolve_scope(). The announce URL is operator-configured
-            // (via --announce), not client-supplied, so it doesn't need the same
-            // auth/permission checks that incoming client connections get. The
-            // forward session always gets both Producer and Consumer (full
-            // read-write) since it's acting as a relay peer, not a client.
-            //
-            // Limitation: all incoming scopes are forwarded to this single upstream scope.
-            // Multi-scope forwarding (routing different incoming scopes to different
-            // upstream paths) would require per-scope forward connections.
-            let forward_scope = session.connection_path().map(|s| s.to_string());
+                // Create the MoQ session over the connection
+                let (session, publisher, subscriber) =
+                    moq_transport::session::Session::connect(session, None, transport)
+                        .await
+                        .context("failed to establish forward session")?;
 
-            let coordinator = self.coordinator.clone();
-            let session = Session {
-                session,
-                producer: Some(Producer::new(
-                    publisher,
-                    self.locals.clone(),
-                    remotes.clone(),
-                    forward_scope.clone(),
-                )),
-                consumer: Some(Consumer::new(
-                    subscriber,
-                    self.locals.clone(),
-                    coordinator,
-                    None,
-                    forward_scope,
-                )),
-                // Forward connections are always full read-write relay peers,
-                // so no reject loops needed.
-                reject_publishes: None,
-                reject_subscribes: None,
+                // Use the connection path already validated and stored by Session::connect().
+                // The forward session is scoped to whatever path the announce URL specifies.
+                //
+                // Note: the forward connection intentionally does not call
+                // coordinator.resolve_scope(). The announce URL is operator-configured
+                // (via --announce), not client-supplied, so it doesn't need the same
+                // auth/permission checks that incoming client connections get. The
+                // forward session always gets both Producer and Consumer (full
+                // read-write) since it's acting as a relay peer, not a client.
+                //
+                // Limitation: all incoming scopes are forwarded to this single upstream scope.
+                // Multi-scope forwarding (routing different incoming scopes to different
+                // upstream paths) would require per-scope forward connections.
+                let forward_scope = session.connection_path().map(|s| s.to_string());
+
+                let forward_coordinator = coordinator.clone();
+                let session = Session {
+                    session,
+                    producer: Some(Producer::new(
+                        publisher,
+                        locals.clone(),
+                        remote_manager.clone(),
+                        forward_scope.clone(),
+                    )),
+                    consumer: Some(Consumer::new(
+                        subscriber,
+                        locals.clone(),
+                        forward_coordinator,
+                        None,
+                        forward_scope,
+                    )),
+                    // Forward connections are always full read-write relay peers,
+                    // so no reject loops needed.
+                    reject_publishes: None,
+                    reject_subscribes: None,
+                };
+
+                let forward_producer = session.producer.clone();
+
+                tasks.push(async move { session.run().await.context("forwarding failed") }.boxed());
+
+                forward_producer
+            } else {
+                None
             };
 
-            let forward_producer = session.producer.clone();
+            let servers: Vec<quic::Server> = quic_endpoints
+                .into_iter()
+                .map(|endpoint| endpoint.server.context("missing TLS certificate for server"))
+                .collect::<anyhow::Result<_>>()?;
 
-            tasks.push(async move { session.run().await.context("forwarding failed") }.boxed());
+            // This will hold the futures for all our listening servers.
+            let mut accepts: FuturesUnordered<ServerFuture> = FuturesUnordered::new();
+            for mut server in servers {
+                tracing::info!("listening on {}", server.local_addr()?);
 
-            forward_producer
-        } else {
-            None
-        };
+                // Create a future, box it, and push it to the collection.
+                accepts.push(
+                    async move {
+                        let conn = server.accept().await.context("accept failed");
+                        (conn, server)
+                    }
+                    .boxed(),
+                );
+            }
 
-        let servers: Vec<quic::Server> = self
-            .quic_endpoints
-            .into_iter()
-            .map(|endpoint| {
-                endpoint
-                    .server
-                    .context("missing TLS certificate for server")
-            })
-            .collect::<anyhow::Result<_>>()?;
-
-        // This will hold the futures for all our listening servers.
-        let mut accepts: FuturesUnordered<ServerFuture> = FuturesUnordered::new();
-        for mut server in servers {
-            tracing::info!("listening on {}", server.local_addr()?);
-
-            // Create a future, box it, and push it to the collection.
-            accepts.push(
-                async move {
-                    let conn = server.accept().await.context("accept failed");
-                    (conn, server)
-                }
-                .boxed(),
-            );
-        }
-
-        loop {
-            tokio::select! {
-                // This branch polls all the `accept` futures concurrently.
-                Some((conn_result, mut server)) = accepts.next() => {
-                    // An accept operation has completed.
-                    // First, immediately queue up the next accept() call for this server.
-                    accepts.push(
-                        async move {
-                            let conn = server.accept().await.context("accept failed");
-                            (conn, server)
-                        }
-                        .boxed(),
-                    );
-
-                    let (conn, connection_id, transport) = conn_result.context("failed to accept QUIC connection")?;
-
-                    metrics::counter!("moq_relay_connections_total").increment(1);
-
-                    // Construct mlog path from connection ID if mlog directory is configured
-                    let mlog_path = self.mlog_dir.as_ref()
-                        .map(|dir| dir.join(format!("{}_server.mlog", connection_id)));
-
-                    let locals = self.locals.clone();
-                    let remotes = remotes.clone();
-                    let forward = forward_producer.clone();
-                    let coordinator = self.coordinator.clone();
-
-                    // Spawn a new task to handle the connection
-                    tasks.push(async move {
-                        // Track active connections - decrements when task completes
-                        let _conn_guard = GaugeGuard::new("moq_relay_active_connections");
-
-                        // Clone the raw connection so we can close it with a proper
-                        // error code if scope resolution fails after the MoQ handshake.
-                        let raw_conn = conn.clone();
-
-                        // Create the MoQ session over the connection (setup handshake etc)
-                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, transport).await {
-                            Ok(session) => session,
-                            Err(err) => {
-                                tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
-                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
-                                // Maintain invariant: connections_total - connections_closed_total == active_connections
-                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
-                                return Ok(());
+            loop {
+                tokio::select! {
+                    // This branch polls all the `accept` futures concurrently.
+                    Some((conn_result, mut server)) = accepts.next() => {
+                        // An accept operation has completed.
+                        // First, immediately queue up the next accept() call for this server.
+                        accepts.push(
+                            async move {
+                                let conn = server.accept().await.context("accept failed");
+                                (conn, server)
                             }
-                        };
+                            .boxed(),
+                        );
 
-                        // Create our MoQ relay session
-                        let moq_session = session;
+                        let (conn, connection_id, transport) = conn_result.context("failed to accept QUIC connection")?;
 
-                        // Resolve the connection path to a scope (identity + permissions).
-                        // This translates the raw transport-level path into an application-level
-                        // scope_id and determines what the connection is allowed to do.
-                        let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
-                            Ok(info) => info,
-                            Err(err) => {
-                                tracing::warn!(
+                        metrics::counter!("moq_relay_connections_total").increment(1);
+
+                        // Construct mlog path from connection ID if mlog directory is configured
+                        let mlog_path = mlog_dir.as_ref()
+                            .map(|dir| dir.join(format!("{}_server.mlog", connection_id)));
+
+                        let locals = locals.clone();
+                        let remotes = remote_manager.clone();
+                        let forward = forward_producer.clone();
+                        let coordinator = coordinator.clone();
+
+                        // Spawn a new task to handle the connection
+                        tasks.push(async move {
+                            // Track active connections - decrements when task completes
+                            let _conn_guard = GaugeGuard::new("moq_relay_active_connections");
+
+                            // Clone the raw connection so we can close it with a proper
+                            // error code if scope resolution fails after the MoQ handshake.
+                            let raw_conn = conn.clone();
+
+                            // Create the MoQ session over the connection (setup handshake etc)
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, transport).await {
+                                Ok(session) => session,
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
+                                    // Maintain invariant: connections_total - connections_closed_total == active_connections
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                    return Ok(());
+                                }
+                            };
+
+                            // Create our MoQ relay session
+                            let moq_session = session;
+
+                            // Resolve the connection path to a scope (identity + permissions).
+                            // This translates the raw transport-level path into an application-level
+                            // scope_id and determines what the connection is allowed to do.
+                            let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
+                                Ok(info) => info,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        connection_path = moq_session.connection_path(),
+                                        error = %err,
+                                        "scope resolution failed, rejecting session"
+                                    );
+                                    // Close with PROTOCOL_VIOLATION (0x3) so the client
+                                    // gets a meaningful error instead of an abrupt reset.
+                                    // This is a QUIC APPLICATION_CLOSE, not a MoQT SESSION_CLOSE
+                                    // control message. Sending a proper SESSION_CLOSE would require
+                                    // running the MoQ session's send loop, which is not warranted
+                                    // for a pre-session rejection. The QUIC close code and reason
+                                    // string are visible to the client's transport layer.
+                                    raw_conn.close(0x3, "scope resolution failed");
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "scope_resolve").increment(1);
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                    return Ok(());
+                                }
+                            };
+
+                            let scope_id = scope_info.as_ref().map(|s| s.scope_id.clone());
+                            let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
+                            let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
+
+                            if let Some(ref info) = scope_info {
+                                tracing::debug!(
                                     connection_path = moq_session.connection_path(),
-                                    error = %err,
-                                    "scope resolution failed, rejecting session"
+                                    scope_id = %info.scope_id,
+                                    permissions = ?info.permissions,
+                                    "scope resolved"
                                 );
-                                // Close with PROTOCOL_VIOLATION (0x3) so the client
-                                // gets a meaningful error instead of an abrupt reset.
-                                // This is a QUIC APPLICATION_CLOSE, not a MoQT SESSION_CLOSE
-                                // control message. Sending a proper SESSION_CLOSE would require
-                                // running the MoQ session's send loop, which is not warranted
-                                // for a pre-session rejection. The QUIC close code and reason
-                                // string are visible to the client's transport layer.
-                                raw_conn.close(0x3, "scope resolution failed");
-                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "scope_resolve").increment(1);
-                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
-                                return Ok(());
                             }
-                        };
 
-                        let scope_id = scope_info.as_ref().map(|s| s.scope_id.clone());
-                        let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
-                        let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
+                            // Gate Producer/Consumer creation on permissions.
+                            // Note the intentional inversion:
+                            // - Producer serves SUBSCRIBEs → gated on can_subscribe
+                            // - Consumer handles PUBLISH_NAMESPACEs → gated on can_publish
+                            //
+                            // When a half is disabled, we pass its transport counterpart
+                            // to the Session's reject fields so unauthorized messages get
+                            // an explicit error response instead of being silently ignored.
+                            let (producer, reject_subscribes) = if can_subscribe {
+                                (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone())), None)
+                            } else {
+                                (None, publisher)
+                            };
 
-                        if let Some(ref info) = scope_info {
-                            tracing::debug!(
-                                connection_path = moq_session.connection_path(),
-                                scope_id = %info.scope_id,
-                                permissions = ?info.permissions,
-                                "scope resolved"
-                            );
-                        }
+                            let (consumer, reject_publishes) = if can_publish {
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                            } else {
+                                (None, subscriber)
+                            };
 
-                        // Gate Producer/Consumer creation on permissions.
-                        // Note the intentional inversion:
-                        // - Producer serves SUBSCRIBEs → gated on can_subscribe
-                        // - Consumer handles PUBLISH_NAMESPACEs → gated on can_publish
-                        //
-                        // When a half is disabled, we pass its transport counterpart
-                        // to the Session's reject fields so unauthorized messages get
-                        // an explicit error response instead of being silently ignored.
-                        let (producer, reject_subscribes) = if can_subscribe {
-                            (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone())), None)
-                        } else {
-                            (None, publisher)
-                        };
+                            let session = Session {
+                                session: moq_session,
+                                producer,
+                                consumer,
+                                reject_publishes,
+                                reject_subscribes,
+                            };
 
-                        let (consumer, reject_publishes) = if can_publish {
-                            (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
-                        } else {
-                            (None, subscriber)
-                        };
-
-                        let session = Session {
-                            session: moq_session,
-                            producer,
-                            consumer,
-                            reject_publishes,
-                            reject_subscribes,
-                        };
-
-                        match session.run().await {
-                            Ok(()) => {
-                                // Session ended cleanly (uncommon - usually ends via close)
-                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                            match session.run().await {
+                                Ok(()) => {
+                                    // Session ended cleanly (uncommon - usually ends via close)
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                }
+                                Err(err) if err.is_graceful_close() => {
+                                    // Graceful close - peer sent APPLICATION_CLOSE with code 0
+                                    tracing::debug!("MoQ session closed gracefully");
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                }
+                                Err(err) => {
+                                    // Actual error - protocol violation, timeout, etc.
+                                    tracing::warn!(error = %err, "MoQ session error: {}", err);
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                }
                             }
-                            Err(err) if err.is_graceful_close() => {
-                                // Graceful close - peer sent APPLICATION_CLOSE with code 0
-                                tracing::debug!("MoQ session closed gracefully");
-                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
-                            }
-                            Err(err) => {
-                                // Actual error - protocol violation, timeout, etc.
-                                tracing::warn!(error = %err, "MoQ session error: {}", err);
-                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
-                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
-                            }
-                        }
 
-                        Ok(())
-                    }.boxed());
-                },
-                res = tasks.next(), if !tasks.is_empty() => res.unwrap()?,
+                            Ok(())
+                        }.boxed());
+                    },
+                    res = tasks.next(), if !tasks.is_empty() => res.unwrap()?,
+                }
             }
         }
+        .await;
+
+        remotes.shutdown().await;
+        run_result
     }
 }

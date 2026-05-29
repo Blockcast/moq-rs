@@ -179,6 +179,15 @@ impl Subscriber {
 
     /// Subscribe to a track by creating a new subscribe request to the publisher.  Block until subscription is closed.
     pub async fn subscribe(&mut self, track: serve::TrackWriter) -> Result<(), ServeError> {
+        let subscribe = self.subscribe_open(track).await?;
+        subscribe.closed().await
+    }
+
+    /// Subscribe to a track and wait until the publisher acknowledges it.
+    pub async fn subscribe_open(
+        &mut self,
+        track: serve::TrackWriter,
+    ) -> Result<Subscribe, ServeError> {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
@@ -187,8 +196,8 @@ impl Subscriber {
             .lock()
             .map_err(|_| ServeError::internal_ctx("subscribe lock poisoned"))?
             .insert(request_id, recv);
-
-        send.closed().await
+        send.ok().await?;
+        Ok(send)
     }
 
     /// Send a message to the publisher via the control stream.
@@ -321,7 +330,7 @@ impl Subscriber {
     }
 
     /// Remove a subscribe from our map of active subscribes, and the alias map if present.
-    fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
+    pub(super) fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
         let subscribe = self.subscribes.lock().ok().and_then(|mut s| s.remove(&id));
         if let Some(ref sub) = subscribe {
             if let Some(track_alias) = sub.track_alias() {
@@ -856,5 +865,89 @@ impl Subscriber {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::Poll;
+
+    use super::*;
+    use crate::{
+        message::{self, GroupOrder},
+        serve::Track,
+    };
+
+    fn subscriber() -> Subscriber {
+        let request_id = RequestId::new(0, 100, 100, 0);
+        Subscriber::new(Queue::default(), None, request_id)
+    }
+
+    #[tokio::test]
+    async fn subscribe_open_cleans_up_when_cancelled_before_ok() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        {
+            let subscribe = subscriber.subscribe_open(writer);
+            futures::pin_mut!(subscribe);
+
+            assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+            assert_eq!(observer.subscribes.lock().unwrap().len(), 1);
+        }
+
+        assert!(observer.subscribes.lock().unwrap().is_empty());
+        assert!(observer.subscribe_alias_map.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_open_subscribe_removes_recv_state() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        let subscribe = subscriber.subscribe_open(writer);
+        futures::pin_mut!(subscribe);
+
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+        assert_eq!(observer.subscribes.lock().unwrap().len(), 1);
+
+        let mut receiver = observer.clone();
+        receiver
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 10,
+                expires: 0,
+                group_order: GroupOrder::Publisher,
+                content_exists: false,
+                largest_location: None,
+                params: Default::default(),
+            })
+            .unwrap();
+
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(subscribe)) => subscribe,
+            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
+            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
+        };
+
+        assert_eq!(observer.subscribes.lock().unwrap().len(), 1);
+        assert_eq!(
+            observer
+                .subscribe_alias_map
+                .lock()
+                .unwrap()
+                .get(&10)
+                .copied(),
+            Some(0)
+        );
+
+        drop(subscribe);
+
+        assert!(observer.subscribes.lock().unwrap().is_empty());
+        assert!(observer.subscribe_alias_map.lock().unwrap().is_empty());
     }
 }
