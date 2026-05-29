@@ -632,6 +632,88 @@ mod tests {
             ]
         );
     }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // T1.7 stage 2: real FFmpeg moq_mmt multicast packets (captured on loopback;
+    // MMTP+MPU headers verbatim) MUST flow through the Mapping-B dispatch without
+    // error and produce the expected subgroup structure — subgroup 0 = Init,
+    // subgroups 1..M = one MFU each, keyed by the per-sample MMTP timestamp. This
+    // validates the dispatch against real muxer output, not just synthetic vectors.
+    #[test]
+    fn replays_real_moq_mmt_capture_into_mapping_b_subgroups() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets/moq_mmt_capture.json");
+        let raw = std::fs::read_to_string(path).expect("real-capture fixture present");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid fixture JSON");
+        let packets: Vec<Vec<u8>> = doc["packets_hex"]
+            .as_array()
+            .expect("packets_hex array")
+            .iter()
+            .map(|h| hex_to_bytes(h.as_str().unwrap()))
+            .collect();
+        assert!(
+            packets.len() >= 100,
+            "expected the real capture (~120 packets), got {}",
+            packets.len()
+        );
+
+        // The moq_mmt muxer's video packet_id is 1.
+        let mut map = make_state_map(1, 5);
+        for (i, pkt) in packets.iter().enumerate() {
+            let routing = crate::mmtp_parse::route(pkt)
+                .unwrap_or_else(|e| panic!("route() failed on real packet {i}: {e}"));
+            dispatch(&mut map, &routing, Bytes::copy_from_slice(pkt))
+                .unwrap_or_else(|e| panic!("dispatch() failed on real packet {i}: {e}"));
+        }
+
+        let state = map.get(&1).expect("packet_id 1 present");
+
+        // Group every create_group call by group_id. Per group, subgroup 0 (Init)
+        // appears at most once; the MFU subgroups are contiguous 1..=M.
+        use std::collections::BTreeMap;
+        let mut by_group: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for (g, sg, prio) in &state.sink.groups_created {
+            assert_eq!(*prio, 5, "subgroups inherit the track priority");
+            by_group.entry(*g).or_default().push(*sg);
+        }
+        assert!(
+            by_group.len() >= 2,
+            "expected >=2 MPU groups (group advance exercised), got {}",
+            by_group.len()
+        );
+
+        let mut saw_init_subgroup_zero = false;
+        let mut saw_multi_mfu_group = false;
+        for (g, subs) in &by_group {
+            let init_count = subs.iter().filter(|x| **x == 0).count();
+            assert!(init_count <= 1, "group {g}: Init subgroup 0 created more than once");
+            if init_count == 1 {
+                saw_init_subgroup_zero = true;
+            }
+            let mut mfus: Vec<u64> = subs.iter().copied().filter(|x| *x != 0).collect();
+            mfus.sort_unstable();
+            let expected: Vec<u64> = (1..=mfus.len() as u64).collect();
+            assert_eq!(mfus, expected, "group {g}: MFU subgroups must be contiguous 1..=M");
+            if mfus.len() >= 2 {
+                saw_multi_mfu_group = true;
+            }
+        }
+        assert!(saw_init_subgroup_zero, "expected an Init object on subgroup 0");
+        assert!(saw_multi_mfu_group, "expected a group with multiple MFU subgroups");
+
+        // A fragmented MFU: some MFU subgroup of the final (still-open) group
+        // received more than one object (its FI=1,2,..,3 fragments).
+        let max_objs = state.mfu_groups.values().map(|g| g.writes.len()).max().unwrap_or(0);
+        assert!(
+            max_objs >= 2,
+            "expected a fragmented MFU (>1 object in one subgroup), got max {max_objs}"
+        );
+    }
 }
 
 // ---- moq-transport adapter (wired in main.rs, not used by tests) ----
