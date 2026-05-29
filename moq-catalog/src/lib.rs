@@ -177,6 +177,7 @@ mod tests {
         for (v, expected) in [
             (TrackPackaging::Cmaf, "\"cmaf\""),
             (TrackPackaging::Loc, "\"loc\""),
+            (TrackPackaging::Mmtp, "\"mmtp\""),
         ] {
             let json = serde_json::to_string(&v).unwrap();
             assert_eq!(json, expected, "serialize {v:?}");
@@ -479,6 +480,14 @@ pub enum TrackPackaging {
 
     #[serde(rename = "loc")]
     Loc,
+
+    /// MMTP packaging. Defined by draft-ramadan-moq-mmt as an additional value
+    /// of the IETF catalog `packaging` field (draft-ietf-moq-catalogformat
+    /// defines `cmaf` and `loc`). This is the coarse, MSF-facing packaging value
+    /// (`shaka.msf` keys track selection on `packaging === "mmtp"`); the
+    /// optional `container` extension carries finer MMTP encapsulation detail.
+    #[serde(rename = "mmtp")]
+    Mmtp,
 }
 
 /// Container format per draft-ramadan-moq-mmt §11.1.
