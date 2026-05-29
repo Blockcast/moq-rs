@@ -146,9 +146,23 @@ fn build_state_map(
                     track_ref.name
                 )
             })?;
-            let subgroups = track_writer
+            let mut subgroups = track_writer
                 .subgroups()
                 .with_context(|| format!("track `{}`: subgroups() failed", track_ref.name))?;
+
+            // Config-or-throw: MMTP publishing under Mapping B opens many
+            // concurrent subgroups per group (Init + one per MFU). The publisher
+            // MUST bound retained history; there is no silent unbounded default.
+            let history_window = multicast.subgroup_history_groups.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "catalog multicast.subgroupHistoryGroups is required for MMTP publishing \
+                     (config-or-throw): it bounds per-track subgroup memory under Mapping B"
+                )
+            })?;
+            if history_window < 1 {
+                bail!("multicast.subgroupHistoryGroups must be >= 1 (got {history_window})");
+            }
+            subgroups.set_history_window(history_window);
 
             // Auto-create the AL-FEC repair sibling. The track name
             // convention `<source>/repair` is publisher-internal per
@@ -160,9 +174,10 @@ fn build_state_map(
                     repair_name
                 )
             })?;
-            let repair_subgroups = repair_writer
+            let mut repair_subgroups = repair_writer
                 .subgroups()
                 .with_context(|| format!("track `{repair_name}`: subgroups() failed"))?;
+            repair_subgroups.set_history_window(history_window);
 
             map.insert(
                 track_ref.packet_id,
@@ -446,6 +461,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1), ("a", 1)])]),
                 network_source: None,
+                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -463,12 +479,34 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("does-not-exist", 1)])]),
                 network_source: None,
+                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
         let err = expect_err(build_state_map(&mut tw, &cat));
         assert!(
             err.to_string().contains("not present in catalog.tracks"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_state_map_errors_when_subgroup_history_window_absent() {
+        // config-or-throw: MMTP publishing requires multicast.subgroupHistoryGroups.
+        // Mapping B opens many subgroups per group; there is no silent unbounded
+        // default.
+        let cat = catalog_with(
+            vec![track("v", Some(Container::Mmtp))],
+            Some(MulticastConfig {
+                endpoints: Some(vec![endpoint(vec![("v", 1)])]),
+                network_source: None,
+                subgroup_history_groups: None,
+            }),
+        );
+        let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
+        let err = expect_err(build_state_map(&mut tw, &cat));
+        assert!(
+            err.to_string().contains("subgroupHistoryGroups"),
             "got: {err}"
         );
     }
@@ -485,6 +523,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
+                subgroup_history_groups: Some(8),
             }),
         );
         let catalog_bytes = serde_json::to_vec(&cat).unwrap();
@@ -512,6 +551,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17), ("a", 18)])]),
                 network_source: None,
+                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -539,6 +579,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
+                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -615,6 +656,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
+                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();

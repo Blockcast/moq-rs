@@ -51,6 +51,7 @@ cat > "$SMOKE/catalog.json" <<EOF
     {"name": "a", "container": "mmtp", "selectionParams": {"codec": "mp4a.synth"}}
   ],
   "multicast": {
+    "subgroupHistoryGroups": 8,
     "endpoints": [{
       "groupAddress": "239.255.1.1",
       "port": 5004,
