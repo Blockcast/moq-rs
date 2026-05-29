@@ -117,17 +117,24 @@ T1.7 staged smoke E2E → T1.2 (CMAF-wrap AVCC NAL) → relay receive-path B + w
   Init→subgroup 0, MFU→timestamp-keyed subgroup (≥1), Fragment→error; A1 relaxed,
   A2 kept. 42 moq-pub-mmtp tests pass, clippy clean.
 
-**REMAINING for B-MIG-pub — window wiring (leak-prevention):** `main.rs` does NOT
-yet call `SubgroupsWriter::set_history_window`, so with the new dispatch the
-publisher opens ~16 subgroups/group and (window unset) **retains all → unbounded
-leak**. Do not run the publisher long until wired. Plan: add optional
-`subgroupHistoryGroups` to the catalog (recommend `MulticastConfig`, global;
-`#[serde(default)]` already present so no fixture breakage); in `build_state_map`
-read it and call `set_history_window` on each source + repair `subgroups` writer;
-decide config-or-throw vs documented requirement. Placement (global vs per-track
-`MulticastTrackRef`) is an open schema call. set_history_window is called on the
-concrete `SubgroupsWriter` in build_state_map (not via the generic TrackSubgroups
-trait), so no trait change needed.
+**B-MIG-pub — COMPLETE** (`47ac1b3`). Window wiring landed: `subgroupHistoryGroups`
+added to `MulticastConfig` (global), `build_state_map` reads it and calls
+`set_history_window` on each source + repair writer, config-or-throw (errors if
+absent for MMTP tracks, rejects < 1). Smoke catalog updated. moq-pub-mmtp 43 pass,
+moq-catalog 24 pass, clippy clean. Future: per-track override on `MulticastTrackRef`
+if audio/video group-rate disparity ever needs it.
+
+### NEXT: T1.7 staged smoke E2E
+
+With B-MIG-pub done, the next task is the staged end-to-end smoke (handoff PENDING
+item 2): real FFmpeg `moq_mmt` multicast → `moq-pub-mmtp` → relay → Shaka observe
+dump, verifying the Mapping-B wire (subgroup 0 = Init, subgroups 1..M keyed by the
+per-MFU timestamp, objects in FI order). The capture recipe is proven (see memory
+`ffmpeg-moq-mmt-multicast-wire-format.md`): `moq_mmt -moq_enabled 0
+-multicast_enabled 1 -mcast_container mmtp`. Note loopback multicast on `lo` did
+not deliver to a local joiner — use a real interface or feed `moq-pub-mmtp` from a
+captured packet file (its stdin length-prefixed input mode). Then T1.2 (CMAF-wrap
+AVCC NAL MFUs) and the relay receive-path B + window.
 
 ---
 
