@@ -124,7 +124,25 @@ absent for MMTP tracks, rejects < 1). Smoke catalog updated. moq-pub-mmtp 43 pas
 moq-catalog 24 pass, clippy clean. Future: per-track override on `MulticastTrackRef`
 if audio/video group-rate disparity ever needs it.
 
-### NEXT: T1.7 staged smoke E2E
+### T1.7 staged smoke — stages 1+2 DONE (real capture → replay)
+
+- **Captured** the real `moq_mmt` multicast MMTP leg on loopback (needs `sudo ip
+  link set lo multicast on` + `ip route replace 239/8 dev lo`; capturer
+  `/tmp/mmtp_cap2.py`; ffmpeg `moq_mmt -moq_enabled 0 -multicast_enabled 1
+  -mcast_container mmtp`). Confirmed: Init(FT0)+MFU(FT2) only, per-MFU timestamps.
+- **Replay test** (`ea1a5b5`, moq-pub-mmtp `replays_real_moq_mmt_capture_into_mapping_b_subgroups`):
+  real packets through `route()`+`dispatch()` → asserts Mapping-B subgroups
+  (Init→0, MFU 1..M by timestamp, fragmented MFUs share a subgroup). Fixture:
+  `moq-pub-mmtp/tests/assets/moq_mmt_capture.json` (119 pkts, headers verbatim,
+  payloads truncated to 16B). 44 tests pass.
+- **Real bug found + fixed**: the resent Init carried a stale `mpu_seq=0` →
+  looked like an MPU-seq regression after later groups. FFmpeg fix on branch
+  `blo-4020-m4-t1.7-init-mpu-seq` (commit `cb57ae0bf22`, `moqenc_mmt.c`): stamp
+  the resent Init with its keyframe group (`gop_count-1`). Re-capture verified
+  `I0 M0 I1 M1 I2 M2` alignment. **NOT pushed** (confirm FFmpeg-fork destination
+  before pushing); ffmpeg rebuilt locally (`build-native`).
+
+### NEXT: T1.7 stage 3 (relay + Shaka E2E) — was:
 
 With B-MIG-pub done, the next task is the staged end-to-end smoke (handoff PENDING
 item 2): real FFmpeg `moq_mmt` multicast → `moq-pub-mmtp` → relay → Shaka observe
