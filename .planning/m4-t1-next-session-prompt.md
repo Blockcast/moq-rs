@@ -106,6 +106,29 @@ prune. See `.planning/m4-b-mig-transport-subgroups-design.md` for the design +
 subgroup-per-MFU in publish.rs + wire `set_history_window` from catalog/config) →
 T1.7 staged smoke E2E → T1.2 (CMAF-wrap AVCC NAL) → relay receive-path B + window.
 
+### B-MIG-pub progress (commits this session)
+
+- `553a92d` feat(moq-transport): deliver all subgroups per group + group-window
+  prune (the prerequisite — done, 5 tests, 114 crate pass).
+- `dc12d1f` docs(planning): T1.7 findings + transport-subgroups design note.
+- `a348ea3` feat(moq-pub-mmtp): **Mapping B subgroup-per-MFU dispatch** — DONE.
+  PacketRouting surfaces MMTP `timestamp`; TrackState holds subgroup 0 (Init) +
+  per-group `HashMap<timestamp, Group>` for MFUs + counter; dispatch routes
+  Init→subgroup 0, MFU→timestamp-keyed subgroup (≥1), Fragment→error; A1 relaxed,
+  A2 kept. 42 moq-pub-mmtp tests pass, clippy clean.
+
+**REMAINING for B-MIG-pub — window wiring (leak-prevention):** `main.rs` does NOT
+yet call `SubgroupsWriter::set_history_window`, so with the new dispatch the
+publisher opens ~16 subgroups/group and (window unset) **retains all → unbounded
+leak**. Do not run the publisher long until wired. Plan: add optional
+`subgroupHistoryGroups` to the catalog (recommend `MulticastConfig`, global;
+`#[serde(default)]` already present so no fixture breakage); in `build_state_map`
+read it and call `set_history_window` on each source + repair `subgroups` writer;
+decide config-or-throw vs documented requirement. Placement (global vs per-track
+`MulticastTrackRef`) is an open schema call. set_history_window is called on the
+concrete `SubgroupsWriter` in build_state_map (not via the generic TrackSubgroups
+trait), so no trait change needed.
+
 ---
 
 ## PENDING (next session) — priority order [PARTLY SUPERSEDED — see Session 2 update]
