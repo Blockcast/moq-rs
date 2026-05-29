@@ -10,7 +10,7 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{cmp, ops::Deref, sync::Arc};
+use std::{ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
@@ -44,16 +44,22 @@ impl Deref for Subgroups {
 
 // State shared between the writer and reader.
 struct SubgroupsState {
-    latest_subgroup_reader: Option<SubgroupReader>,
-    epoch: u64, // Updated each time latest changes
+    // Created subgroups still within the history window, in creation order. Each
+    // reader walks this via its own absolute cursor (SubgroupsReader::read_index),
+    // so every subgroup of a group is delivered — not just the latest. Mirrors
+    // the object-level SubgroupState.
+    subgroups: Vec<SubgroupReader>,
+    // Count of subgroups pruned off the front by the history window. A reader's
+    // absolute read_index maps to `subgroups[read_index - pruned]`.
+    pruned: usize,
     closed: Result<(), ServeError>,
 }
 
 impl Default for SubgroupsState {
     fn default() -> Self {
         Self {
-            latest_subgroup_reader: None,
-            epoch: 0,
+            subgroups: Vec::new(),
+            pruned: 0,
             closed: Ok(()),
         }
     }
@@ -65,6 +71,10 @@ pub struct SubgroupsWriter {
     next_subgroup_id: u64, // Not in the state to avoid a lock
     next_group_id: u64,    // Not in the state to avoid a lock
     last_group_id: u64,    // Not in the state to avoid a lock
+    // Retain only subgroups of the most recent `history_window_groups` group ids;
+    // older groups are pruned on create(). None = retain unbounded (matching the
+    // object-level stream). Live publishers MUST set this to bound memory.
+    history_window_groups: Option<u64>,
 }
 
 impl SubgroupsWriter {
@@ -75,7 +85,19 @@ impl SubgroupsWriter {
             next_subgroup_id: 0,
             next_group_id: 0,
             last_group_id: 0,
+            history_window_groups: None,
         }
+    }
+
+    /// Bound retained subgroup history to the most recent `groups` group ids.
+    /// As newer groups arrive, subgroups of groups older than the window are
+    /// pruned. Required for live publishers to keep memory bounded; without it,
+    /// history grows unbounded (one subgroup-reader handle per subgroup created).
+    /// `groups` must be >= 1. Assumes monotonically non-decreasing group ids
+    /// (enforced upstream by the publisher's MPU-sequence A2 check).
+    pub fn set_history_window(&mut self, groups: u64) {
+        assert!(groups >= 1, "history window must retain at least one group");
+        self.history_window_groups = Some(groups);
     }
 
     // Helper to increment the group by one.
@@ -111,29 +133,35 @@ impl SubgroupsWriter {
         };
         let (writer, reader) = subgroup.produce();
 
+        // Append unconditionally — every subgroup is retained and delivered, in
+        // creation order. (The old latest-wins logic dropped all but the newest
+        // subgroup of a group, which is incompatible with Mapping B's
+        // subgroup-per-MFU.) MoQ permits subgroups in any order; the subscriber
+        // reorders by (group, subgroup, object) ids.
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        self.next_subgroup_id = writer.subgroup_id + 1;
+        self.next_group_id = writer.group_id + 1;
+        self.last_group_id = writer.group_id;
+        state.subgroups.push(reader);
 
-        if let Some(latest) = &state.latest_subgroup_reader {
-            // TODO: Check this logic again
-            if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
-                match writer.subgroup_id.cmp(&latest.subgroup_id) {
-                    cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
-                    cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-                    cmp::Ordering::Greater => state.latest_subgroup_reader = Some(reader),
-                }
-            } else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
-                state.latest_subgroup_reader = Some(reader);
-            } else {
-                return Ok(writer); // drop here as well
+        // Bound history to the most recent `window` group ids. Prune any subgroup
+        // whose group is at least `window` groups behind the newest. Group ids are
+        // monotonically non-decreasing (publisher A2), so prunable subgroups form a
+        // contiguous prefix. The additive form avoids unsigned underflow when the
+        // newest group id is smaller than the window.
+        if let Some(window) = self.history_window_groups {
+            let newest = writer.group_id;
+            let mut k = 0;
+            while k < state.subgroups.len()
+                && state.subgroups[k].group_id.saturating_add(window) <= newest
+            {
+                k += 1;
             }
-        } else {
-            state.latest_subgroup_reader = Some(reader);
+            if k > 0 {
+                state.subgroups.drain(0..k);
+                state.pruned += k;
+            }
         }
-
-        self.next_subgroup_id = state.latest_subgroup_reader.as_ref().unwrap().subgroup_id + 1;
-        self.next_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id + 1;
-        self.last_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id;
-        state.epoch += 1;
 
         Ok(writer)
     }
@@ -162,7 +190,9 @@ impl Deref for SubgroupsWriter {
 pub struct SubgroupsReader {
     pub info: Arc<Track>,
     state: State<SubgroupsState>,
-    epoch: u64,
+    // Cursor into SubgroupsState::subgroups. Cloned readers inherit this index
+    // but then advance in parallel — each receives every subgroup.
+    read_index: usize,
 }
 
 impl SubgroupsReader {
@@ -170,7 +200,7 @@ impl SubgroupsReader {
         Self {
             info: track_info,
             state,
-            epoch: 0,
+            read_index: 0,
         }
     }
 
@@ -179,9 +209,17 @@ impl SubgroupsReader {
             {
                 let state = self.state.lock();
 
-                if self.epoch != state.epoch {
-                    self.epoch = state.epoch;
-                    return Ok(state.latest_subgroup_reader.clone());
+                // read_index is absolute (counts pruned entries). A reader that
+                // fell behind the prune window skips ahead to the oldest retained
+                // subgroup.
+                if self.read_index < state.pruned {
+                    self.read_index = state.pruned;
+                }
+                let vec_idx = self.read_index - state.pruned;
+                if vec_idx < state.subgroups.len() {
+                    let subgroup = state.subgroups[vec_idx].clone();
+                    self.read_index += 1;
+                    return Ok(Some(subgroup));
                 }
 
                 state.closed.clone()?;
@@ -198,8 +236,8 @@ impl SubgroupsReader {
     pub fn latest(&self) -> Option<(u64, u64)> {
         let state = self.state.lock();
         state
-            .latest_subgroup_reader
-            .as_ref()
+            .subgroups
+            .last()
             .map(|group| (group.group_id, group.latest()))
     }
 
@@ -634,5 +672,138 @@ impl Deref for SubgroupObjectReader {
 
     fn deref(&self) -> &Self::Target {
         &self.info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::TrackNamespace;
+
+    fn track() -> Arc<Track> {
+        Arc::new(Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string()))
+    }
+
+    // Mapping B emits multiple subgroups per group (subgroup 0 = Init, 1..M = MFUs).
+    // The reader MUST deliver every created subgroup, not just the latest.
+    #[tokio::test]
+    async fn delivers_all_subgroups_in_one_group() {
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let _a = writer
+            .create(Subgroup { group_id: 0, subgroup_id: 0, priority: 0 })
+            .unwrap();
+        let _b = writer
+            .create(Subgroup { group_id: 0, subgroup_id: 1, priority: 0 })
+            .unwrap();
+        drop(writer); // close so a drained reader returns None instead of blocking
+
+        let mut got = Vec::new();
+        while let Some(s) = reader.next().await.unwrap() {
+            got.push((s.group_id, s.subgroup_id));
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(0, 0), (0, 1)],
+            "both subgroups of group 0 must be delivered (latest-wins drops subgroup 0)"
+        );
+    }
+
+    // With a 1-group history window, subgroups of older groups are pruned as
+    // newer groups arrive, bounding memory. A reader arriving after the prune
+    // sees only the surviving (newest) group.
+    #[tokio::test]
+    async fn prunes_subgroups_outside_group_window() {
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        writer.set_history_window(1);
+        let _a = writer
+            .create(Subgroup { group_id: 0, subgroup_id: 0, priority: 0 })
+            .unwrap();
+        let _b = writer
+            .create(Subgroup { group_id: 0, subgroup_id: 1, priority: 0 })
+            .unwrap();
+        let _c = writer
+            .create(Subgroup { group_id: 1, subgroup_id: 0, priority: 0 })
+            .unwrap();
+        drop(writer);
+
+        let mut got = Vec::new();
+        while let Some(s) = reader.next().await.unwrap() {
+            got.push((s.group_id, s.subgroup_id));
+        }
+        assert_eq!(
+            got,
+            vec![(1, 0)],
+            "group 0 subgroups pruned once group 1 arrived (window=1)"
+        );
+    }
+
+    // The window only affects readers that fall behind. A reader consuming each
+    // subgroup as it is created must still see every one, even when an older
+    // group is pruned after the reader already passed it.
+    #[tokio::test]
+    async fn keeping_up_reader_sees_all_despite_window() {
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        writer.set_history_window(1);
+
+        let _a = writer
+            .create(Subgroup { group_id: 0, subgroup_id: 0, priority: 0 })
+            .unwrap();
+        let s0 = reader.next().await.unwrap().expect("g0s0");
+        assert_eq!((s0.group_id, s0.subgroup_id), (0, 0));
+
+        let _b = writer
+            .create(Subgroup { group_id: 0, subgroup_id: 1, priority: 0 })
+            .unwrap();
+        let s1 = reader.next().await.unwrap().expect("g0s1");
+        assert_eq!((s1.group_id, s1.subgroup_id), (0, 1));
+
+        // Creating group 1 prunes group 0, but the reader already consumed it.
+        let _c = writer
+            .create(Subgroup { group_id: 1, subgroup_id: 0, priority: 0 })
+            .unwrap();
+        let s2 = reader.next().await.unwrap().expect("g1s0");
+        assert_eq!((s2.group_id, s2.subgroup_id), (1, 0));
+    }
+
+    // Cloned readers each carry their own cursor and independently receive every
+    // subgroup (fanout).
+    #[tokio::test]
+    async fn cloned_readers_each_receive_all_subgroups() {
+        let (mut writer, reader) = Subgroups { track: track() }.produce();
+        let _a = writer
+            .create(Subgroup { group_id: 0, subgroup_id: 0, priority: 0 })
+            .unwrap();
+        let _b = writer
+            .create(Subgroup { group_id: 0, subgroup_id: 1, priority: 0 })
+            .unwrap();
+        drop(writer);
+
+        let reader2 = reader.clone();
+        let collect = |mut r: SubgroupsReader| async move {
+            let mut got = Vec::new();
+            while let Some(s) = r.next().await.unwrap() {
+                got.push((s.group_id, s.subgroup_id));
+            }
+            got
+        };
+        assert_eq!(collect(reader).await, vec![(0, 0), (0, 1)]);
+        assert_eq!(collect(reader2).await, vec![(0, 0), (0, 1)]);
+    }
+
+    // append() (one subgroup per new group) still works: increasing group ids,
+    // subgroup 0, all delivered.
+    #[tokio::test]
+    async fn append_creates_increasing_groups_all_delivered() {
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let _a = writer.append(0).unwrap();
+        let _b = writer.append(0).unwrap();
+        drop(writer);
+
+        let mut got = Vec::new();
+        while let Some(s) = reader.next().await.unwrap() {
+            got.push((s.group_id, s.subgroup_id));
+        }
+        assert_eq!(got, vec![(0, 0), (1, 0)]);
     }
 }
