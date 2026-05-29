@@ -72,6 +72,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # The Karma vehicle's test page runs on a different origin (Karma's
+        # server) and fetches /__fingerprint + /__replay cross-origin, so the
+        # control responses must be CORS-readable. Harmless for the same-origin
+        # standalone harness.
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if body:
             self.wfile.write(body)
