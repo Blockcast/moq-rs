@@ -120,6 +120,17 @@ pub struct MulticastConfig {
     /// array per §4.2.3.
     #[serde(rename = "networkSource", skip_serializing_if = "Option::is_none")]
     pub network_source: Option<OneOrMany<NetworkSource>>,
+
+    /// Subgroup history window, in MoQ groups, the publisher retains per track
+    /// to bound memory (and serve catching-up subscribers). Under Mapping B a
+    /// group holds many concurrent subgroups (Init + one per MFU); the publisher
+    /// prunes subgroups of groups older than this window. REQUIRED for MMTP
+    /// publishing — the publisher errors if it is absent (config-or-throw, no
+    /// silent unbounded default). Applies to source and `<name>/repair` tracks
+    /// alike. Local deployment-policy extension; not in
+    /// draft-ramadan-moq-multicast.
+    #[serde(rename = "subgroupHistoryGroups", skip_serializing_if = "Option::is_none")]
+    pub subgroup_history_groups: Option<u64>,
 }
 
 #[cfg(test)]
