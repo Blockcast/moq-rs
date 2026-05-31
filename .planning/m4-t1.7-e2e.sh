@@ -90,11 +90,13 @@ E2E_REPO_ROOT="$SHAKA_ROOT" E2E_CAPTURE="$CAPTURE" E2E_RESULT="$RESULT" \
 PIDS+=($!); sleep 1
 
 echo "[7/8] Launch headless Chrome at the playback harness page ..."
+HARNESS="${HARNESS:-demo/play-mmtp.html}"
+echo "      harness: $HARNESS"
 google-chrome --headless=new --no-sandbox --disable-gpu --no-first-run \
   --user-data-dir="$WORK/chrome" \
   --autoplay-policy=no-user-gesture-required \
   --enable-logging=stderr \
-  "http://127.0.0.1:$CTRL_PORT/demo/play-mmtp.html" \
+  "http://127.0.0.1:$CTRL_PORT/$HARNESS" \
   > "$WORK/chrome.log" 2>&1 &
 CHROME_PID=$!
 
