@@ -89,15 +89,17 @@ E2E_REPO_ROOT="$SHAKA_ROOT" E2E_CAPTURE="$CAPTURE" E2E_RESULT="$RESULT" \
   python3 "$MOQ_ROOT/.planning/m4-t1.7-e2e/serve.py" > "$WORK/serve.log" 2>&1 &
 PIDS+=($!); sleep 1
 
-echo "[7/8] Launch headless Chrome at the harness page ..."
+echo "[7/8] Launch headless Chrome at the playback harness page ..."
 google-chrome --headless=new --no-sandbox --disable-gpu --no-first-run \
   --user-data-dir="$WORK/chrome" \
-  "http://127.0.0.1:$CTRL_PORT/demo/observe-mmtp.html" \
+  --autoplay-policy=no-user-gesture-required \
+  --enable-logging=stderr \
+  "http://127.0.0.1:$CTRL_PORT/demo/play-mmtp.html" \
   > "$WORK/chrome.log" 2>&1 &
 CHROME_PID=$!
 
-echo "      waiting for result (up to 35s) ..."
-for i in $(seq 1 70); do
+echo "      waiting for result (up to 45s) ..."
+for i in $(seq 1 90); do
   [[ -s "$RESULT" ]] && break
   sleep 0.5
 done
@@ -110,57 +112,44 @@ if [[ ! -s "$RESULT" ]]; then
   echo "  --- serve.log ---"; tail -6 "$WORK/serve.log" | sed 's/^/    /'
   echo "  --- pub.log ---";   tail -6 "$WORK/pub.log"   | sed 's/^/    /'
   echo "  --- relay.log ---"; tail -4 "$WORK/relay.log" | sed 's/^/    /'
+  echo "  --- chrome.log (tail) ---"; tail -10 "$WORK/chrome.log" | sed 's/^/    /'
   exit 1
 fi
 python3 - "$RESULT" <<'PY'
-# Assert the playable-stream contract the MMTP path now builds end-to-end.
-# processMmtpTrack_ replaced the observe-first subgroup dump: media flows when
-# createSegmentIndex() subscribes, and each reassembled MFU becomes a real
-# SegmentReference. PASS requires:
-#   - harness status == "done", no error / parserError
-#   - >= 1 SegmentReference built from the live MMTP leg
-#   - a stored Init MPU (initBytes > 0; avcC seeds the transmuxer)
-#   - monotonic, non-negative segment start times (NTP-short timeline)
-# Wire-level Mapping B (Init->sg0, MFU->sg>=1, FI order) is covered by the
-# moq-rs publisher tests; here we assert what Shaka consumes.
+# Assert the T1.2 playback contract end-to-end.
+#   PASS requires:
+#     - harness status == "done", no error
+#     - bufferedSeconds > 0  (MSE SourceBuffer received fMP4 data)
+#     - currentTime > 0      (video element advanced past t=0)
 import json,sys
 r=json.load(open(sys.argv[1]))
-status=r.get("status"); err=r.get("error"); perr=r.get("parserError")
-obs=r.get("observe") or {}
-seg=obs.get("segments",0); initb=obs.get("initBytes",0)
-mono=obs.get("monotonic",False); first=obs.get("firstStart")
-durs=obs.get("durations") or []
-print("  status       :", status)
-print("  parserError  :", perr)
-print("  error        :", (err or "")[:300])
-print("  segments     :", seg)
-print("  initBytes    :", initb)
-print("  monotonic    :", mono)
-print("  firstStart   :", first)
-print("  durations[:5]:", durs[:5])
+status=r.get("status")
+err=r.get("error")
+buf=float(r.get("bufferedSeconds",0))
+ct=float(r.get("currentTime",0))
+print("  status        :", status)
+print("  error         :", (err or "")[:300])
+print("  bufferedSeconds:", round(buf,3))
+print("  currentTime   :", round(ct,3))
 
 fails=[]
 if status!="done": fails.append(f"status={status!r} (expected 'done')")
-if err: fails.append("harness error present")
-if perr: fails.append(f"parserError={perr!r}")
-if seg<1: fails.append("no SegmentReferences built from the MMTP leg")
-if initb<1: fails.append("no Init MPU stored (initBytes=0)")
-if not mono: fails.append("segment start times not monotonic")
-if first is not None and first<0: fails.append(f"negative firstStart={first}")
+if err: fails.append("harness error: " + (err or "")[:200])
+if buf<=0: fails.append(f"bufferedSeconds={buf} (must be >0; MSE did not buffer any data)")
+if ct<=0: fails.append(f"currentTime={ct} (must be >0; video did not advance)")
 
 print()
 if fails:
     print("  E2E ASSERT: FAIL")
     for f in fails: print("    -", f)
     sys.exit(1)
-print("  E2E ASSERT: PASS — live MMTP playable stream:",
-      f"{seg} segments, init {initb}B, monotonic timing (processMmtpTrack_).")
+print(f"  E2E ASSERT: PASS — MMTP video playback verified (buffered={buf:.3f}s currentTime={ct:.3f}s)")
 PY
 ASSERT_RC=$?
 
 if [[ $ASSERT_RC -ne 0 ]]; then
-  echo "  --- shaka trace (last 25) ---"
-  python3 -c "import json;print(chr(10).join('    '+l for l in json.load(open('$RESULT')).get('trace',[])[-25:]))" 2>/dev/null || true
+  echo "  --- chrome.log (last 30) ---"; tail -30 "$WORK/chrome.log" | sed 's/^/    /'
+  echo "  --- serve.log (last 10) ---"; tail -10 "$WORK/serve.log" | sed 's/^/    /'
   echo "  --- relay.log (tail) ---"; tail -6 "$WORK/relay.log" | sed 's/^/    /'
   exit 1
 fi
