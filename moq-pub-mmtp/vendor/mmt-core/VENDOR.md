@@ -1,8 +1,8 @@
 # Vendored mmt-core
 
 Upstream: https://github.com/Blockcast/libmmt (private)
-Pinned commit: 929e5b0c7a14f6ffe0ecd50d792fff7cdc44ba0a
-Vendored on: 2026-05-28
+Pinned commit: e8ccd75aab1fc7b269ea3a3e559703c1a98e66de
+Vendored on: 2026-06-01
 Source path in upstream: `mmt-core/`
 
 ## Why vendored

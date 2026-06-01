@@ -14,8 +14,8 @@
 //
 // A MoQ object on the wire is one full raw MMTP packet (raw-passthrough
 // container mode, M.1b §B1):
-//   MMTP header (12 B) [+ SourceFecPayloadId (4 B) iff fec_type==1]
-//     + MPU header (8 B, only for packet_type=Mpu) + media payload
+//   MMTP header (12 B) + MPU header (8 B, only for packet_type=Mpu)
+//     + media payload [+ SourceFecPayloadId trailer (4 B) iff fec_type==1]
 //
 // Regenerate (DO NOT hand-edit the JSON):
 //   cargo run -p moq-pub-mmtp --example mmtp_packet_vectors -- \
@@ -99,9 +99,9 @@ fn mpu_vector(
     })
 }
 
-/// Build an MPU Mfu packet carrying a SourceFecPayloadId (fec_type==1), which
-/// sits between the 12-byte MMTP header and the 8-byte MPU header.
-fn fec_vector(name: &str, packet_id: u16, ss_id: u32, mpu_sequence: u32, payload: &[u8]) -> Value {
+/// Build wire bytes for an MPU Mfu packet carrying a SourceFecPayloadId
+/// (fec_type==1). The SS_ID is the final 4-byte trailer after the MPU payload.
+fn build_fec_packet(packet_id: u16, ss_id: u32, mpu_sequence: u32, payload: &[u8]) -> Vec<u8> {
     let ext = MmtpHeaderExt::with_fec(packet_id, PacketType::Mpu, SourceFecPayloadId::new(ss_id));
 
     let mut mpu = MpuHeader::new(FragmentType::Mfu, mpu_sequence);
@@ -113,7 +113,13 @@ fn fec_vector(name: &str, packet_id: u16, ss_id: u32, mpu_sequence: u32, payload
     ext.write_to(&mut buf).unwrap();
     mpu.write_to(&mut buf).unwrap();
     buf.put_slice(payload);
-    let packet = buf.to_vec();
+    ext.write_source_fec_payload_id_trailer(&mut buf).unwrap();
+    buf.to_vec()
+}
+
+/// Build an MPU Mfu packet carrying a SourceFecPayloadId (fec_type==1).
+fn fec_vector(name: &str, packet_id: u16, ss_id: u32, mpu_sequence: u32, payload: &[u8]) -> Value {
+    let packet = build_fec_packet(packet_id, ss_id, mpu_sequence, payload);
 
     json!({
         "name": name,
@@ -180,7 +186,14 @@ fn sequence_vector(
     let mut packets: Vec<Value> = Vec::new();
     // Init object (carries the init segment; FI=0).
     packets.push(Value::String(to_hex(&build_mpu_packet(
-        packet_id, true, mpu_sequence, FragmentType::Init, 0, 0, mpu_sequence, init_payload,
+        packet_id,
+        true,
+        mpu_sequence,
+        FragmentType::Init,
+        0,
+        0,
+        mpu_sequence,
+        init_payload,
     ))));
     // MFU fragments: FI=1 first, 2 middle(s), 3 last.
     let n = frag_payloads.len();
@@ -196,7 +209,14 @@ fn sequence_vector(
             2
         };
         packets.push(Value::String(to_hex(&build_mpu_packet(
-            packet_id, fi == 1, mpu_sequence, FragmentType::Mfu, fi, i as u8, mpu_sequence, p,
+            packet_id,
+            fi == 1,
+            mpu_sequence,
+            FragmentType::Mfu,
+            fi,
+            i as u8,
+            mpu_sequence,
+            p,
         ))));
         reassembled.extend_from_slice(p);
     }
@@ -268,8 +288,14 @@ fn main() -> anyhow::Result<()> {
             0,
             b"track=1;mpu_seq=0;frag=0;fi=1",
         ),
-        // fec_type==1: 4-byte SourceFecPayloadId between MMTP and MPU headers.
-        fec_vector("mfu_with_fec_source_id", 2, 0xCAFE_BABE, 7, b"fec-protected-mfu"),
+        // fec_type==1: 4-byte SourceFecPayloadId after the MPU payload.
+        fec_vector(
+            "mfu_with_fec_source_id",
+            2,
+            0xCAFE_BABE,
+            7,
+            b"fec-protected-mfu",
+        ),
         // Non-MPU packet: Repair, no MPU header.
         repair_vector("repair_packet", 1, b"\x00\x01\x02\x03repair-symbols"),
     ];
@@ -299,9 +325,37 @@ fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1) {
         Some(path) => {
             std::fs::write(&path, format!("{serialised}\n"))?;
-            eprintln!("wrote {} vectors to {path}", doc["vectors"].as_array().unwrap().len());
+            eprintln!(
+                "wrote {} vectors to {path}",
+                doc["vectors"].as_array().unwrap().len()
+            );
         }
         None => println!("{serialised}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fec_source_id_is_packet_trailer_not_prefix() {
+        let payload = b"fec-protected-mfu";
+        let packet = build_fec_packet(2, 0xCAFE_BABE, 7, payload);
+        let payload_start = 12 + 8;
+        let payload_end = payload_start + payload.len();
+
+        assert_eq!(&packet[payload_start..payload_end], payload);
+        assert_eq!(&packet[payload_end..], &[0xCA, 0xFE, 0xBA, 0xBE]);
+
+        // The MPU header starts immediately after MMTP, proving no SS_ID prefix
+        // was inserted between the MMTP and MPU headers.
+        assert_eq!(packet[12], 0x00);
+        assert_eq!(packet[13] as usize, payload.len());
+        assert_eq!(
+            packet.len(),
+            12 + 8 + payload.len() + SourceFecPayloadId::SIZE
+        );
+    }
 }
