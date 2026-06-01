@@ -5,6 +5,7 @@
 mod error;
 mod publish_namespace;
 mod published_namespace;
+mod published_track;
 mod publisher;
 mod reader;
 mod request_id;
@@ -17,6 +18,8 @@ mod writer;
 pub use error::*;
 pub use publish_namespace::*;
 pub use published_namespace::*;
+pub use published_track::PublishedTrack;
+pub(crate) use published_track::{PendingPublishUpdate, PublishedTrackRecv};
 pub use publisher::*;
 pub use request_id::{RequestId, RequestIdAllocation};
 pub use subscribe::*;
