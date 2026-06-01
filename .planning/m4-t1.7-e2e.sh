@@ -49,7 +49,7 @@ cat > "$WORK/catalog.json" <<EOF
 {
   "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2", "supportsDeltaUpdates": true,
   "commonTrackFields": {"namespace": "$NAME"},
-  "tracks": [{"name": "v", "packaging": "mmtp", "selectionParams": {"codec": "avc1.synth"}}],
+  "tracks": [{"name": "v", "framerate": 30, "packaging": "mmtp", "selectionParams": {"codec": "avc1.synth"}}],
   "multicast": {
     "subgroupHistoryGroups": 8,
     "endpoints": [{"groupAddress": "239.1.1.1", "port": 5000, "tracks": [{"name": "v", "packetId": 1}]}]
@@ -113,58 +113,48 @@ if [[ ! -s "$RESULT" ]]; then
   exit 1
 fi
 python3 - "$RESULT" <<'PY'
-# Assert the Mapping-B observe contract end-to-end and set the exit code.
-#   PASS requires:
-#     - harness status == "done", no error / parserError
-#     - >= 1 group observed
-#     - every observed group: Init on subgroup 0 AND >=1 MFU on subgroup >= 1
-#       (MFUs keyed by per-MFU timestamp -> contiguous subgroups 1..M)
-#     - every reassembled MFU reports >= 1 fragment (objects in FI order)
-import json,sys,re,collections
+# Assert the playable-stream contract the MMTP path now builds end-to-end.
+# processMmtpTrack_ replaced the observe-first subgroup dump: media flows when
+# createSegmentIndex() subscribes, and each reassembled MFU becomes a real
+# SegmentReference. PASS requires:
+#   - harness status == "done", no error / parserError
+#   - >= 1 SegmentReference built from the live MMTP leg
+#   - a stored Init MPU (initBytes > 0; avcC seeds the transmuxer)
+#   - monotonic, non-negative segment start times (NTP-short timeline)
+# Wire-level Mapping B (Init->sg0, MFU->sg>=1, FI order) is covered by the
+# moq-rs publisher tests; here we assert what Shaka consumes.
+import json,sys
 r=json.load(open(sys.argv[1]))
 status=r.get("status"); err=r.get("error"); perr=r.get("parserError")
-recs=r.get("records",[])
-print("  status        :", status)
-print("  parserError   :", perr)
-print("  error         :", (err or "")[:300])
-print("  observe records:", len(recs))
-
-groups=collections.defaultdict(lambda: {"init_sg":set(),"mfu_sg":set(),"frags":[]})
-kinds=collections.Counter()
-for line in recs:
-    m=re.search(r'kind=(\w+) grp=(\d+) sg=(\d+)', line)
-    if not m: continue
-    kind,g,sg=m.group(1),int(m.group(2)),int(m.group(3))
-    kinds[kind]+=1
-    if kind=='init': groups[g]["init_sg"].add(sg)
-    elif kind=='mfu':
-        groups[g]["mfu_sg"].add(sg)
-        fm=re.search(r'frags=(\d+)', line)
-        if fm: groups[g]["frags"].append(int(fm.group(1)))
-print("  kinds         :", dict(kinds))
-for g in sorted(groups):
-    gg=groups[g]
-    print(f"    group {g}: init_sg={sorted(gg['init_sg'])} #mfu_sg={len(gg['mfu_sg'])} "
-          f"mfu_sg_range=[{min(gg['mfu_sg']) if gg['mfu_sg'] else '-'}..{max(gg['mfu_sg']) if gg['mfu_sg'] else '-'}] "
-          f"frags(sample)={gg['frags'][:5]}")
+obs=r.get("observe") or {}
+seg=obs.get("segments",0); initb=obs.get("initBytes",0)
+mono=obs.get("monotonic",False); first=obs.get("firstStart")
+durs=obs.get("durations") or []
+print("  status       :", status)
+print("  parserError  :", perr)
+print("  error        :", (err or "")[:300])
+print("  segments     :", seg)
+print("  initBytes    :", initb)
+print("  monotonic    :", mono)
+print("  firstStart   :", first)
+print("  durations[:5]:", durs[:5])
 
 fails=[]
 if status!="done": fails.append(f"status={status!r} (expected 'done')")
 if err: fails.append("harness error present")
 if perr: fails.append(f"parserError={perr!r}")
-if not groups: fails.append("no groups observed")
-for g,gg in groups.items():
-    if 0 not in gg["init_sg"]: fails.append(f"group {g}: no Init on subgroup 0")
-    if not gg["mfu_sg"]: fails.append(f"group {g}: no MFU subgroups")
-    elif min(gg["mfu_sg"])<1: fails.append(f"group {g}: MFU on subgroup 0 (must be >=1)")
-    if any(f<1 for f in gg["frags"]): fails.append(f"group {g}: MFU with <1 fragment")
+if seg<1: fails.append("no SegmentReferences built from the MMTP leg")
+if initb<1: fails.append("no Init MPU stored (initBytes=0)")
+if not mono: fails.append("segment start times not monotonic")
+if first is not None and first<0: fails.append(f"negative firstStart={first}")
 
 print()
 if fails:
     print("  E2E ASSERT: FAIL")
     for f in fails: print("    -", f)
     sys.exit(1)
-print("  E2E ASSERT: PASS — Mapping B verified live (Init->sg0, MFUs->sg>=1 by timestamp, FI-ordered)")
+print("  E2E ASSERT: PASS — live MMTP playable stream:",
+      f"{seg} segments, init {initb}B, monotonic timing (processMmtpTrack_).")
 PY
 ASSERT_RC=$?
 
