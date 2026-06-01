@@ -1,0 +1,37 @@
+{
+  "_comment": "Synthetic FEC-on MMTP capture for Mapping-B publisher replay. Source packets carry fec_type=1 with a 4-byte SourceFecPayloadId trailer; repair packets carry fec_type=2 and route to the /repair sibling. Keep moq_mmt_capture.json unchanged as the FEC-off guard.",
+  "source": "synthetic mmt_core-compatible MMTP packets for BLO-8666",
+  "packets_hex": [
+    "0900000100000000000000000009080000000000494e49542d4645433010000000",
+    "080000010000111100000001000a280000000000464543302d4d46552d4110000001",
+    "10030001000000000000000252455041495230",
+    "0900000100000000000000030009080000000001494e49542d4645433110000002",
+    "080000010000222200000004000a280000000001464543312d4d46552d4110000003",
+    "10030001000000000000000552455041495231"
+  ],
+  "expected": {
+    "packet_id": 1,
+    "source_priority": 5,
+    "repair_priority": 7,
+    "source_groups_created": [
+      [0, 0, 5],
+      [0, 1, 5],
+      [1, 0, 5],
+      [1, 1, 5]
+    ],
+    "repair_groups_created": [
+      [0, 0, 7],
+      [1, 0, 7]
+    ],
+    "source_trailers_hex": [
+      "10000000",
+      "10000001",
+      "10000002",
+      "10000003"
+    ],
+    "repair_payloads_hex": [
+      "52455041495230",
+      "52455041495231"
+    ]
+  }
+}
