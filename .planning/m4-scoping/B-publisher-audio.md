@@ -192,8 +192,16 @@ moq-catalog: **NO schema change.** All audio fields exist.
 
 1. **Does the standard invocation map an audio input today?** Code is wired (VERIFIED), exercised by
    codec-matrix per `moqenc_mmt.c:153-155` (ASSUMED). #1 empirical check (plan step 1).
-2. **AAC vs Opus**: all paths assume AAC (esds/ASC, `mp4a.40.2`). Opus needs a different init/codec
-   string and is not evidenced in the muxer. DECISION: scope B to **AAC only**; defer Opus.
+2. **AAC vs Opus** — **DECISION (2026-06-01): defer Opus; scope B → C → A/V-sync to AAC
+   (`mp4a.40.2`) only.** VERIFIED: publisher is AAC-only (default `AV_CODEC_ID_AAC` `:4952`; moov
+   `stsd` builds `{avc1,hvc1,av01,mp4a}` `:3316` — no Opus sample-entry / `dOps`). Adding Opus =
+   net-new muxer work (Opus sample-entry + `dOps` in the Init MPU, Opus MFU framing). Shaka
+   **already** supports Opus (`loc_parser.js:372` → 960/sr; `lib/transmuxer/opus.js`) and the catalog
+   `codec` field is generic — so Opus stays *additive* later, no schema change. **GUARDRAIL for
+   C / A-V-sync: derive audio frame duration from the codec — do NOT hardcode AAC's `1024/sr`**
+   (reuse Shaka's `loc_parser` `opus → 960/sr` mapping). This is the one place AAC-first could
+   silently bake in rework. Follow-up ticket "Opus on the MMTP audio path" when a consumer needs it.
+   Recommendation posted on BLO-8644.
 3. **Subgroup-key validity for audio**: per-AU NTP-short timestamps at 48 kHz/1024-spf are ~21.3 ms
    apart; frac resolution ~15 µs → keys stay distinct+monotonic. LOW risk; confirm no collision at
    higher rates. VERIFIED math `160-167` + `4101-4102`.
