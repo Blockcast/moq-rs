@@ -121,10 +121,7 @@ mod tests {
         assert_eq!(r.fec_type, 0);
         assert_eq!(r.mpu_sequence, Some(42));
         // fragment_type is required for the publisher's A1 Init-only-first-packet check.
-        assert_eq!(
-            r.fragment_type,
-            Some(mmt_core::header::FragmentType::Init)
-        );
+        assert_eq!(r.fragment_type, Some(mmt_core::header::FragmentType::Init));
     }
 
     #[test]
@@ -141,6 +138,27 @@ mod tests {
         buf.put_slice(&[0xAA]);
         let r = route(&buf.to_vec()).unwrap();
         assert_eq!(r.timestamp, 0x0002_dddd);
+    }
+
+    #[test]
+    fn parses_fec_source_packet_with_ss_id_trailer() {
+        let mut hdr = MmtpHeader::new(9, PacketType::Mpu);
+        hdr.fec_type = 1;
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+
+        let mut mpu = MpuHeader::new(FragmentType::Mfu, 11);
+        mpu.payload_length = 4;
+        mpu.write_to(&mut buf).unwrap();
+
+        buf.put_slice(b"data");
+        buf.put_slice(&0xCAFE_BABEu32.to_be_bytes());
+
+        let r = route(&buf.to_vec()).unwrap();
+        assert_eq!(r.packet_id, 9);
+        assert_eq!(r.fec_type, 1);
+        assert_eq!(r.mpu_sequence, Some(11));
+        assert_eq!(r.fragment_type, Some(FragmentType::Mfu));
     }
 
     #[test]

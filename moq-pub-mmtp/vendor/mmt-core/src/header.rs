@@ -328,16 +328,47 @@ impl SourceFecPayloadId {
             ss_id: u32::from_be_bytes(*bytes),
         }
     }
+
+    /// Read a Source FEC Payload ID from the final four bytes of a packet
+    /// payload/trailer span.
+    #[inline]
+    pub fn read_trailer(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(MmtError::BufferTooSmall {
+                need: Self::SIZE,
+                have: bytes.len(),
+            });
+        }
+
+        let off = bytes.len() - Self::SIZE;
+        Ok(Self {
+            ss_id: u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]),
+        })
+    }
+
+    /// Split bytes into `(payload_without_trailer, source_fec_payload_id)`.
+    ///
+    /// The Source FEC Payload ID is carried as a trailer after the MPU payload
+    /// when `fec_type = 1`; it is not part of the MMTP header prefix.
+    #[inline]
+    pub fn split_payload_and_trailer(bytes: &[u8]) -> Result<(&[u8], Self)> {
+        let trailer = Self::read_trailer(bytes)?;
+        let payload_end = bytes.len() - Self::SIZE;
+        Ok((&bytes[..payload_end], trailer))
+    }
 }
 
 /// Extended MMTP Header with FEC support
 ///
-/// Includes optional source_FEC_payload_ID field when fec_type = 1
+/// `fec_type = 1` advertises a Source FEC Payload ID, but the SS_ID is a
+/// four-byte trailer appended after the MPU payload. It is not serialized as a
+/// prefix immediately after the MMTP header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MmtpHeaderExt {
     /// Base header fields
     pub base: MmtpHeader,
-    /// Source FEC Payload ID (present when fec_type = 1)
+    /// Source FEC Payload ID to append as a trailer when serializing a full
+    /// packet payload.
     pub source_fec_payload_id: Option<SourceFecPayloadId>,
 }
 
@@ -373,40 +404,54 @@ impl MmtpHeaderExt {
         }
     }
 
-    /// Get total header size
+    /// Get MMTP header size. Source FEC Payload ID bytes are trailer bytes and
+    /// are intentionally excluded.
     pub fn size(&self) -> usize {
-        let mut size = self.base.size();
-        if self.source_fec_payload_id.is_some() {
-            size += SourceFecPayloadId::SIZE;
-        }
-        size
+        self.base.size()
     }
 
-    /// Write to buffer
+    /// Write the MMTP header to buffer.
+    ///
+    /// This does not write the Source FEC Payload ID. Call
+    /// [`Self::write_source_fec_payload_id_trailer`] after writing the MPU
+    /// payload when serializing a full source packet.
     pub fn write_to<B: BufMut>(&self, buf: &mut B) -> Result<usize> {
-        let mut written = self.base.write_to(buf)?;
+        self.base.write_to(buf)
+    }
 
+    /// Write the Source FEC Payload ID trailer after the packet payload.
+    pub fn write_source_fec_payload_id_trailer<B: BufMut>(&self, buf: &mut B) -> Result<usize> {
         if let Some(ref fec_id) = self.source_fec_payload_id {
-            written += fec_id.write_to(buf)?;
+            fec_id.write_to(buf)
+        } else {
+            Ok(0)
         }
-
-        Ok(written)
     }
 
     /// Read from buffer
     pub fn read_from<B: Buf>(buf: &mut B) -> Result<Self> {
         let base = MmtpHeader::read_from(buf)?;
 
-        let source_fec_payload_id = if base.fec_type == FecType::WithSourcePayloadId as u8 {
-            Some(SourceFecPayloadId::read_from(buf)?)
-        } else {
-            None
-        };
-
         Ok(Self {
             base,
-            source_fec_payload_id,
+            source_fec_payload_id: None,
         })
+    }
+
+    /// Split a payload/trailer span according to the header FEC type.
+    ///
+    /// When `fec_type = 1`, the final four bytes are returned as the Source FEC
+    /// Payload ID and the first slice is bounded at `len - 4`.
+    pub fn split_payload_and_source_fec_trailer<'a>(
+        &self,
+        bytes: &'a [u8],
+    ) -> Result<(&'a [u8], Option<SourceFecPayloadId>)> {
+        if self.base.fec_type == FecType::WithSourcePayloadId as u8 {
+            let (payload, fec_id) = SourceFecPayloadId::split_payload_and_trailer(bytes)?;
+            Ok((payload, Some(fec_id)))
+        } else {
+            Ok((bytes, None))
+        }
     }
 }
 
@@ -761,6 +806,59 @@ mod tests {
         let mut read_buf = &buf[..MMTP_HEADER_SIZE];
         let parsed = MmtpHeader::read_from(&mut read_buf).unwrap();
         assert_eq!(parsed.fec_type, FecType::WithSourcePayloadId as u8);
+    }
+
+    #[test]
+    fn test_mmtp_header_ext_source_fec_id_is_trailer_not_prefix() {
+        let fec_id = SourceFecPayloadId::new(0x01020304);
+        let header = MmtpHeaderExt::with_fec(0x1234, PacketType::Mpu, fec_id);
+
+        let mut buf = vec![0u8; 64];
+        let written = header.write_to(&mut buf.as_mut_slice()).unwrap();
+
+        // fec_type=1 advertises a Source FEC Payload ID, but the SS_ID is not
+        // part of the MMTP header. It is appended after the MPU payload.
+        assert_eq!(written, MMTP_HEADER_SIZE);
+        assert_eq!(&buf[written..written + SourceFecPayloadId::SIZE], &[0; 4]);
+    }
+
+    #[test]
+    fn test_mmtp_header_ext_read_does_not_consume_payload_as_fec_prefix() {
+        let fec_id = SourceFecPayloadId::new(0x01020304);
+        let header = MmtpHeaderExt::with_fec(0x1234, PacketType::Mpu, fec_id);
+        let payload = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+
+        let mut packet = Vec::new();
+        header.write_to(&mut packet).unwrap();
+        packet.extend_from_slice(&payload);
+        packet.extend_from_slice(&fec_id.to_bytes());
+
+        let mut read_buf = &packet[..];
+        let parsed = MmtpHeaderExt::read_from(&mut read_buf).unwrap();
+
+        assert_eq!(parsed.base.fec_type, FecType::WithSourcePayloadId as u8);
+        assert!(parsed.source_fec_payload_id.is_none());
+        assert_eq!(read_buf.len(), payload.len() + SourceFecPayloadId::SIZE);
+        assert_eq!(read_buf, [&payload[..], &fec_id.to_bytes()].concat());
+    }
+
+    #[test]
+    fn test_source_fec_payload_id_split_uses_payload_end_len_minus_4() {
+        let header =
+            MmtpHeaderExt::with_fec(0x1234, PacketType::Mpu, SourceFecPayloadId::new(0x01020304));
+        let mut payload_with_trailer = b"video-data".to_vec();
+        payload_with_trailer.extend_from_slice(&0x01020304u32.to_be_bytes());
+
+        let (payload, parsed_fec_id) = header
+            .split_payload_and_source_fec_trailer(&payload_with_trailer)
+            .unwrap();
+
+        assert_eq!(payload, b"video-data");
+        assert_eq!(
+            payload.len(),
+            payload_with_trailer.len() - SourceFecPayloadId::SIZE
+        );
+        assert_eq!(parsed_fec_id.unwrap().ss_id, 0x01020304);
     }
 
     #[test]
