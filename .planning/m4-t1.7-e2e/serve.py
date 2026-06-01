@@ -90,9 +90,18 @@ def replay_capture(start=0, drop=0, reorder=0):
              dropped (the transmuxer needs one to seed).
     reorder: reverse WHOLE frames within each window of `reorder` frames
              (out-of-order delivery). Init MPUs anchor the windows.
+
+    Wired by the shaka Player.load harness (demo/play-mmtp-load.html
+    ?scenario=midjoin|loss); e2e.sh selects the harness via the HARNESS env.
     """
     cap = json.load(open(CAPTURE))
     packets = cap["packets_hex"][start:]
+    # mid-GOP join (start>0) relies on a re-sent Init MPU remaining in the slice
+    # (Init recurs per keyframe group). Fail loud if the slice dropped them all,
+    # rather than silently testing the unrelated "no init available" path.
+    if start > 0 and not any(_ft_fi(h)[0] == 0 for h in packets):
+        raise ValueError(
+            "replay start=%d leaves no Init MPU (FT=0) in range" % start)
 
     if (drop and drop > 1) or (reorder and reorder > 1):
         units = _segment_units(packets)

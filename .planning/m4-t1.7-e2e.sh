@@ -145,7 +145,7 @@ if fails:
     print("  E2E ASSERT: FAIL")
     for f in fails: print("    -", f)
     sys.exit(1)
-print(f"  E2E ASSERT: PASS — MMTP video playback verified (buffered={buf:.3f}s currentTime={ct:.3f}s)")
+print(f"  E2E ASSERT: PASS — MMTP playback verified: MSE buffered={buf:.3f}s, currentTime={ct:.3f}s advanced (harness via HARNESS=: hand-rolled MSE pipe or production Player.load)")
 PY
 ASSERT_RC=$?
 
