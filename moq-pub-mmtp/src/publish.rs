@@ -213,7 +213,9 @@ pub fn dispatch<T: TrackSubgroups>(
                     let ts = routing.timestamp;
                     if !state.mfu_groups.contains_key(&ts) {
                         let subgroup_id = state.next_mfu_subgroup_id;
-                        let g = state.sink.create_group(group_id, subgroup_id, state.priority)?;
+                        let g = state
+                            .sink
+                            .create_group(group_id, subgroup_id, state.priority)?;
                         state.next_mfu_subgroup_id += 1;
                         state.mfu_groups.insert(ts, g);
                     }
@@ -339,7 +341,12 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             packet_id,
-            TrackState::new(format!("track-{packet_id}"), priority, MockSubgroups::default(), repair),
+            TrackState::new(
+                format!("track-{packet_id}"),
+                priority,
+                MockSubgroups::default(),
+                repair,
+            ),
         );
         map
     }
@@ -407,7 +414,10 @@ mod tests {
             vec![(1, 1, 5)],
             "MFU opens subgroup 1 of group 1 (0 reserved for Init)"
         );
-        assert!(state.init_group.is_none(), "no Init seen → subgroup 0 not opened");
+        assert!(
+            state.init_group.is_none(),
+            "no Init seen → subgroup 0 not opened"
+        );
     }
 
     #[test]
@@ -453,10 +463,30 @@ mod tests {
         // Mapping B: Init -> subgroup 0; each distinct MFU timestamp -> a new
         // subgroup (1, 2, ...); the same timestamp reuses its subgroup.
         let mut map = make_state_map(1, 5);
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"init")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a0")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xB), Bytes::from_static(b"b0")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a1")).unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Init, 0),
+            Bytes::from_static(b"init"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xA),
+            Bytes::from_static(b"a0"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xB),
+            Bytes::from_static(b"b0"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xA),
+            Bytes::from_static(b"a1"),
+        )
+        .unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
@@ -471,7 +501,10 @@ mod tests {
             state.mfu_groups[&0xA].writes,
             vec![Bytes::from_static(b"a0"), Bytes::from_static(b"a1")]
         );
-        assert_eq!(state.mfu_groups[&0xB].writes, vec![Bytes::from_static(b"b0")]);
+        assert_eq!(
+            state.mfu_groups[&0xB].writes,
+            vec![Bytes::from_static(b"b0")]
+        );
     }
 
     #[test]
@@ -479,10 +512,30 @@ mod tests {
         // Advancing to a new group resets the MFU subgroup counter to 1 and
         // clears the previous group's subgroups.
         let mut map = make_state_map(1, 5);
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"i10")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 11, FragmentType::Init, 0), Bytes::from_static(b"i11")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 11, FragmentType::Mfu, 0xC), Bytes::from_static(b"c")).unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Init, 0),
+            Bytes::from_static(b"i10"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xA),
+            Bytes::from_static(b"a"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 11, FragmentType::Init, 0),
+            Bytes::from_static(b"i11"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 11, FragmentType::Mfu, 0xC),
+            Bytes::from_static(b"c"),
+        )
+        .unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
@@ -505,10 +558,7 @@ mod tests {
         // Repair for a packet_id not in the source map → hard error.
         let mut map = make_state_map_with_repair(1, 5, true);
         let err = dispatch(&mut map, &repair(99), Bytes::from_static(b"r")).unwrap_err();
-        assert!(
-            err.to_string().contains("unknown packet_id"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("unknown packet_id"), "got: {err}");
     }
 
     #[test]
@@ -612,10 +662,30 @@ mod tests {
         // ordered objects in one subgroup — even though the publisher never reads
         // the Fragmentation Indicator (§5.1).
         let mut map = make_state_map(1, 5);
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"init")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f1")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f2")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f3")).unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Init, 0),
+            Bytes::from_static(b"init"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
+            Bytes::from_static(b"f1"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
+            Bytes::from_static(b"f2"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
+            Bytes::from_static(b"f3"),
+        )
+        .unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
@@ -640,6 +710,43 @@ mod tests {
             .collect()
     }
 
+    fn bytes_to_hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            use std::fmt::Write;
+            write!(&mut out, "{b:02x}").unwrap();
+        }
+        out
+    }
+
+    fn load_capture(path: &str) -> (serde_json::Value, Vec<Vec<u8>>) {
+        let raw = std::fs::read_to_string(path).expect("capture fixture present");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid fixture JSON");
+        let packets = doc["packets_hex"]
+            .as_array()
+            .expect("packets_hex array")
+            .iter()
+            .map(|h| hex_to_bytes(h.as_str().unwrap()))
+            .collect();
+        (doc, packets)
+    }
+
+    fn expected_groups(doc: &serde_json::Value, key: &str) -> Vec<(u64, u64, u8)> {
+        doc["expected"][key]
+            .as_array()
+            .expect("expected group array")
+            .iter()
+            .map(|row| {
+                let row = row.as_array().expect("group tuple");
+                (
+                    row[0].as_u64().unwrap(),
+                    row[1].as_u64().unwrap(),
+                    row[2].as_u64().unwrap() as u8,
+                )
+            })
+            .collect()
+    }
+
     // T1.7 stage 2: real FFmpeg moq_mmt multicast packets (captured on loopback;
     // MMTP+MPU headers verbatim) MUST flow through the Mapping-B dispatch without
     // error and produce the expected subgroup structure — subgroup 0 = Init,
@@ -647,15 +754,11 @@ mod tests {
     // validates the dispatch against real muxer output, not just synthetic vectors.
     #[test]
     fn replays_real_moq_mmt_capture_into_mapping_b_subgroups() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets/moq_mmt_capture.json");
-        let raw = std::fs::read_to_string(path).expect("real-capture fixture present");
-        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid fixture JSON");
-        let packets: Vec<Vec<u8>> = doc["packets_hex"]
-            .as_array()
-            .expect("packets_hex array")
-            .iter()
-            .map(|h| hex_to_bytes(h.as_str().unwrap()))
-            .collect();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/assets/moq_mmt_capture.json"
+        );
+        let (_doc, packets) = load_capture(path);
         assert!(
             packets.len() >= 100,
             "expected the real capture (~120 packets), got {}",
@@ -691,28 +794,146 @@ mod tests {
         let mut saw_multi_mfu_group = false;
         for (g, subs) in &by_group {
             let init_count = subs.iter().filter(|x| **x == 0).count();
-            assert!(init_count <= 1, "group {g}: Init subgroup 0 created more than once");
+            assert!(
+                init_count <= 1,
+                "group {g}: Init subgroup 0 created more than once"
+            );
             if init_count == 1 {
                 saw_init_subgroup_zero = true;
             }
             let mut mfus: Vec<u64> = subs.iter().copied().filter(|x| *x != 0).collect();
             mfus.sort_unstable();
             let expected: Vec<u64> = (1..=mfus.len() as u64).collect();
-            assert_eq!(mfus, expected, "group {g}: MFU subgroups must be contiguous 1..=M");
+            assert_eq!(
+                mfus, expected,
+                "group {g}: MFU subgroups must be contiguous 1..=M"
+            );
             if mfus.len() >= 2 {
                 saw_multi_mfu_group = true;
             }
         }
-        assert!(saw_init_subgroup_zero, "expected an Init object on subgroup 0");
-        assert!(saw_multi_mfu_group, "expected a group with multiple MFU subgroups");
+        assert!(
+            saw_init_subgroup_zero,
+            "expected an Init object on subgroup 0"
+        );
+        assert!(
+            saw_multi_mfu_group,
+            "expected a group with multiple MFU subgroups"
+        );
 
         // A fragmented MFU: some MFU subgroup of the final (still-open) group
         // received more than one object (its FI=1,2,..,3 fragments).
-        let max_objs = state.mfu_groups.values().map(|g| g.writes.len()).max().unwrap_or(0);
+        let max_objs = state
+            .mfu_groups
+            .values()
+            .map(|g| g.writes.len())
+            .max()
+            .unwrap_or(0);
         assert!(
             max_objs >= 2,
             "expected a fragmented MFU (>1 object in one subgroup), got max {max_objs}"
         );
+    }
+
+    #[test]
+    fn fec_off_capture_has_no_source_fec_or_repair_packets() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/assets/moq_mmt_capture.json"
+        );
+        let (_doc, packets) = load_capture(path);
+        assert!(
+            packets.len() >= 100,
+            "expected the real FEC-off capture (~120 packets), got {}",
+            packets.len()
+        );
+
+        for (i, pkt) in packets.iter().enumerate() {
+            let routing = crate::mmtp_parse::route(pkt)
+                .unwrap_or_else(|e| panic!("route() failed on FEC-off packet {i}: {e}"));
+            assert_ne!(
+                routing.fec_type, 1,
+                "FEC-off guard packet {i} unexpectedly carries source FEC"
+            );
+            assert_ne!(
+                routing.packet_type,
+                PacketType::Repair,
+                "FEC-off guard packet {i} unexpectedly routes as repair"
+            );
+        }
+    }
+
+    #[test]
+    fn replays_fec_on_capture_into_source_and_repair_tracks() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/assets/moq_mmt_fec_on_capture.json"
+        );
+        let (doc, packets) = load_capture(path);
+        assert_eq!(packets.len(), 6, "fixture shape changed");
+
+        let mut map = make_state_map_with_repair(1, 5, true);
+        let mut source_trailers = Vec::new();
+        let mut repair_payloads = Vec::new();
+
+        for (i, pkt) in packets.iter().enumerate() {
+            let routing = crate::mmtp_parse::route(pkt)
+                .unwrap_or_else(|e| panic!("route() failed on FEC-on packet {i}: {e}"));
+            match routing.packet_type {
+                PacketType::Mpu => {
+                    assert_eq!(
+                        routing.fec_type, 1,
+                        "FEC-on source packet {i} must carry source FEC"
+                    );
+                    let trailer = &pkt[pkt.len() - 4..];
+                    source_trailers.push(bytes_to_hex(trailer));
+                    assert_ne!(
+                        &pkt[12..16],
+                        trailer,
+                        "SourceFecPayloadId must be a trailer, not an MPU prefix"
+                    );
+                }
+                PacketType::Repair => {
+                    assert_eq!(
+                        routing.fec_type, 2,
+                        "repair packet {i} must use RepairMode0 fec_type"
+                    );
+                    repair_payloads.push(bytes_to_hex(&pkt[12..]));
+                }
+                other => panic!("unexpected FEC-on packet type at {i}: {other:?}"),
+            }
+            dispatch(&mut map, &routing, Bytes::copy_from_slice(pkt))
+                .unwrap_or_else(|e| panic!("dispatch() failed on FEC-on packet {i}: {e}"));
+        }
+
+        let state = map.get(&1).expect("packet_id 1 present");
+        assert_eq!(
+            state.sink.groups_created,
+            expected_groups(&doc, "source_groups_created")
+        );
+
+        let repair = state.repair.as_ref().expect("repair sibling exists");
+        assert_eq!(
+            repair.sink.groups_created,
+            expected_groups(&doc, "repair_groups_created")
+        );
+        assert_eq!(repair.current_group_id, Some(1));
+
+        let expected_trailers: Vec<String> = doc["expected"]["source_trailers_hex"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(source_trailers, expected_trailers);
+
+        let expected_repair_payloads: Vec<String> = doc["expected"]["repair_payloads_hex"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(repair_payloads, expected_repair_payloads);
     }
 }
 
