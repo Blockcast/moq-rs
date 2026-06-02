@@ -1,5 +1,30 @@
 # M.4 next-session prompt — T1.6 close-out + Sub-project C (2026-06-01)
 
+> **UPDATE 2026-06-02 (T1.6 seam-prep SHIPPED + build-source gate greened):**
+> **BLO-8646 done** — the Shaka WT-connect seam-prep **PR #8** squash-merged to
+> `blockcast/main` (`f9d42e7d8`): `buildWebTransportOptions_`, centralized ALPN
+> (`moqt-16`/`moq-00`) + DRAFT_14 policy, `msf_transport_unit.js`.
+> - **`blockcast/main` was secretly red on the build-source gate from PR #5's MMTP
+>   code** (PR #5 merged on UNSTABLE). `build/all.py` (the `build-base`/`build-head`
+>   CI) caught 3 stacked layers that `build.py +@complete` does NOT run: ~70 ESLint,
+>   16 cspell words, **91 Closure test-type errors**. All fixed in **PR #9**
+>   (`3d4c671d9`) → main green. **Lesson: `build.py --name experimental +@complete`
+>   compiles but skips lint/spelling/test-type — it is NOT the gate. Run
+>   `python3 build/check.py` (or `build/all.py`) before trusting green.**
+> - **Real defect found + fixed:** the seam-prep set `options.protocols`, which is not
+>   a `WebTransportOptions` field (no-op ALPN). Flagged on BLO-8646; ME removed the dead
+>   path (`e6d9a6825`) — not papered over.
+> - **CI shape (carry forward):** shaka PR-bound checks are `build-base` (builds the PR
+>   base) + `build-head` (builds the merged tree) + `Validate PR Title` (semantic-PR;
+>   needs conventional title) + `compare`. These are **non-required** (you can merge on
+>   UNSTABLE), but a code PR is only truly green when `build-head` passes. When a PR's
+>   base advances, its CI does NOT auto-re-run — merge current base in + push to re-trigger.
+> - **Next T1.6 work:** **BLO-8704** (cross-player `@blockcast/moq-transport` pkg +
+>   hang/moqtail migration) — `blocked`, promotable now that 8646 landed. Also open:
+>   BLO-8717 (FFmpeg image bake), recovery-infra BLO-8676/8677 (control-plane, not deliverables).
+>
+> ---
+>
 > **UPDATE 2026-06-02 (Sub-project C SHIPPED — shaka PR #5 merged):** C (**BLO-8702**)
 > is **done** (completed 04:49Z, evidence verdict `pass`). Shaka **PR #5** squash-merged
 > into `blockcast/main` at 05:39Z → tip **`c631b0d56`** `feat(msf): MMTP AAC receiver +
@@ -153,7 +178,7 @@ lanes if too large for one serial run.
 | B publisher audio | BLO-8644 | unblocked; PRs #5/#6 landed+green; audio-E2E acceptance bullet open → fold into C (BLO-8702) recapture |
 | CQ#1 framerate | BLO-8680/8681 | **done** (satisfied) |
 | WT 4057 / relay bring-up | BLO-8688/8689/8690/8691/8695 | **done** (env-only) |
-| T1.6 WT factory (reduced) | BLO-8646 | `todo`, ME — **reduced to Shaka-side seam-prep only**; land it as its own shaka PR → `in_review`. Name `@blockcast/moq-transport` recorded. |
+| T1.6 WT factory (reduced) | BLO-8646 | **`done`** — seam-prep **PR #8** squash-merged to `blockcast/main` (`f9d42e7d8`); `protocols` no-op defect removed (`e6d9a6825`). Build-source gate greened via **PR #9** (`3d4c671d9`: lint+spelling+91 type errors). |
 | T1.6 cross-player package | **BLO-8704** | `backlog`, medium, ME — greenfield `@blockcast/moq-transport` + hang/moqtail migration; **C landed → now promotable `backlog→todo`** |
 | Sub-project C | **BLO-8702** | **`done`** — shaka **PR #5** squash-merged to `blockcast/main` (`c631b0d56`, 2026-06-02); whole MMTP stack (T1.2+T1.7+C); build +@complete 0 errors, Mmtp 27/27 |
 | Sub-project C — Opus | BLO-8705 | `todo`, medium, ME — deferred, not built this milestone |
