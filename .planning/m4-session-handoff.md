@@ -1,5 +1,12 @@
 # M.4 session handoff — post-T1.5c-1.B + 4-gate resolution (2026-06-01)
 
+> **SUPERSEDED 2026-06-02** by `m4-next-session-prompt.md` (live rolling handoff). Since
+> this doc was written: **B (BLO-8644) E2E went green**, and **Sub-project C (BLO-8702)
+> SHIPPED** — shaka **PR #5** squash-merged to `blockcast/main` (`c631b0d56`); it landed
+> the whole MMTP stack (T1.2 video + T1.7 + C), build `+@complete` 0 errors, Mmtp 27/27.
+> Open M.4 work now: **BLO-8704** (cross-player `@blockcast/moq-transport` pkg, promotable
+> after C), **BLO-8646** (T1.6 seam-prep), **BLO-8717** (FFmpeg image bake).
+
 **TL;DR:** T1.5c-1.B (NTP-wrap unwrap) shipped. All 4 post-T1.2 targets scoped,
 recommended, and decided/signed-off. MulticastEngineer (paperclip) then
 implemented **T1.FEC** and **T1.5c-1.A**; **T1.6** is in review; **B** is blocked
@@ -26,7 +33,8 @@ whether those two gates cleared and B's E2E went green.
 | **T1.FEC** SS_ID trailer | BLO-8645 | **DONE** | libmmt #51 + moq-rs #11(revendor)/#13(FEC-ON) + shaka #7, all merged. **libmmt API signed off by Omar.** |
 | **T1.5c-1.A** reorder buffer | BLO-8647 | **DONE** | msf_parser.js W=`computeFecTimeout`, `targetLatency` ceiling, `fecInterleaveDepthMs` field; MSFParser 8 / msf 124 green |
 | **T1.6** WT factory | BLO-8646 | **in_review** | name decided → `@blockcast/moq-transport` (NOT `@blockcast/transport`=ssm-transport, NOT `@blockcast/mmt-transport`=mode-manager) |
-| **B** publisher audio | BLO-8644 | **BLOCKED** | packet_id=2 proven, 3 gaps fixed, Opus deferred, contract doc done; blocked only on final live E2E |
+| **B** publisher audio | BLO-8644 | **DONE** | live E2E green; last audio-E2E bullet folds into C's recapture (`moq_mmt_capture_av.json`, `5174596`) |
+| **C** receiver audio + A/V sync | BLO-8702 | **SHIPPED** | shaka PR #5 → `blockcast/main` (`c631b0d56`); whole MMTP stack; build +@complete 0 err, Mmtp 27/27; Opus deferred (8705/8713/8714) |
 
 ## Active blocker chain (B's E2E) — both root-caused + routed to MulticastEngineer
 `BLO-8644 → BLO-8680 (framerate, CEO) → BLO-8681 (impl, ME) → BLO-8689 (WT-validate, ME)` + `BLO-8688 (WT 4057, CTO)`.
@@ -45,5 +53,5 @@ Both posted as comments on the issues + `interrupt` wakes on BLO-8689/BLO-8681.
 ## Next session
 1. Check B's E2E: did 8688 (WT 0.6.0 relay) + 8680 (catalog framerate) clear → 8644 green?
 2. T1.6 (BLO-8646) review close-out → `@blockcast/moq-transport` package land.
-3. Sub-project C (receiver audio + A/V sync) — now unblocked by B's contract; TIER-2 shared-epoch sync (moq-lib `Sync`/moqtail `MediaSync`).
+3. ~~Sub-project C (receiver audio + A/V sync)~~ **DONE 2026-06-02** — BLO-8702, shaka PR #5 merged (`c631b0d56`); TIER-2 shared-epoch sync landed. Opus deferred (8705/8713/8714).
 4. Scoping docs live in `.planning/m4-scoping/{B-publisher-audio,T1.5c-timing-avsync,T1.FEC-trailer-fix,T1.6-transport-factory}.md`.
