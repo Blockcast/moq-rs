@@ -10,8 +10,16 @@
 # (moqenc_mmt.c: stream->packet_id = stream_index + 1). Capture is unicast on
 # 127.0.0.1:<PORT> (serve.py replays unicast anyway, so multicast routing is moot).
 set -euo pipefail
-FFMPEG="${FFMPEG:-$HOME/src/pim-multicast-gateway/FFmpeg/build-native/ffmpeg}"
-OUT="${1:-$(cd "$(dirname "$0")" && pwd)/moq_mmt_capture_av.json}"
+# Resolve the Blockcast FFmpeg (moq_mmt muxer). Prefer the CI convention the pmg
+# workflows use ($FFMPEG_PATH/build-native — they set FFMPEG_PATH=<workspace>/FFmpeg
+# from the Blockcast/FFmpeg submodule), then the in-tree submodule build, then a
+# devbox checkout. System /usr/bin/ffmpeg has NO moq_mmt muxer — never use it.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -n "${FFMPEG:-}" ]; then :
+elif [ -n "${FFMPEG_PATH:-}" ] && [ -x "$FFMPEG_PATH/build-native/ffmpeg" ]; then FFMPEG="$FFMPEG_PATH/build-native/ffmpeg"
+elif [ -x "$SELF_DIR/../../../FFmpeg/build-native/ffmpeg" ]; then FFMPEG="$(cd "$SELF_DIR/../../.." && pwd)/FFmpeg/build-native/ffmpeg"
+else FFMPEG="$HOME/src/pim-multicast-gateway/FFmpeg/build-native/ffmpeg"; fi
+OUT="${1:-$SELF_DIR/moq_mmt_capture_av.json}"
 PORT="${PORT:-5000}"; DUR="${DUR:-4}"
 [ -x "$FFMPEG" ] || { echo "custom ffmpeg with moq_mmt not found: $FFMPEG"; exit 1; }
 "$FFMPEG" -hide_banner -h muxer=moq_mmt 2>/dev/null | grep -q moq_mmt \
