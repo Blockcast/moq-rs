@@ -1,19 +1,21 @@
 // SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Inbound PUBLISH handling: a subscriber receives a PUBLISH from a publisher
-//! and can accept it with PUBLISH_OK, reject it with REQUEST_ERROR, and then
-//! receive Objects on the resulting subscription.
+//! Inbound PUBLISH handling: this endpoint, acting as subscriber, receives a
+//! PUBLISH from a publisher and can accept it with PUBLISH_OK, reject it with
+//! REQUEST_ERROR, and then receive Objects on the resulting subscription
+//! (draft-16 §9.13 / §9.14 / §9.15).
 //!
-//! # Ownership model (draft-16 §9.13 / §9.14)
+//! # Ownership model
 //!
-//! The transport layer retains the `TrackWriter` (stored inside
-//! `PublishedTrackRecv`) so that `recv_stream` and `recv_datagram` can write
-//! inbound Objects without application involvement.  The application receives
-//! the `TrackReader` by calling `PublishedTrack::ok`.
+//! The transport layer retains the `TrackWriter` (inside `PublishReceivedRecv`)
+//! so the stream/datagram receive paths can write inbound Objects without
+//! application involvement. The application receives the `TrackReader` from
+//! `PublishReceived::ok`. This mirrors the outbound-SUBSCRIBE receive path
+//! where `SubscribeRecv` owns the writer.
 //!
-//! This mirrors the existing outbound-SUBSCRIBE path where `SubscribeRecv`
-//! owns the writer and the stream/datagram handlers write into it.
+//! This is the inbound counterpart of `Published` (outbound PUBLISH). Both use
+//! the same `TrackOrigin` alias map in `Subscriber` for stream routing.
 
 use crate::{
     coding::{KeyValuePairs, Location, ReasonPhrase, TrackName, TrackNamespace},
@@ -27,16 +29,16 @@ use super::Subscriber;
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 
-/// State shared between `PublishedTrack` (application handle) and
-/// `PublishedTrackRecv` (transport handle).
-pub(crate) struct PublishedTrackState {
+/// State shared between `PublishReceived` (application handle) and
+/// `PublishReceivedRecv` (transport handle).
+pub(crate) struct PublishReceivedState {
     /// True once PUBLISH_DONE has been received from the publisher.
     done: bool,
     /// Terminal result; set when `done` becomes true.
     closed: Result<(), ServeError>,
 }
 
-impl Default for PublishedTrackState {
+impl Default for PublishReceivedState {
     fn default() -> Self {
         Self {
             done: false,
@@ -50,12 +52,12 @@ impl Default for PublishedTrackState {
 /// An inbound PUBLISH received by this endpoint acting as subscriber
 /// (draft-16 §9.13).
 ///
-/// Call [`ok`] to accept the subscription and obtain the [`TrackReader`].
-/// Dropping without calling [`ok`] sends `REQUEST_ERROR UNINTERESTED` back to
-/// the publisher.
-pub struct PublishedTrack {
+/// Call [`ok`](Self::ok) to accept the subscription and obtain the
+/// [`TrackReader`]. Dropping without calling `ok` sends `REQUEST_ERROR
+/// UNINTERESTED` back to the publisher.
+pub struct PublishReceived {
     session: Subscriber,
-    state: State<PublishedTrackState>,
+    state: State<PublishReceivedState>,
 
     /// Request ID of the inbound PUBLISH (draft-16 §9.1).
     request_id: u64,
@@ -75,7 +77,7 @@ pub struct PublishedTrack {
     error: Option<ServeError>,
 }
 
-impl PublishedTrack {
+impl PublishReceived {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         session: Subscriber,
@@ -85,7 +87,7 @@ impl PublishedTrack {
         name: TrackName,
         initial_forward: bool,
         largest_location: Option<Location>,
-        state: State<PublishedTrackState>,
+        state: State<PublishReceivedState>,
     ) -> Self {
         Self {
             session,
@@ -107,12 +109,15 @@ impl PublishedTrack {
     ///
     /// `forward` sets the initial Forward State:
     ///   - `true`  — publisher may start transmitting Objects immediately.
-    ///   - `false` — publisher pauses until the subscriber sends REQUEST_UPDATE
-    ///               with Forward=1.
+    ///   - `false` — publisher pauses until Forward is later set to 1.
+    ///
+    /// Note: post-establishment `REQUEST_UPDATE` is not supported yet, so
+    /// passing `false` keeps the publisher paused for the lifetime of the
+    /// subscription in this implementation.
     ///
     /// # Protocol note
-    /// PUBLISH has a dedicated success response (§9.14, type 0x1E).  Do not
-    /// use REQUEST_OK (§9.7) here.
+    /// PUBLISH has a dedicated success response (§9.14, type 0x1E). Do not use
+    /// REQUEST_OK (§9.7) here.
     pub fn ok(&mut self, forward: bool) -> Result<TrackReader, ServeError> {
         if self.ok {
             return Err(ServeError::Duplicate);
@@ -131,7 +136,7 @@ impl PublishedTrack {
         // Take the TrackReader that was pre-allocated in recv_publish.
         let reader = self
             .session
-            .take_published_track_reader(self.request_id)
+            .take_publish_received_reader(self.request_id)
             .ok_or(ServeError::Done)?;
 
         Ok(reader)
@@ -160,16 +165,6 @@ impl PublishedTrack {
         }
     }
 
-    /// Toggle Forward state by sending REQUEST_UPDATE (draft-16 §9.11).
-    ///
-    /// Waits for the publisher's REQUEST_OK or returns the error from
-    /// REQUEST_ERROR.
-    pub async fn set_forward(&mut self, forward: bool) -> Result<(), ServeError> {
-        self.session
-            .send_request_update_for_publish(self.request_id, forward)
-            .await
-    }
-
     pub fn namespace(&self) -> &TrackNamespace {
         &self.namespace
     }
@@ -191,7 +186,7 @@ impl PublishedTrack {
     }
 }
 
-impl Drop for PublishedTrack {
+impl Drop for PublishReceived {
     fn drop(&mut self) {
         if self.ok {
             // Already accepted; nothing to send — PUBLISH_DONE arrives from the
@@ -229,7 +224,7 @@ impl Drop for PublishedTrack {
         );
 
         // Clean up subscriber-side state for this PUBLISH.
-        self.session.remove_published_track(self.request_id);
+        self.session.remove_publish_received(self.request_id);
     }
 }
 
@@ -237,26 +232,24 @@ impl Drop for PublishedTrack {
 
 /// Transport-side bookkeeping for a single inbound PUBLISH.
 ///
-/// Stored in `Subscriber::published_tracks`.  Stream and datagram receive
+/// Stored in `Subscriber::publishes_received`. Stream and datagram receive
 /// paths write Objects directly into the `TrackWriterMode` here.
-pub(crate) struct PublishedTrackRecv {
+pub(crate) struct PublishReceivedRecv {
     /// Shared state so both the transport and app can observe PUBLISH_DONE.
-    state: State<PublishedTrackState>,
+    state: State<PublishReceivedState>,
 
-    /// Write half for inbound Objects.  The transport owns this so it can push
+    /// Write half for inbound Objects. The transport owns this so it can push
     /// Objects without going through the application.
     writer: Option<TrackWriterMode>,
 
-    /// Read half returned to the application on `PublishedTrack::ok`.
+    /// Read half returned to the application on `PublishReceived::ok`.
     /// Wrapped in `Option` so it can be taken exactly once.
     reader: Option<TrackReader>,
 }
 
-impl PublishedTrackRecv {
-    /// Create a `PublishedTrack` / `PublishedTrackRecv` pair from a PUBLISH message.
-    ///
-    /// Returns both the application-facing handle and the transport-facing recv,
-    /// pre-wired to the same shared state.
+impl PublishReceivedRecv {
+    /// Create a `PublishReceived` / `PublishReceivedRecv` pair from a PUBLISH
+    /// message. Both handles share the same state.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn produce(
         session: Subscriber,
@@ -268,10 +261,10 @@ impl PublishedTrackRecv {
         largest_location: Option<Location>,
         writer: serve::TrackWriter,
         reader: TrackReader,
-    ) -> (PublishedTrack, PublishedTrackRecv) {
-        let (app_state, transport_state) = State::<PublishedTrackState>::default().split();
+    ) -> (PublishReceived, PublishReceivedRecv) {
+        let (app_state, transport_state) = State::<PublishReceivedState>::default().split();
 
-        let app = PublishedTrack::new(
+        let app = PublishReceived::new(
             session,
             request_id,
             track_alias,
@@ -290,15 +283,15 @@ impl PublishedTrackRecv {
         (app, recv)
     }
 
-    /// Take the `TrackReader` out exactly once (for `PublishedTrack::ok`).
+    /// Take the `TrackReader` out exactly once (for `PublishReceived::ok`).
     pub fn take_reader(&mut self) -> Option<TrackReader> {
         self.reader.take()
     }
 
     /// Open a subgroup writer for the given subgroup header.
     ///
-    /// Mirrors `SubscribeRecv::subgroup` so the same `recv_subgroup` code path
-    /// can serve both SUBSCRIBE-initiated and PUBLISH-initiated subscriptions.
+    /// Mirrors `SubscribeRecv::subgroup` so the same subgroup receive loop can
+    /// serve both SUBSCRIBE-initiated and PUBLISH-initiated subscriptions.
     pub fn subgroup(
         &mut self,
         header: data::SubgroupHeader,
@@ -375,18 +368,6 @@ impl PublishedTrackRecv {
     }
 }
 
-// ── Pending REQUEST_UPDATE for set_forward ────────────────────────────────────
-
-/// Bookkeeping for a pending REQUEST_UPDATE sent by `PublishedTrack::set_forward`.
-///
-/// Stored in `Subscriber::pending_publish_updates` keyed by the REQUEST_UPDATE
-/// request id.  When REQUEST_OK or REQUEST_ERROR arrives it is removed and the
-/// sender is notified.
-pub(crate) struct PendingPublishUpdate {
-    /// One-shot channel to wake the `set_forward` caller.
-    pub result_tx: tokio::sync::oneshot::Sender<Result<(), ServeError>>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,15 +380,15 @@ mod tests {
     fn make_pair(
         request_id: u64,
     ) -> (
-        PublishedTrack,
-        PublishedTrackRecv,
+        PublishReceived,
+        PublishReceivedRecv,
         crate::session::Subscriber,
     ) {
         let rid = RequestId::new(0, 100, 100, 0);
         let subscriber = crate::session::Subscriber::new(Queue::default(), None, rid);
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();
-        let (pt, recv) = PublishedTrackRecv::produce(
+        let (pr, recv) = PublishReceivedRecv::produce(
             subscriber.clone(),
             request_id,
             42,
@@ -418,12 +399,12 @@ mod tests {
             writer,
             reader,
         );
-        (pt, recv, subscriber)
+        (pr, recv, subscriber)
     }
 
     #[test]
     fn take_reader_returns_once() {
-        let (_pt, mut recv, _sub) = make_pair(0);
+        let (_pr, mut recv, _sub) = make_pair(0);
         assert!(recv.take_reader().is_some());
         assert!(
             recv.take_reader().is_none(),
@@ -433,7 +414,7 @@ mod tests {
 
     #[test]
     fn recv_done_closes_writer_and_sets_state() {
-        let (_pt, mut recv, _sub) = make_pair(1);
+        let (_pr, mut recv, _sub) = make_pair(1);
         assert!(recv.writer.is_some());
 
         recv.recv_done(message::PublishDoneCode::TrackEnded as u64);
@@ -446,16 +427,16 @@ mod tests {
 
     #[test]
     fn recv_done_non_track_ended_stores_code() {
-        let (_pt, mut recv, _sub) = make_pair(2);
+        let (_pr, mut recv, _sub) = make_pair(2);
         recv.recv_done(message::PublishDoneCode::Expired as u64);
         // No panic and writer is gone.
         assert!(recv.writer.is_none());
     }
 
     #[test]
-    fn published_track_drop_without_ok_does_not_panic() {
-        let (pt, _recv, _sub) = make_pair(3);
+    fn publish_received_drop_without_ok_does_not_panic() {
+        let (pr, _recv, _sub) = make_pair(3);
         // Drop without calling ok() — should send REQUEST_ERROR, not panic.
-        drop(pt);
+        drop(pr);
     }
 }

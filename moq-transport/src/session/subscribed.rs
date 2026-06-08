@@ -71,6 +71,20 @@ pub struct Subscribed {
     /// PUBLISH_DONE vs REQUEST_ERROR on drop.
     ok: bool,
 
+    /// Whether `serve_inner` should send SUBSCRIBE_OK before sending data.
+    ///
+    /// True for SUBSCRIBE-initiated subscriptions. False for PUBLISH-initiated
+    /// subscriptions because the success response is PUBLISH_OK sent by the
+    /// subscriber, not SUBSCRIBE_OK from us.
+    send_subscribe_ok: bool,
+
+    /// Track Alias used in subgroup/datagram headers.
+    ///
+    /// For SUBSCRIBE-initiated subscriptions this equals `info.id`, preserving
+    /// existing behavior. For PUBLISH-initiated subscriptions this is the alias
+    /// sent in PUBLISH.
+    track_alias: u64,
+
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
@@ -83,11 +97,14 @@ impl Subscribed {
     ) -> Result<(Self, SubscribedRecv), SessionError> {
         let (send, recv) = State::default().split();
         let info = SubscribeInfo::new_from_subscribe(&msg)?;
+        let track_alias = info.id;
         let send = Self {
             publisher,
             state: send,
             info,
             ok: false,
+            send_subscribe_ok: true,
+            track_alias,
             mlog,
         };
 
@@ -95,6 +112,48 @@ impl Subscribed {
         let recv = SubscribedRecv { state: recv };
 
         Ok((send, recv))
+    }
+
+    /// Create a publisher-side subscription for a PUBLISH-initiated track.
+    ///
+    /// This reuses the same serve loop as inbound SUBSCRIBE. The only protocol
+    /// differences are that the Track Alias is chosen by the publisher and the
+    /// subscription is already considered accepted for purposes of sending
+    /// PUBLISH_DONE on Drop.
+    pub(super) fn new_for_publish(
+        publisher: Publisher,
+        request_id: u64,
+        track_alias: u64,
+        namespace: crate::coding::TrackNamespace,
+        name: crate::coding::TrackName,
+        forward: bool,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> (Self, SubscribedRecv) {
+        let (send, recv) = State::default().split();
+        let info = SubscribeInfo {
+            id: request_id,
+            track_namespace: namespace,
+            track_name: name,
+            subscriber_priority: 128,
+            group_order: crate::message::GroupOrder::Publisher,
+            forward,
+            filter_type: crate::message::FilterType::AbsoluteStart,
+            start_location: None,
+            end_group_id: None,
+            filter: None,
+            params: Default::default(),
+            track_status: false,
+        };
+        let send = Self {
+            publisher,
+            state: send,
+            info,
+            ok: true,
+            send_subscribe_ok: false,
+            track_alias,
+            mlog,
+        };
+        (send, SubscribedRecv { state: recv })
     }
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
@@ -124,16 +183,18 @@ impl Subscribed {
                 .map_err(|_| SessionError::Internal)?;
         }
 
-        self.publisher
-            .send_message_and_wait(message::SubscribeOk {
-                id: self.info.id,
-                track_alias: self.info.id, // use subscription id as track alias
-                params,
-                track_extensions: Default::default(),
-            })
-            .await;
+        if self.send_subscribe_ok {
+            self.publisher
+                .send_message_and_wait(message::SubscribeOk {
+                    id: self.info.id,
+                    track_alias: self.track_alias,
+                    params,
+                    track_extensions: Default::default(),
+                })
+                .await;
 
-        self.ok = true; // So we send SubscribeDone on drop
+            self.ok = true; // So we send PUBLISH_DONE on drop
+        }
 
         let delivery_filter = self.info.delivery_filter(largest_location);
 
@@ -274,7 +335,7 @@ impl Subscribed {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
                             header_type: data::StreamHeaderType::SubgroupIdExt,  // SubGroupId = Yes, Extensions = Yes, ContainsEndOfGroup = No
-                            track_alias: self.info.id, // use subscription id as track_alias
+                            track_alias: self.track_alias,
                             group_id: subgroup.group_id,
                             subgroup_id: Some(subgroup.subgroup_id),
                             publisher_priority: subgroup.priority,
@@ -484,7 +545,7 @@ impl Subscribed {
 
             let encoded_datagram = data::Datagram {
                 datagram_type,
-                track_alias: self.info.id, // use subscription id as track_alias
+                track_alias: self.track_alias,
                 group_id: datagram.group_id,
                 object_id: Some(datagram.object_id),
                 publisher_priority: datagram.priority,
