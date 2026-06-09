@@ -14,6 +14,7 @@ mod request_id;
 mod subscribe;
 mod subscribe_namespace;
 mod subscribed;
+mod subscribed_namespace;
 mod subscriber;
 mod track_status_requested;
 mod writer;
@@ -31,6 +32,7 @@ pub use request_id::{RequestId, RequestIdAllocation};
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribed::*;
+pub use subscribed_namespace::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
 
@@ -719,6 +721,7 @@ impl Session {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_subscribe_namespace_open(self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_accept(self.webtransport.clone(), self.publisher.clone(), self.request_id.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
@@ -816,6 +819,53 @@ impl Session {
         }
 
         recv.run(reader).await
+    }
+
+    async fn run_subscribe_namespace_accept(
+        webtransport: web_transport::Session,
+        publisher: Option<Publisher>,
+        request_id: RequestId,
+    ) -> Result<(), SessionError> {
+        let mut tasks = FuturesUnordered::new();
+
+        loop {
+            tokio::select! {
+                stream = webtransport.accept_bi() => {
+                    let (send, recv) = stream?;
+                    let publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
+                    let request_id = request_id.clone();
+                    tasks.push(Self::accept_subscribe_namespace_stream(publisher, request_id, send, recv));
+                }
+                Some(res) = tasks.next(), if !tasks.is_empty() => res?,
+            }
+        }
+    }
+
+    async fn accept_subscribe_namespace_stream(
+        mut publisher: Publisher,
+        request_id: RequestId,
+        send: web_transport::SendStream,
+        recv: web_transport::RecvStream,
+    ) -> Result<(), SessionError> {
+        let writer = Writer::new(send);
+        let mut reader = Reader::new(recv);
+        let msg = reader.decode::<Message>().await?;
+
+        let subscribe_namespace = match msg {
+            Message::SubscribeNamespace(msg) => msg,
+            other => {
+                return Err(SessionError::ProtocolViolation(format!(
+                    "bidirectional stream began with {} instead of SUBSCRIBE_NAMESPACE",
+                    other.name()
+                )))
+            }
+        };
+        let log_msg = Message::SubscribeNamespace(subscribe_namespace.clone());
+        Self::log_control_message(&log_msg, "recv");
+
+        request_id.validate_incoming(subscribe_namespace.id)?;
+        let recv = publisher.recv_subscribe_namespace(subscribe_namespace)?;
+        recv.run(writer, reader).await
     }
 
     /// Receives inbound messages from the control stream reader/receiver.  Analyzes if the message
