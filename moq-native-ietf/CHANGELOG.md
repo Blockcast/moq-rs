@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.8.0...moq-native-ietf-v0.9.0) - 2026-06-10
+
+### Other
+
+- Use Box+impl Fn for socket wrapper; add passthrough test
+- Add socket_wrapper hook to quic Config
+
 ## [0.8.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.5...moq-native-ietf-v0.8.0) - 2026-04-10
 
 ### Fixed
