@@ -5,16 +5,16 @@ use std::collections::HashSet;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    coding::TrackNamespace,
-    message::{RequestErrorCode, SubscribeOptions},
-    serve::{FullTrackName, ServeError, TracksReader},
+    coding::{KeyValuePairs, TrackNamespace},
+    message::SubscribeOptions,
+    serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{Publisher, SessionError, Subscribed, SubscribedNamespace, TrackStatusRequested},
 };
 use tokio::sync::broadcast;
 
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
-    Locals, NamespaceChange, RemoteManager,
+    Locals, NamespaceChange, RemoteManager, TrackChange,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -202,22 +202,29 @@ impl Producer {
         self,
         mut subscribed_namespace: SubscribedNamespace,
     ) -> Result<(), anyhow::Error> {
-        // PUBLISH fan-out is a separate part of the feature. Reject requests
-        // that ask for it rather than accepting incomplete behavior.
-        if subscribed_namespace.subscribe_options != SubscribeOptions::Namespace {
-            subscribed_namespace.reject(
-                RequestErrorCode::NotSupported as u64,
-                "publish option not supported",
-            )?;
-            return Ok(());
-        }
-
-        let mut changes = self.locals.subscribe_namespace_changes();
+        let wants_namespace = wants_namespace(subscribed_namespace.subscribe_options);
+        let wants_publish = wants_publish(subscribed_namespace.subscribe_options);
+        let mut namespace_changes = self.locals.subscribe_namespace_changes();
+        let mut track_changes = self.locals.subscribe_track_changes();
+        let mut publish_tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
+            FuturesUnordered::new();
 
         subscribed_namespace.ok()?;
 
-        let mut known = HashSet::new();
-        self.send_namespace_snapshot(&mut subscribed_namespace, &mut known)?;
+        let mut known_namespaces = HashSet::new();
+        if wants_namespace {
+            self.send_namespace_snapshot(&mut subscribed_namespace, &mut known_namespaces)?;
+        }
+
+        let mut known_tracks = HashSet::new();
+        if wants_publish {
+            self.send_publish_snapshot(
+                &mut subscribed_namespace,
+                &mut known_tracks,
+                &mut publish_tasks,
+            )
+            .await?;
+        }
 
         loop {
             tokio::select! {
@@ -225,17 +232,29 @@ impl Producer {
                     res?;
                     return Ok(());
                 }
-                change = changes.recv() => {
+                change = namespace_changes.recv(), if wants_namespace => {
                     match change {
                         Ok(change) => {
-                            self.apply_namespace_change(&mut subscribed_namespace, &mut known, change)?;
+                            self.apply_namespace_change(&mut subscribed_namespace, &mut known_namespaces, change)?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            self.resync_namespaces(&mut subscribed_namespace, &mut known)?;
+                            self.resync_namespaces(&mut subscribed_namespace, &mut known_namespaces)?;
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
                 }
+                change = track_changes.recv(), if wants_publish => {
+                    match change {
+                        Ok(change) => {
+                            self.apply_track_change(&subscribed_namespace, &mut known_tracks, &mut publish_tasks, change).await?;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            self.resync_publish_tracks(&subscribed_namespace, &mut known_tracks, &mut publish_tasks).await?;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    }
+                }
+                _ = publish_tasks.next(), if !publish_tasks.is_empty() => {},
             }
         }
     }
@@ -311,6 +330,121 @@ impl Producer {
         Ok(())
     }
 
+    async fn send_publish_snapshot(
+        &self,
+        subscribed_namespace: &SubscribedNamespace,
+        known: &mut HashSet<FullTrackName>,
+        publish_tasks: &mut FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
+    ) -> Result<(), anyhow::Error> {
+        for track in self.locals.list_tracks_matching(
+            self.scope.as_deref(),
+            &subscribed_namespace.namespace_prefix,
+        ) {
+            self.publish_track_for_namespace(subscribed_namespace, known, publish_tasks, track)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn apply_track_change(
+        &self,
+        subscribed_namespace: &SubscribedNamespace,
+        known: &mut HashSet<FullTrackName>,
+        publish_tasks: &mut FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
+        change: TrackChange,
+    ) -> Result<(), anyhow::Error> {
+        match change {
+            TrackChange::Added { scope, track } => {
+                if scope.as_deref() != self.scope.as_deref()
+                    || !subscribed_namespace
+                        .namespace_prefix
+                        .is_prefix_of(&track.namespace)
+                {
+                    return Ok(());
+                }
+
+                self.publish_track_for_namespace(subscribed_namespace, known, publish_tasks, track)
+                    .await
+            }
+            TrackChange::Removed { scope, full_name } => {
+                if scope.as_deref() == self.scope.as_deref() {
+                    known.remove(&full_name);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn resync_publish_tracks(
+        &self,
+        subscribed_namespace: &SubscribedNamespace,
+        known: &mut HashSet<FullTrackName>,
+        publish_tasks: &mut FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
+    ) -> Result<(), anyhow::Error> {
+        let tracks: Vec<_> = self
+            .locals
+            .list_tracks_matching(
+                self.scope.as_deref(),
+                &subscribed_namespace.namespace_prefix,
+            )
+            .into_iter()
+            .map(|track| (full_name_for_track(&track), track))
+            .collect();
+        let current: HashSet<_> = tracks
+            .iter()
+            .map(|(full_name, _)| full_name.clone())
+            .collect();
+
+        for (full_name, track) in tracks {
+            if !known.contains(&full_name) {
+                self.publish_track_for_namespace(subscribed_namespace, known, publish_tasks, track)
+                    .await?;
+            }
+        }
+
+        known.retain(|full_name| current.contains(full_name));
+        Ok(())
+    }
+
+    async fn publish_track_for_namespace(
+        &self,
+        subscribed_namespace: &SubscribedNamespace,
+        known: &mut HashSet<FullTrackName>,
+        publish_tasks: &mut FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
+        track: TrackReader,
+    ) -> Result<(), anyhow::Error> {
+        let full_name = full_name_for_track(&track);
+        if known.contains(&full_name) {
+            return Ok(());
+        }
+
+        let mut params = KeyValuePairs::default();
+        if !subscribed_namespace.forward {
+            params.set_forward(false);
+        }
+
+        let namespace = full_name.namespace.to_utf8_path();
+        let track_name = full_name.name.to_string();
+        let mut publisher = self.publisher.clone();
+        let published = match publisher.publish(track, params).await {
+            Ok(published) => published,
+            Err(SessionError::Serve(ServeError::Duplicate)) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        known.insert(full_name);
+        publish_tasks.push(
+            async move {
+                if let Err(err) = published.serve().await {
+                    tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving PUBLISH for SUBSCRIBE_NAMESPACE");
+                }
+            }
+            .boxed(),
+        );
+
+        Ok(())
+    }
+
     fn is_expected_serve_shutdown(err: &anyhow::Error) -> bool {
         matches!(
             err.downcast_ref::<SessionError>(),
@@ -370,6 +504,24 @@ impl Producer {
             track_status_requested.request_msg.track_name
         ))
         .into())
+    }
+}
+
+fn wants_namespace(options: SubscribeOptions) -> bool {
+    matches!(
+        options,
+        SubscribeOptions::Namespace | SubscribeOptions::Both
+    )
+}
+
+fn wants_publish(options: SubscribeOptions) -> bool {
+    matches!(options, SubscribeOptions::Publish | SubscribeOptions::Both)
+}
+
+fn full_name_for_track(track: &TrackReader) -> FullTrackName {
+    FullTrackName {
+        namespace: track.namespace.clone(),
+        name: track.name.clone(),
     }
 }
 

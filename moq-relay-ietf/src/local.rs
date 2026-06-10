@@ -38,6 +38,18 @@ pub struct NamespaceChange {
     pub added: bool,
 }
 
+#[derive(Clone)]
+pub enum TrackChange {
+    Added {
+        scope: Option<String>,
+        track: TrackReader,
+    },
+    Removed {
+        scope: Option<String>,
+        full_name: FullTrackName,
+    },
+}
+
 /// Relay-local registry.
 ///
 /// Actual media tracks are always stored by exact Full Track Name. Namespace
@@ -54,6 +66,9 @@ pub struct Locals {
 
     /// Namespace add/remove notifications for SUBSCRIBE_NAMESPACE handlers.
     namespace_changes: broadcast::Sender<NamespaceChange>,
+
+    /// Actual PUBLISH track add/remove notifications for Publish/Both fan-out.
+    track_changes: broadcast::Sender<TrackChange>,
 }
 
 impl Default for Locals {
@@ -65,15 +80,21 @@ impl Default for Locals {
 impl Locals {
     pub fn new() -> Self {
         let (namespace_changes, _) = broadcast::channel(1024);
+        let (track_changes, _) = broadcast::channel(1024);
         Self {
             tracks: Default::default(),
             namespaces: Default::default(),
             namespace_changes,
+            track_changes,
         }
     }
 
     pub fn subscribe_namespace_changes(&self) -> broadcast::Receiver<NamespaceChange> {
         self.namespace_changes.subscribe()
+    }
+
+    pub fn subscribe_track_changes(&self) -> broadcast::Receiver<TrackChange> {
+        self.track_changes.subscribe()
     }
 
     pub fn list_namespaces_matching(
@@ -92,6 +113,26 @@ impl Locals {
             .keys()
             .filter(|namespace| prefix.is_prefix_of(namespace))
             .cloned()
+            .collect()
+    }
+
+    pub fn list_tracks_matching(
+        &self,
+        scope: Option<&str>,
+        prefix: &TrackNamespacePrefix,
+    ) -> Vec<TrackReader> {
+        let Ok(mut tracks) = self.tracks.lock() else {
+            return Vec::new();
+        };
+        let Some(bucket) = tracks.get_mut(scope.unwrap_or(UNSCOPED)) else {
+            return Vec::new();
+        };
+
+        bucket.retain(|_, track| !track.is_closed());
+        bucket
+            .iter()
+            .filter(|(full_name, _)| prefix.is_prefix_of(&full_name.namespace))
+            .map(|(_, track)| track.clone())
             .collect()
     }
 
@@ -164,9 +205,14 @@ impl Locals {
             .map_err(|_| ServeError::internal_ctx("locals track registry lock poisoned"))?;
         let bucket = tracks.entry(scope_key.clone()).or_default();
         match bucket.entry(full_name.clone()) {
-            hash_map::Entry::Vacant(entry) => entry.insert(track),
+            hash_map::Entry::Vacant(entry) => entry.insert(track.clone()),
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
         };
+
+        let _ = self.track_changes.send(TrackChange::Added {
+            scope: scope_key_to_option(&scope_key),
+            track,
+        });
 
         Ok(LocalTrackRegistration {
             locals: self.clone(),
@@ -340,13 +386,21 @@ impl Drop for LocalTrackRegistration {
         };
         tracing::debug!(namespace = %namespace, track = %track, scope = %scope, "deregistering track from locals");
 
+        let mut removed = false;
         if let Ok(mut tracks) = self.locals.tracks.lock() {
             if let Some(bucket) = tracks.get_mut(self.scope_key.as_str()) {
-                bucket.remove(&self.full_name);
+                removed = bucket.remove(&self.full_name).is_some();
                 if bucket.is_empty() {
                     tracks.remove(self.scope_key.as_str());
                 }
             }
+        }
+
+        if removed {
+            let _ = self.locals.track_changes.send(TrackChange::Removed {
+                scope: scope_key_to_option(&self.scope_key),
+                full_name: self.full_name.clone(),
+            });
         }
     }
 }
@@ -534,6 +588,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_namespaces_matching_keeps_unscoped_and_scoped_separate() {
+        let mut locals = Locals::new();
+        let _global = locals
+            .register_namespace(None, ns("room/global"))
+            .await
+            .expect("global namespace should register");
+        let _scoped = locals
+            .register_namespace(Some("scope-a"), ns("room/scoped"))
+            .await
+            .expect("scoped namespace should register");
+
+        let global =
+            locals.list_namespaces_matching(None, &TrackNamespacePrefix::from_utf8_path("room"));
+        assert_eq!(global, vec![ns("room/global")]);
+
+        let scoped = locals.list_namespaces_matching(
+            Some("scope-a"),
+            &TrackNamespacePrefix::from_utf8_path("room"),
+        );
+        assert_eq!(scoped, vec![ns("room/scoped")]);
+    }
+
+    #[tokio::test]
     async fn namespace_changes_reports_register_and_drop() {
         let mut locals = Locals::new();
         let mut changes = locals.subscribe_namespace_changes();
@@ -589,5 +666,104 @@ mod tests {
                 added: true,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn list_tracks_matching_filters_by_namespace_prefix_and_scope() {
+        let mut locals = Locals::new();
+        let (_writer_a, reader_a) = Track::new(ns("room/123"), "audio").produce();
+        let (_writer_b, reader_b) = Track::new(ns("room/123/camera"), "video").produce();
+        let (_writer_other_scope, reader_other_scope) =
+            Track::new(ns("room/123"), "other").produce();
+
+        let _a = locals
+            .register_track(Some("scope-a"), reader_a)
+            .await
+            .expect("track a should register");
+        let _b = locals
+            .register_track(Some("scope-a"), reader_b)
+            .await
+            .expect("track b should register");
+        let _other = locals
+            .register_track(Some("scope-b"), reader_other_scope)
+            .await
+            .expect("other scope should register");
+
+        let mut tracks = locals.list_tracks_matching(
+            Some("scope-a"),
+            &TrackNamespacePrefix::from_utf8_path("room/123"),
+        );
+        tracks.sort_by_key(|track| format!("{}/{}", track.namespace, track.name));
+
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].namespace, ns("room/123"));
+        assert_eq!(tracks[0].name, TrackName::from("audio"));
+        assert_eq!(tracks[1].namespace, ns("room/123/camera"));
+        assert_eq!(tracks[1].name, TrackName::from("video"));
+    }
+
+    #[tokio::test]
+    async fn list_tracks_matching_keeps_unscoped_and_scoped_separate() {
+        let mut locals = Locals::new();
+        let (_global_writer, global_reader) = Track::new(ns("room/global"), "audio").produce();
+        let (_scoped_writer, scoped_reader) = Track::new(ns("room/scoped"), "video").produce();
+
+        let _global = locals
+            .register_track(None, global_reader)
+            .await
+            .expect("global track should register");
+        let _scoped = locals
+            .register_track(Some("scope-a"), scoped_reader)
+            .await
+            .expect("scoped track should register");
+
+        let global =
+            locals.list_tracks_matching(None, &TrackNamespacePrefix::from_utf8_path("room"));
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].namespace, ns("room/global"));
+        assert_eq!(global[0].name, TrackName::from("audio"));
+
+        let scoped = locals.list_tracks_matching(
+            Some("scope-a"),
+            &TrackNamespacePrefix::from_utf8_path("room"),
+        );
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].namespace, ns("room/scoped"));
+        assert_eq!(scoped[0].name, TrackName::from("video"));
+    }
+
+    #[tokio::test]
+    async fn track_changes_reports_register_and_drop() {
+        let mut locals = Locals::new();
+        let mut changes = locals.subscribe_track_changes();
+        let namespace = ns("room/123");
+        let (_writer, reader) = Track::new(namespace.clone(), "audio").produce();
+
+        let registration = locals
+            .register_track(Some("scope-a"), reader)
+            .await
+            .expect("track should register");
+
+        let added = changes.recv().await.expect("added event");
+        match added {
+            TrackChange::Added { scope, track } => {
+                assert_eq!(scope, Some("scope-a".to_string()));
+                assert_eq!(track.namespace, namespace);
+                assert_eq!(track.name, TrackName::from("audio"));
+            }
+            TrackChange::Removed { .. } => panic!("expected added event"),
+        }
+
+        drop(registration);
+
+        let removed = changes.recv().await.expect("removed event");
+        match removed {
+            TrackChange::Removed { scope, full_name } => {
+                assert_eq!(scope, Some("scope-a".to_string()));
+                assert_eq!(full_name.namespace, ns("room/123"));
+                assert_eq!(full_name.name, TrackName::from("audio"));
+            }
+            TrackChange::Added { .. } => panic!("expected removed event"),
+        }
     }
 }
