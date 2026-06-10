@@ -87,6 +87,8 @@ pub enum TestCase {
     SubscribeNamespaceExisting,
     /// T0.8: SUBSCRIBE_NAMESPACE Both receives NAMESPACE and PUBLISH
     SubscribeNamespaceBoth,
+    /// T0.9: SUBSCRIBE_NAMESPACE receives future NAMESPACE and NAMESPACE_DONE
+    SubscribeNamespaceUpdates,
 }
 
 impl TestCase {
@@ -102,6 +104,7 @@ impl TestCase {
             TestCase::PublishTrackSubscribe,
             TestCase::SubscribeNamespaceExisting,
             TestCase::SubscribeNamespaceBoth,
+            TestCase::SubscribeNamespaceUpdates,
         ]
     }
 
@@ -117,6 +120,7 @@ impl TestCase {
             TestCase::PublishTrackSubscribe => "publish-track-subscribe",
             TestCase::SubscribeNamespaceExisting => "subscribe-namespace-existing",
             TestCase::SubscribeNamespaceBoth => "subscribe-namespace-both",
+            TestCase::SubscribeNamespaceUpdates => "subscribe-namespace-updates",
         }
     }
 }
@@ -174,6 +178,9 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
             scenarios::test_subscribe_namespace_existing(args).await
         }
         TestCase::SubscribeNamespaceBoth => scenarios::test_subscribe_namespace_both(args).await,
+        TestCase::SubscribeNamespaceUpdates => {
+            scenarios::test_subscribe_namespace_updates(args).await
+        }
     };
 
     let duration = start.elapsed();

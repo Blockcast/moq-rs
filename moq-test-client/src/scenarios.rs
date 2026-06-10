@@ -687,6 +687,111 @@ pub async fn test_subscribe_namespace_both(args: &Args) -> Result<TestConnection
     .context("test timed out")?
 }
 
+/// T0.9: Subscribe Namespace Updates
+///
+/// Subscriber sends SUBSCRIBE_NAMESPACE before a publisher exists. It receives
+/// NAMESPACE when the publisher appears and NAMESPACE_DONE when the publisher
+/// drops PUBLISH_NAMESPACE.
+pub async fn test_subscribe_namespace_updates(args: &Args) -> Result<TestConnectionIds> {
+    timeout(TEST_TIMEOUT, async {
+        let mut cids = TestConnectionIds::default();
+
+        let (sub_session, sub_cid, sub_transport) = connect(args)
+            .await
+            .context("subscriber failed to connect")?;
+        cids.add(sub_cid);
+        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
+            .await
+            .context("subscriber SETUP failed")?;
+
+        let sub_session_task =
+            tokio::spawn(
+                async move { sub_session.run().await.context("subscriber session error") },
+            );
+
+        let subscribed_namespace = subscriber
+            .subscribe_namespace(
+                TrackNamespacePrefix::from_utf8_path("moq-test"),
+                SubscribeOptions::Namespace,
+                KeyValuePairs::default(),
+            )
+            .await
+            .context("failed to send SUBSCRIBE_NAMESPACE")?;
+
+        subscribed_namespace
+            .ok()
+            .await
+            .context("SUBSCRIBE_NAMESPACE rejected")?;
+
+        let (pub_session, pub_cid, pub_transport) =
+            connect(args).await.context("publisher failed to connect")?;
+        cids.add(pub_cid);
+        let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
+            .await
+            .context("publisher SETUP failed")?;
+
+        let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
+        let (_, _, pub_reader) = Tracks::new(namespace.clone()).produce();
+
+        let pub_session_task =
+            tokio::spawn(async move { pub_session.run().await.context("publisher session error") });
+        let publish_task = tokio::spawn(async move {
+            publisher
+                .publish_namespace(pub_reader)
+                .await
+                .context("publisher PUBLISH_NAMESPACE failed")
+        });
+
+        let event = timeout(Duration::from_secs(3), subscribed_namespace.next())
+            .await
+            .context("timed out waiting for future NAMESPACE")?
+            .context("SUBSCRIBE_NAMESPACE closed while waiting for NAMESPACE")?
+            .ok_or_else(|| anyhow::anyhow!("SUBSCRIBE_NAMESPACE ended without NAMESPACE"))?;
+
+        match event {
+            NamespaceEvent::Added(added) if added == namespace => {}
+            NamespaceEvent::Added(added) => anyhow::bail!(
+                "received wrong future namespace: got {}, expected {}",
+                added,
+                namespace
+            ),
+            NamespaceEvent::Removed(removed) => {
+                anyhow::bail!("received NAMESPACE_DONE before NAMESPACE: {}", removed)
+            }
+        }
+
+        publish_task.abort();
+
+        let event = timeout(Duration::from_secs(3), subscribed_namespace.next())
+            .await
+            .context("timed out waiting for NAMESPACE_DONE")?
+            .context("SUBSCRIBE_NAMESPACE closed while waiting for NAMESPACE_DONE")?
+            .ok_or_else(|| anyhow::anyhow!("SUBSCRIBE_NAMESPACE ended without NAMESPACE_DONE"))?;
+
+        match event {
+            NamespaceEvent::Removed(removed) if removed == namespace => {}
+            NamespaceEvent::Removed(removed) => anyhow::bail!(
+                "received wrong removed namespace: got {}, expected {}",
+                removed,
+                namespace
+            ),
+            NamespaceEvent::Added(added) => {
+                anyhow::bail!(
+                    "received duplicate NAMESPACE before NAMESPACE_DONE: {}",
+                    added
+                )
+            }
+        }
+
+        pub_session_task.abort();
+        sub_session_task.abort();
+
+        Ok(cids)
+    })
+    .await
+    .context("test timed out")?
+}
+
 /// T0.5: Subscribe Before Publish Namespace
 ///
 /// Subscriber subscribes first (will be pending), then publisher sends PUBLISH_NAMESPACE.
