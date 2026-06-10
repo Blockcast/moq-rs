@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use moq_relay_ietf::{
-    Coordinator, CoordinatorError, CoordinatorResult, NamespaceOrigin, NamespaceRegistration,
-    TrackRegistration,
+    Coordinator, CoordinatorError, CoordinatorResult, NamespaceInfo, NamespaceOrigin,
+    NamespaceRegistration, NamespaceSubscription, TrackRegistration,
 };
 
 /// Data stored in the shared file
@@ -163,6 +163,13 @@ fn write_data(file: &File, data: &CoordinatorData) -> Result<()> {
     file.flush()?;
 
     Ok(())
+}
+
+fn namespace_key_has_prefix(namespace_key: &str, prefix_key: &str) -> bool {
+    namespace_key
+        .split('/')
+        .zip(prefix_key.split('/'))
+        .all(|(namespace_part, prefix_part)| namespace_part == prefix_part)
 }
 
 /// A coordinator that uses a shared file for state storage.
@@ -328,6 +335,46 @@ impl Coordinator for FileCoordinator {
         .await??;
 
         result.ok_or(CoordinatorError::NamespaceNotFound)
+    }
+
+    async fn subscribe_namespace(
+        &self,
+        scope: Option<&str>,
+        prefix: &TrackNamespace,
+    ) -> CoordinatorResult<NamespaceSubscription> {
+        let scope_key = CoordinatorData::scope_key(scope);
+        let prefix_key = CoordinatorData::namespace_key(prefix);
+        let file_path = self.file_path.clone();
+
+        let existing = tokio::task::spawn_blocking(move || -> Result<Vec<NamespaceInfo>> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&file_path)?;
+
+            file.lock_shared()?;
+
+            let data = read_data(&file)?;
+            let existing = data
+                .namespaces
+                .get(&scope_key)
+                .into_iter()
+                .flat_map(|bucket| bucket.keys())
+                .filter(|namespace_key| namespace_key_has_prefix(namespace_key, &prefix_key))
+                .map(|namespace_key| {
+                    TrackNamespace::try_from(namespace_key.as_str()).map(NamespaceInfo::new)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            file.unlock()?;
+
+            Ok(existing)
+        })
+        .await??;
+
+        Ok(NamespaceSubscription::new(existing, ()))
     }
 
     async fn register_track(
@@ -571,6 +618,88 @@ mod tests {
         assert_eq!(origin.namespace(), &namespace);
         assert_eq!(origin.url(), relay_url);
         assert!(client.is_none());
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn subscribe_namespace_returns_existing_matches() {
+        let file = temp_file_path("subscribe-namespace-existing");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url);
+
+        let _room = coordinator
+            .register_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room/123"))
+            .await
+            .expect("room should register");
+        let _camera = coordinator
+            .register_namespace(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123/camera"),
+            )
+            .await
+            .expect("camera should register");
+        let _other = coordinator
+            .register_namespace(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("other/123"),
+            )
+            .await
+            .expect("other should register");
+
+        let subscription = coordinator
+            .subscribe_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room/123"))
+            .await
+            .expect("namespace subscription should succeed");
+        let mut matches: Vec<_> = subscription
+            .existing_namespaces
+            .into_iter()
+            .map(|info| info.namespace.to_utf8_path())
+            .collect();
+        matches.sort();
+
+        assert_eq!(matches, vec!["/room/123", "/room/123/camera"]);
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn subscribe_namespace_keeps_scopes_isolated() {
+        let file = temp_file_path("subscribe-namespace-scopes");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url);
+
+        let _global = coordinator
+            .register_namespace(None, &TrackNamespace::from_utf8_path("room/global"))
+            .await
+            .expect("global should register");
+        let _scoped = coordinator
+            .register_namespace(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/scoped"),
+            )
+            .await
+            .expect("scoped should register");
+
+        let global = coordinator
+            .subscribe_namespace(None, &TrackNamespace::from_utf8_path("room"))
+            .await
+            .expect("global namespace subscription should succeed");
+        assert_eq!(global.existing_namespaces.len(), 1);
+        assert_eq!(
+            global.existing_namespaces[0].namespace,
+            TrackNamespace::from_utf8_path("room/global")
+        );
+
+        let scoped = coordinator
+            .subscribe_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room"))
+            .await
+            .expect("scoped namespace subscription should succeed");
+        assert_eq!(scoped.existing_namespaces.len(), 1);
+        assert_eq!(
+            scoped.existing_namespaces[0].namespace,
+            TrackNamespace::from_utf8_path("room/scoped")
+        );
 
         let _ = std::fs::remove_file(file);
     }
