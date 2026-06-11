@@ -262,7 +262,9 @@ mod tests {
             ]
         }"#;
         let root: Root = serde_json::from_str(json).unwrap();
-        let err = root.validate().expect_err("FecRepair in catalog.tracks must fail");
+        let err = root
+            .validate()
+            .expect_err("FecRepair in catalog.tracks must fail");
         assert!(
             matches!(&err, CatalogValidationError::FecRepairInCatalog { track_name } if track_name == "v/repair"),
             "expected FecRepairInCatalog(v/repair), got: {err:?}"
@@ -331,7 +333,10 @@ mod tests {
         let root: Root = serde_json::from_str(json).unwrap();
         let err = root.validate().expect_err("duplicate packet_id must fail");
         assert!(
-            matches!(err, CatalogValidationError::DuplicatePacketId { packet_id: 1, .. }),
+            matches!(
+                err,
+                CatalogValidationError::DuplicatePacketId { packet_id: 1, .. }
+            ),
             "expected DuplicatePacketId, got: {err:?}"
         );
     }

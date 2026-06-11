@@ -124,31 +124,79 @@ fn main() -> anyhow::Result<()> {
         // test_complete_mfu_zero_copy
         vector_json(
             "complete_mfu_fi0",
-            &[Frag { mpu_seq: 1, fi: 0, counter: 0, data: b"complete", rap: true }],
+            &[Frag {
+                mpu_seq: 1,
+                fi: 0,
+                counter: 0,
+                data: b"complete",
+                rap: true,
+            }],
         ),
         // test_two_fragments_in_order
         vector_json(
             "two_fragments_in_order",
             &[
-                Frag { mpu_seq: 2, fi: 1, counter: 0, data: b"AAA", rap: true },
-                Frag { mpu_seq: 2, fi: 3, counter: 1, data: b"BBB", rap: false },
+                Frag {
+                    mpu_seq: 2,
+                    fi: 1,
+                    counter: 0,
+                    data: b"AAA",
+                    rap: true,
+                },
+                Frag {
+                    mpu_seq: 2,
+                    fi: 3,
+                    counter: 1,
+                    data: b"BBB",
+                    rap: false,
+                },
             ],
         ),
         // test_out_of_order_fragments (last arrives before first; sort by counter)
         vector_json(
             "out_of_order_fragments",
             &[
-                Frag { mpu_seq: 3, fi: 3, counter: 1, data: b"ZZZ", rap: false },
-                Frag { mpu_seq: 3, fi: 1, counter: 0, data: b"XXX", rap: true },
+                Frag {
+                    mpu_seq: 3,
+                    fi: 3,
+                    counter: 1,
+                    data: b"ZZZ",
+                    rap: false,
+                },
+                Frag {
+                    mpu_seq: 3,
+                    fi: 1,
+                    counter: 0,
+                    data: b"XXX",
+                    rap: true,
+                },
             ],
         ),
         // test_three_fragments
         vector_json(
             "three_fragments",
             &[
-                Frag { mpu_seq: 4, fi: 1, counter: 0, data: b"A", rap: true },
-                Frag { mpu_seq: 4, fi: 2, counter: 1, data: b"B", rap: false },
-                Frag { mpu_seq: 4, fi: 3, counter: 2, data: b"C", rap: false },
+                Frag {
+                    mpu_seq: 4,
+                    fi: 1,
+                    counter: 0,
+                    data: b"A",
+                    rap: true,
+                },
+                Frag {
+                    mpu_seq: 4,
+                    fi: 2,
+                    counter: 1,
+                    data: b"B",
+                    rap: false,
+                },
+                Frag {
+                    mpu_seq: 4,
+                    fi: 3,
+                    counter: 2,
+                    data: b"C",
+                    rap: false,
+                },
             ],
         ),
         // M.1b §B1 smoke wire: Init is a separate object (not shown); the 3 Mfu
@@ -157,9 +205,27 @@ fn main() -> anyhow::Result<()> {
         vector_json(
             "b1_smoke_video_mpu0_3frag",
             &[
-                Frag { mpu_seq: 0, fi: 1, counter: 0, data: b"track=1;mpu_seq=0;frag=0;fi=1", rap: true },
-                Frag { mpu_seq: 0, fi: 2, counter: 1, data: b"track=1;mpu_seq=0;frag=1;fi=2", rap: false },
-                Frag { mpu_seq: 0, fi: 3, counter: 2, data: b"track=1;mpu_seq=0;frag=2;fi=3", rap: false },
+                Frag {
+                    mpu_seq: 0,
+                    fi: 1,
+                    counter: 0,
+                    data: b"track=1;mpu_seq=0;frag=0;fi=1",
+                    rap: true,
+                },
+                Frag {
+                    mpu_seq: 0,
+                    fi: 2,
+                    counter: 1,
+                    data: b"track=1;mpu_seq=0;frag=1;fi=2",
+                    rap: false,
+                },
+                Frag {
+                    mpu_seq: 0,
+                    fi: 3,
+                    counter: 2,
+                    data: b"track=1;mpu_seq=0;frag=2;fi=3",
+                    rap: false,
+                },
             ],
         ),
     ];
@@ -178,7 +244,10 @@ fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1) {
         Some(path) => {
             std::fs::write(&path, format!("{serialised}\n"))?;
-            eprintln!("wrote {} vectors to {path}", doc["vectors"].as_array().unwrap().len());
+            eprintln!(
+                "wrote {} vectors to {path}",
+                doc["vectors"].as_array().unwrap().len()
+            );
         }
         None => println!("{serialised}"),
     }

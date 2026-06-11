@@ -30,12 +30,8 @@ pub async fn drain_track_to_writer<W: AsyncWrite + Unpin>(
     match mode {
         TrackReaderMode::Subgroups(mut groups) => {
             while let Some(mut group) = groups.next().await.context("subgroups.next")? {
-                while let Some(mut object) =
-                    group.next().await.context("subgroup object.next")?
-                {
-                    while let Some(chunk) =
-                        object.read().await.context("object.read chunk")?
-                    {
+                while let Some(mut object) = group.next().await.context("subgroup object.next")? {
+                    while let Some(chunk) = object.read().await.context("object.read chunk")? {
                         out.write_all(&chunk).await.context("out.write_all chunk")?;
                         bytes_written += chunk.len() as u64;
                     }
@@ -44,7 +40,10 @@ pub async fn drain_track_to_writer<W: AsyncWrite + Unpin>(
         }
         // moq-pub-mmtp only emits subgroup-mode tracks for M.1; the
         // other reader modes (Stream, Datagrams) are out of scope.
-        _ => bail!("track `{}` is not in subgroup mode (moq-pub-mmtp emits subgroup mode only)", track.name),
+        _ => bail!(
+            "track `{}` is not in subgroup mode (moq-pub-mmtp emits subgroup mode only)",
+            track.name
+        ),
     }
     out.flush().await.context("flush output")?;
     Ok(bytes_written)
@@ -139,9 +138,15 @@ mod tests {
                 priority: 0,
             })
             .expect("create subgroup");
-        subgroup.write(Bytes::from_static(b"alpha")).expect("write 1");
-        subgroup.write(Bytes::from_static(b"beta")).expect("write 2");
-        subgroup.write(Bytes::from_static(b"gamma")).expect("write 3");
+        subgroup
+            .write(Bytes::from_static(b"alpha"))
+            .expect("write 1");
+        subgroup
+            .write(Bytes::from_static(b"beta"))
+            .expect("write 2");
+        subgroup
+            .write(Bytes::from_static(b"gamma"))
+            .expect("write 3");
         drop(subgroup);
         drop(subgroups);
 

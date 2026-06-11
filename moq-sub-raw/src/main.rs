@@ -29,8 +29,7 @@ async fn main() -> Result<()> {
     let quic_endpoint = quic::Endpoint::new(quic::Config::new(args.bind, None, tls.clone())?)?;
 
     tracing::info!(url = %args.url, "connecting to relay");
-    let (session, connection_id, transport) =
-        quic_endpoint.client.connect(&args.url, None).await?;
+    let (session, connection_id, transport) = quic_endpoint.client.connect(&args.url, None).await?;
     tracing::info!(%connection_id, "connected to relay");
 
     let (session, subscriber) = Subscriber::connect(session, transport)
@@ -41,8 +40,7 @@ async fn main() -> Result<()> {
     // namespace lives in the URL-path-derived tenant scope on the
     // relay, not as a connect-URL path. Stay on the root path.
     let namespace = TrackNamespace::from_utf8_path(&args.name);
-    let (mut tracks_writer, _request, mut tracks_reader) =
-        Tracks::new(namespace.clone()).produce();
+    let (mut tracks_writer, _request, mut tracks_reader) = Tracks::new(namespace.clone()).produce();
 
     // For each (track, output) pair: create the producer-side
     // TrackWriter, hand it to a clone of the subscriber to wire up
