@@ -410,6 +410,17 @@ impl MmtpHeaderExt {
         self.base.size()
     }
 
+    /// Whether this packet carries a Source FEC Payload ID trailer.
+    ///
+    /// Derived solely from the header `fec_type`, this is the single source of
+    /// truth for trailer presence used by both the serialize path
+    /// ([`Self::write_source_fec_payload_id_trailer`]) and the parse path
+    /// ([`Self::split_payload_and_source_fec_trailer`]), so the two cannot
+    /// disagree about whether a trailer exists.
+    pub fn has_source_fec_trailer(&self) -> bool {
+        self.base.fec_type == FecType::WithSourcePayloadId as u8
+    }
+
     /// Write the MMTP header to buffer.
     ///
     /// This does not write the Source FEC Payload ID. Call
@@ -421,6 +432,11 @@ impl MmtpHeaderExt {
 
     /// Write the Source FEC Payload ID trailer after the packet payload.
     pub fn write_source_fec_payload_id_trailer<B: BufMut>(&self, buf: &mut B) -> Result<usize> {
+        debug_assert_eq!(
+            self.has_source_fec_trailer(),
+            self.source_fec_payload_id.is_some(),
+            "fec_type and source_fec_payload_id disagree on trailer presence"
+        );
         if let Some(ref fec_id) = self.source_fec_payload_id {
             fec_id.write_to(buf)
         } else {
@@ -428,7 +444,13 @@ impl MmtpHeaderExt {
         }
     }
 
-    /// Read from buffer
+    /// Read the base MMTP header from the buffer.
+    ///
+    /// Does **not** populate `source_fec_payload_id`: when `fec_type = 1` the
+    /// SS_ID is a payload *trailer*, not a header prefix, and cannot be parsed
+    /// without the full payload span. The field is therefore always `None` after
+    /// a read — recover the SS_ID from the payload via
+    /// [`Self::split_payload_and_source_fec_trailer`].
     pub fn read_from<B: Buf>(buf: &mut B) -> Result<Self> {
         let base = MmtpHeader::read_from(buf)?;
 
@@ -446,7 +468,7 @@ impl MmtpHeaderExt {
         &self,
         bytes: &'a [u8],
     ) -> Result<(&'a [u8], Option<SourceFecPayloadId>)> {
-        if self.base.fec_type == FecType::WithSourcePayloadId as u8 {
+        if self.has_source_fec_trailer() {
             let (payload, fec_id) = SourceFecPayloadId::split_payload_and_trailer(bytes)?;
             Ok((payload, Some(fec_id)))
         } else {
