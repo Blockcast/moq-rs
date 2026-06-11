@@ -31,7 +31,9 @@ pub async fn open_udp_socket(target: SocketAddr) -> Result<UdpSocket> {
     if is_multicast(target) {
         let wildcard = match target.ip() {
             IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), target.port()),
-            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), target.port()),
+            IpAddr::V6(_) => {
+                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), target.port())
+            }
         };
         let socket = UdpSocket::bind(wildcard)
             .await

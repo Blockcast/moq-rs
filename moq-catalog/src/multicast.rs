@@ -129,7 +129,10 @@ pub struct MulticastConfig {
     /// silent unbounded default). Applies to source and `<name>/repair` tracks
     /// alike. Local deployment-policy extension; not in
     /// draft-ramadan-moq-multicast.
-    #[serde(rename = "subgroupHistoryGroups", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "subgroupHistoryGroups",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub subgroup_history_groups: Option<u64>,
 }
 

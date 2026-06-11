@@ -82,10 +82,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     for mpu_seq in 0..args.groups {
-        for (packet_id, expected_sink) in [
-            (1u16, &mut expected_video),
-            (2u16, &mut expected_audio),
-        ] {
+        for (packet_id, expected_sink) in [(1u16, &mut expected_video), (2u16, &mut expected_audio)]
+        {
             let packet = build_init_packet(packet_id, mpu_seq);
             match &udp_sink {
                 Some((sock, target)) => {

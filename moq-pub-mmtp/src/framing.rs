@@ -91,10 +91,7 @@ mod tests {
         // 3 bytes — incomplete prefix.
         let mut r = cursor(&[0x00, 0x00, 0x05]);
         let err = read_one_frame(&mut r).await.unwrap_err();
-        assert!(
-            err.to_string().contains("length prefix"),
-            "err = {err:?}"
-        );
+        assert!(err.to_string().contains("length prefix"), "err = {err:?}");
     }
 
     #[tokio::test]
