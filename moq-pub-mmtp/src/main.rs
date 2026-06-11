@@ -78,8 +78,7 @@ async fn main() -> Result<()> {
     let quic_endpoint = quic::Endpoint::new(quic::Config::new(args.bind, None, tls.clone())?)?;
 
     tracing::info!(url = %args.url, "connecting to relay");
-    let (session, connection_id, transport) =
-        quic_endpoint.client.connect(&args.url, None).await?;
+    let (session, connection_id, transport) = quic_endpoint.client.connect(&args.url, None).await?;
     tracing::info!(%connection_id, "connected to relay");
 
     let (session, mut publisher) = Publisher::connect(session, transport)
@@ -111,10 +110,9 @@ fn build_state_map(
     tracks_writer: &mut TracksWriter,
     catalog: &Root,
 ) -> Result<HashMap<u16, TrackState<SubgroupsWriter>>> {
-    let multicast = catalog
-        .multicast
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("catalog has no `multicast` extension — required for moq-pub-mmtp"))?;
+    let multicast = catalog.multicast.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("catalog has no `multicast` extension — required for moq-pub-mmtp")
+    })?;
     let endpoints = multicast
         .endpoints
         .as_ref()
@@ -164,7 +162,7 @@ fn build_state_map(
             if history_window < 1 {
                 bail!("multicast.subgroupHistoryGroups must be >= 1 (got {history_window})");
             }
-            subgroups.set_history_window(history_window);
+            subgroups.set_history_window(history_window)?;
 
             // Auto-create the AL-FEC repair sibling. The track name
             // convention `<source>/repair` is publisher-internal per
@@ -179,7 +177,7 @@ fn build_state_map(
             let mut repair_subgroups = repair_writer
                 .subgroups()
                 .with_context(|| format!("track `{repair_name}`: subgroups() failed"))?;
-            repair_subgroups.set_history_window(history_window);
+            repair_subgroups.set_history_window(history_window)?;
 
             map.insert(
                 track_ref.packet_id,
@@ -229,9 +227,9 @@ fn publish_catalog_track(
 ) -> Result<Vec<SubgroupsWriter>> {
     let mut writers = Vec::with_capacity(CATALOG_TRACK_NAMES.len());
     for name in CATALOG_TRACK_NAMES {
-        let track = tracks_writer.create(name).ok_or_else(|| {
-            anyhow::anyhow!("TracksWriter::create returned None for `{name}`")
-        })?;
+        let track = tracks_writer
+            .create(name)
+            .ok_or_else(|| anyhow::anyhow!("TracksWriter::create returned None for `{name}`"))?;
         let mut subgroups = track
             .subgroups()
             .with_context(|| format!("`{name}` track: subgroups() failed"))?;
@@ -336,26 +334,17 @@ async fn recv_one_udp_packet(
     state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>>,
     buf: &mut [u8],
 ) -> Result<()> {
-    let (n, _addr) = socket
-        .recv_from(buf)
-        .await
-        .context("UDP recv_from error")?;
+    let (n, _addr) = socket.recv_from(buf).await.context("UDP recv_from error")?;
     if n == 0 {
         return Ok(());
     }
     let packet = &buf[..n];
     let routing = route(packet).context("MMTP header parse error (UDP)")?;
-    dispatch(
-        state_map,
-        &routing,
-        Bytes::copy_from_slice(packet),
-    )?;
+    dispatch(state_map, &routing, Bytes::copy_from_slice(packet))?;
     Ok(())
 }
 
-async fn run_stdin_loop(
-    state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>>,
-) -> Result<()> {
+async fn run_stdin_loop(state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>>) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut packet_count: u64 = 0;
     loop {
@@ -396,10 +385,7 @@ mod tests {
         }
     }
 
-    fn catalog_with(
-        tracks: Vec<Track>,
-        multicast: Option<MulticastConfig>,
-    ) -> Root {
+    fn catalog_with(tracks: Vec<Track>, multicast: Option<MulticastConfig>) -> Root {
         Root {
             version: 1,
             streaming_format: 1,
@@ -467,7 +453,10 @@ mod tests {
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
         let err = expect_err(build_state_map(&mut tw, &cat));
-        assert!(err.to_string().contains("endpoints is missing"), "got: {err}");
+        assert!(
+            err.to_string().contains("endpoints is missing"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -39,6 +39,10 @@ pub struct PacketRouting {
     /// timestamp survives first-fragment loss. See the M.4 T1.7 findings /
     /// .planning/m4-b-mig-transport-subgroups-design.md.
     pub timestamp: u32,
+    /// MPU aggregation flag (multiple data units packed in one payload). Present
+    /// (as `false`) for non-Mpu packets. The publisher refuses aggregated MPUs:
+    /// Mapping B is one MFU per packet, and the muxer does not emit aggregation.
+    pub aggregation: bool,
 }
 
 /// Parse routing info from a raw MMTP packet. Does not copy the packet.
@@ -57,14 +61,18 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
     let mut cursor: &[u8] = packet;
     let hdr = MmtpHeader::read_from(&mut cursor)
         .map_err(|e| anyhow!("MMTP header decode failed: {e:?}"))?;
-    let (mpu_sequence, fragment_type) = if hdr.packet_type == PacketType::Mpu {
+    let (mpu_sequence, fragment_type, aggregation) = if hdr.packet_type == PacketType::Mpu {
         let mut payload: &[u8] = &packet[MMTP_HEADER_SIZE..];
         let (mpu, _payload_len) = MpuHeader::read_from(&mut payload)
             .map_err(|e| anyhow!("MPU header decode failed: {e:?}"))
             .context("MMTP packet_type=Mpu but MPU header decode failed")?;
-        (Some(mpu.mpu_sequence), Some(mpu.fragment_type))
+        (
+            Some(mpu.mpu_sequence),
+            Some(mpu.fragment_type),
+            mpu.aggregation,
+        )
     } else {
-        (None, None)
+        (None, None, false)
     };
     Ok(PacketRouting {
         packet_id: hdr.packet_id,
@@ -74,6 +82,7 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
         mpu_sequence,
         fragment_type,
         timestamp: hdr.timestamp,
+        aggregation,
     })
 }
 
@@ -159,6 +168,27 @@ mod tests {
         assert_eq!(r.fec_type, 1);
         assert_eq!(r.mpu_sequence, Some(11));
         assert_eq!(r.fragment_type, Some(FragmentType::Mfu));
+    }
+
+    #[test]
+    fn surfaces_mpu_aggregation_flag() {
+        // route() must surface the MPU aggregation bit so the publisher can refuse
+        // aggregated packets (Mapping B is one MFU per packet). Default = false.
+        let plain = synth_mmtp_packet(7, PacketType::Mpu, false, 0, Some(1));
+        assert!(!route(&plain).unwrap().aggregation, "non-aggregated MPU");
+
+        let mut hdr = MmtpHeader::new(7, PacketType::Mpu);
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+        let mut mpu = MpuHeader::new(FragmentType::Mfu, 2);
+        mpu.payload_length = 0;
+        mpu.aggregation = true;
+        mpu.write_to(&mut buf).unwrap();
+        buf.put_slice(&[0xAA]);
+        assert!(
+            route(&buf.to_vec()).unwrap().aggregation,
+            "aggregation bit must be surfaced from the MPU header"
+        );
     }
 
     #[test]

@@ -83,6 +83,11 @@ pub struct TrackState<T: TrackSubgroups> {
     /// every packet — unlike the MFU DU header (`sample_number`), which is
     /// written only on the first fragment. Keying off the timestamp therefore
     /// survives first-fragment loss. Reset on group advance.
+    ///
+    /// The key is the 32-bit MMTP timestamp (NTP short format). Two distinct MFUs
+    /// would only collide if their timestamps were equal, which cannot happen
+    /// within a single MPU group: one MPU spans a narrow timestamp range far short
+    /// of the 2^32 wrap, and the map is cleared on every group advance.
     mfu_groups: HashMap<u32, T::Group>,
     /// Next MFU subgroup_id to assign within the current group. Starts at 1
     /// (subgroup 0 is reserved for Init) and increments as new MFU timestamps
@@ -170,6 +175,20 @@ pub fn dispatch<T: TrackSubgroups>(
                     routing.packet_id
                 )
             })?;
+
+            // Refuse aggregated MPU packets (multiple data units in one payload).
+            // The moq_mmt muxer does not emit aggregation under Mapping B (one MFU
+            // per packet), and dispatch keys a whole packet to a single subgroup by
+            // its timestamp — an aggregate would silently mis-route its inner DUs.
+            // Mirror the FT=Fragment refusal: error rather than guess.
+            if routing.aggregation {
+                bail!(
+                    "packet_id {} carries an aggregated MPU (multiple data units in one \
+                     payload), which the moq_mmt muxer does not emit under Mapping B; \
+                     refusing to guess subgroup boundaries",
+                    routing.packet_id
+                );
+            }
 
             // Group boundaries come from the MPU sequence (A2 monotonicity),
             // not from FragmentType::Init. Init may be lost on the multicast leg
@@ -365,6 +384,7 @@ mod tests {
             mpu_sequence: Some(mpu_seq),
             fragment_type: Some(frag),
             timestamp,
+            aggregation: false,
         }
     }
 
@@ -379,6 +399,7 @@ mod tests {
             mpu_sequence: None,
             fragment_type: None,
             timestamp: 0,
+            aggregation: false,
         }
     }
 
@@ -703,6 +724,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mfu_survives_first_fragment_loss() {
+        // The load-bearing reason MFU subgroups are keyed off the per-sample MMTP
+        // timestamp (present on every fragment) rather than the MFU DU header's
+        // `sample_number` (written only on the first fragment): if fragment 1 is
+        // lost on the multicast leg, the surviving fragments 2..N — which carry
+        // only the timestamp — must still coalesce into ONE MFU subgroup, not
+        // spawn a spurious second one. No Init and no first fragment arrive here.
+        let mut map = make_state_map(1, 5);
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
+            Bytes::from_static(b"f2"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
+            Bytes::from_static(b"f3"),
+        )
+        .unwrap();
+        let state = map.get(&1).unwrap();
+        assert_eq!(
+            state.sink.groups_created,
+            vec![(10, 1, 5)],
+            "surviving fragments of one MFU share a single subgroup despite \
+             first-fragment loss (timestamp keying, not sample_number)"
+        );
+        assert_eq!(
+            state.mfu_groups[&0xABCD].writes,
+            vec![Bytes::from_static(b"f2"), Bytes::from_static(b"f3")]
+        );
+    }
+
+    #[test]
+    fn aggregated_mpu_hard_errors() {
+        // Aggregated MPU packets (multiple data units in one payload) are refused:
+        // dispatch keys a whole packet to one timestamp subgroup, so an aggregate
+        // would silently mis-route its inner DUs. Mirror the FT=Fragment refusal.
+        let mut map = make_state_map(1, 5);
+        let mut routing = mpu_ts(1, 1, FragmentType::Mfu, 0x100);
+        routing.aggregation = true;
+        let err = dispatch(&mut map, &routing, Bytes::from_static(b"agg")).unwrap_err();
+        assert!(
+            err.to_string().contains("aggregat"),
+            "expected aggregated-MPU refusal, got: {err}"
+        );
+    }
+
     fn hex_to_bytes(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -758,7 +828,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/assets/moq_mmt_capture.json"
         );
-        let (_doc, packets) = load_capture(path);
+        let (doc, packets) = load_capture(path);
         assert!(
             packets.len() >= 100,
             "expected the real capture (~120 packets), got {}",
@@ -775,6 +845,17 @@ mod tests {
         }
 
         let state = map.get(&1).expect("packet_id 1 present");
+
+        // Frozen oracle: the exact (group, subgroup, priority) sequence this real
+        // capture must produce. Unlike the self-derived structural checks below,
+        // this is a true regression gate — a muxer framing shift (different MFU or
+        // group boundaries) changes these tuples and fails the test rather than
+        // re-deriving a new "expected" from the shifted bytes.
+        assert_eq!(
+            state.sink.groups_created,
+            expected_groups(&doc, "source_groups_created"),
+            "FEC-off capture must produce the frozen group/subgroup structure"
+        );
 
         // Group every create_group call by group_id. Per group, subgroup 0 (Init)
         // appears at most once; the MFU subgroups are contiguous 1..=M.
