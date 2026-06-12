@@ -14,6 +14,14 @@ bytes = "1"
 thiserror = "1"
 log = "0.4"
 
+[features]
+default = ["reassembler"]
+# `reassembler` (MfuReassembler) uses std::time::Instant + std::thread for its
+# timeout bookkeeping, which panic on wasm32-unknown-unknown. Gate it so wasm
+# consumers (mmt-wasm) can opt out via `default-features = false`. Default-on
+# keeps every existing consumer (mmt-fec, mmt-container, mmt-ffi, pim) unchanged.
+reassembler = []
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"

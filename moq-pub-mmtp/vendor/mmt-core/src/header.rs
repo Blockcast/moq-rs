@@ -432,15 +432,10 @@ impl MmtpHeaderExt {
 
     /// Write the Source FEC Payload ID trailer after the packet payload.
     pub fn write_source_fec_payload_id_trailer<B: BufMut>(&self, buf: &mut B) -> Result<usize> {
-        debug_assert_eq!(
-            self.has_source_fec_trailer(),
-            self.source_fec_payload_id.is_some(),
-            "fec_type and source_fec_payload_id disagree on trailer presence"
-        );
-        if let Some(ref fec_id) = self.source_fec_payload_id {
-            fec_id.write_to(buf)
-        } else {
-            Ok(0)
+        match (self.has_source_fec_trailer(), &self.source_fec_payload_id) {
+            (true, Some(fec_id)) => fec_id.write_to(buf),
+            (false, None) => Ok(0),
+            (true, None) | (false, Some(_)) => Err(MmtError::InvalidFecPayloadId),
         }
     }
 
@@ -881,6 +876,23 @@ mod tests {
             payload_with_trailer.len() - SourceFecPayloadId::SIZE
         );
         assert_eq!(parsed_fec_id.unwrap().ss_id, 0x01020304);
+    }
+
+    #[test]
+    fn test_source_fec_trailer_write_rejects_mismatched_fec_state() {
+        let mut header =
+            MmtpHeaderExt::with_fec(0x1234, PacketType::Mpu, SourceFecPayloadId::new(0x01020304));
+        header.source_fec_payload_id = None;
+
+        let mut buf = vec![0u8; 4];
+        let result = header.write_source_fec_payload_id_trailer(&mut buf.as_mut_slice());
+        assert!(matches!(result, Err(MmtError::InvalidFecPayloadId)));
+
+        header.base.fec_type = FecType::None as u8;
+        header.source_fec_payload_id = Some(SourceFecPayloadId::new(0x01020304));
+
+        let result = header.write_source_fec_payload_id_trailer(&mut buf.as_mut_slice());
+        assert!(matches!(result, Err(MmtError::InvalidFecPayloadId)));
     }
 
     #[test]
