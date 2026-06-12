@@ -44,6 +44,7 @@ pub mod codec;
 pub mod error;
 pub mod header;
 pub mod packet;
+#[cfg(feature = "reassembler")]
 pub mod reassembler;
 
 // Re-export main types
@@ -56,4 +57,5 @@ pub use header::{
 pub use packet::{
     FragmentIterator, PacketBuilder, PacketFragmenter, PacketPool, DEFAULT_MTU, MAX_PACKET_SIZE,
 };
+#[cfg(feature = "reassembler")]
 pub use reassembler::{MfuFragment, MfuReassembler, ReassembledMfu, ReassemblerStats};
