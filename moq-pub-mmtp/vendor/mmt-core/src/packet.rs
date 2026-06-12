@@ -331,6 +331,12 @@ impl PacketFragmenter {
         if payload_len == 0 {
             return 1;
         }
+        // A zero max_payload (MTU ≤ header overhead) can't carry any payload —
+        // return 0 instead of dividing by zero. Mirrors fragment() yielding no
+        // fragments for the same degenerate config.
+        if self.max_payload_per_packet == 0 {
+            return 0;
+        }
         payload_len.div_ceil(self.max_payload_per_packet)
     }
 
@@ -358,7 +364,10 @@ impl<'a> Iterator for FragmentIterator<'a> {
     type Item = (usize, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.payload.len() {
+        // A zero max_size (MTU ≤ header overhead) would leave `offset` unable to
+        // advance — without this guard the iterator loops forever, growing any
+        // collector unbounded. Treat "no room for payload" as "no fragments".
+        if self.max_size == 0 || self.offset >= self.payload.len() {
             return None;
         }
 
@@ -416,6 +425,43 @@ impl PacketPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fragmenter_minimal_viable_mtu_boundary() {
+        // Lock the off-by-one around header_overhead: find the MTU where
+        // max_payload transitions 0 → 1 without hardcoding the overhead.
+        let overhead = (0..512)
+            .find(|&mtu| PacketFragmenter::new(mtu).max_payload() == 1)
+            .map(|mtu| mtu - 1)
+            .expect("a minimal viable MTU exists below 512");
+
+        assert_eq!(
+            PacketFragmenter::new(overhead).max_payload(),
+            0,
+            "mtu == overhead → max_payload 0"
+        );
+        let frag = PacketFragmenter::new(overhead + 1);
+        assert_eq!(frag.max_payload(), 1, "mtu == overhead+1 → max_payload 1");
+
+        // With max_payload == 1, a 3-byte payload yields exactly 3 one-byte
+        // fragments and packets_needed agrees.
+        let frags: Vec<_> = frag.fragment(&[1u8, 2, 3]).collect();
+        assert_eq!(frags.len(), 3);
+        assert!(frags.iter().all(|(_, s)| s.len() == 1));
+        assert_eq!(frag.packets_needed(3), 3);
+    }
+
+    #[test]
+    fn test_fragmenter_zero_max_payload_terminates() {
+        // MTU ≤ header overhead → max_payload == 0. Regression: fragment() must
+        // terminate (return no fragments) rather than loop forever on a
+        // non-advancing offset.
+        let frag = PacketFragmenter::new(4);
+        assert_eq!(frag.max_payload(), 0);
+        assert_eq!(frag.fragment(&[1u8, 2, 3, 4, 5]).count(), 0);
+        // packets_needed must not divide by zero on the same degenerate config.
+        assert_eq!(frag.packets_needed(5), 0);
+    }
 
     #[test]
     fn test_packet_builder_basic() {
