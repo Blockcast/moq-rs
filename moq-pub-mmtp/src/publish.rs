@@ -63,7 +63,7 @@ pub trait TrackSubgroups {
 pub struct TrackState<T: TrackSubgroups> {
     /// Catalog track name (informational, used for log context).
     pub name: String,
-    /// Object-level priority (typically derived from track container).
+    /// Object-level priority for source objects on this track.
     pub priority: u8,
     /// Subgroup factory wired to one moq-transport TrackWriter::subgroups().
     pub sink: T,
@@ -94,7 +94,7 @@ pub struct TrackState<T: TrackSubgroups> {
     /// are seen. Reset on group advance.
     next_mfu_subgroup_id: u64,
     /// Sibling `<name>/repair` track for AL-FEC repair packets. Per
-    /// draft-ramadan-moq-mmt §7.2 repair tracks run at priority 7 and
+    /// draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1 repair tracks run at priority 7 and
     /// inherit the source track's group_id so the receiver can
     /// correlate source/repair by MPU sequence. None means no FEC is
     /// configured for this packet_id (subscriber gets no recovery).
@@ -147,7 +147,7 @@ pub struct RepairSink<T: TrackSubgroups> {
 ///
 /// `payload` is the full MMTP packet (header + body) — exactly what
 /// the receiver will see when this lands as a MoQ object payload, per
-/// the raw-passthrough container mode (see .planning/moq-rs-m1-adr.md
+/// the raw MMTP passthrough mode (see .planning/moq-rs-m1-adr.md
 /// "MMTP framing — already done").
 pub fn dispatch<T: TrackSubgroups>(
     state_map: &mut HashMap<u16, TrackState<T>>,
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn repair_packet_routes_to_repair_sink_at_priority_7() {
         // Repair packets MUST land on the repair sibling sink (not the
-        // source sink), with priority 7 per draft-ramadan-moq-mmt §7.2.
+        // source sink), with priority 7 per draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1.
         let mut map = make_state_map_with_repair(1, 5, true);
         // Open source MPU 10 first.
         dispatch(

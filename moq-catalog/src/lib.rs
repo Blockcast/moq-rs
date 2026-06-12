@@ -52,11 +52,9 @@ pub struct Track {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packaging: Option<TrackPackaging>,
 
-    /// Container format per draft-ramadan-moq-mmt §11.1. Optional extension
-    /// to the IETF draft-01 catalog format; parsers that don't understand it
-    /// MUST ignore it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub container: Option<Container>,
+    /// MMTP packetization mode per draft-ramadan-moq-mmt §12.1.
+    #[serde(rename = "mmtpMode", skip_serializing_if = "Option::is_none")]
+    pub mmtp_mode: Option<MmtpMode>,
 
     #[serde(rename = "renderGroup", skip_serializing_if = "Option::is_none")]
     pub render_group: Option<u16>,
@@ -88,43 +86,51 @@ mod tests {
     }
 
     #[test]
-    fn container_serializes_spec_values() {
-        // Per draft-ramadan-moq-mmt §11.1: container values are
-        // "isobmff" | "mmtp" | "mfu" | "fec-repair".
+    fn track_packaging_serializes_mmtp_values() {
         for (v, expected) in [
-            (Container::Isobmff, "\"isobmff\""),
-            (Container::Mmtp, "\"mmtp\""),
-            (Container::Mfu, "\"mfu\""),
-            (Container::FecRepair, "\"fec-repair\""),
+            (TrackPackaging::Cmaf, "\"cmaf\""),
+            (TrackPackaging::Loc, "\"loc\""),
+            (TrackPackaging::Mmtp, "\"mmtp\""),
+            (TrackPackaging::FecRepair, "\"fec-repair\""),
         ] {
             let json = serde_json::to_string(&v).unwrap();
             assert_eq!(json, expected, "serialize {v:?}");
-            let back: Container = serde_json::from_str(&json).unwrap();
+            let back: TrackPackaging = serde_json::from_str(&json).unwrap();
             assert_eq!(back, v, "round-trip {v:?}");
         }
     }
 
     #[test]
-    fn track_accepts_container_field() {
-        let json = r#"{
-            "name": "video",
-            "container": "mmtp",
-            "selectionParams": {"codec": "avc1.64001f"}
-        }"#;
-        let track: Track = serde_json::from_str(json).unwrap();
-        assert_eq!(track.container, Some(Container::Mmtp));
+    fn mmtp_mode_serializes_spec_values() {
+        for (v, expected) in [(MmtpMode::Mpu, "\"mpu\""), (MmtpMode::Mfu, "\"mfu\"")] {
+            let json = serde_json::to_string(&v).unwrap();
+            assert_eq!(json, expected, "serialize {v:?}");
+            let back: MmtpMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v, "round-trip {v:?}");
+        }
     }
 
     #[test]
-    fn track_without_container_round_trips() {
-        // Containers field is optional — older catalogs that don't carry it
-        // must still parse, and serialization must not emit "container":null.
+    fn track_accepts_packaging_and_mmtp_mode_fields() {
+        let json = r#"{
+            "name": "video",
+            "packaging": "mmtp",
+            "mmtpMode": "mpu",
+            "selectionParams": {"codec": "avc1.64001f"}
+        }"#;
+        let track: Track = serde_json::from_str(json).unwrap();
+        assert_eq!(track.packaging, Some(TrackPackaging::Mmtp));
+        assert_eq!(track.mmtp_mode, Some(MmtpMode::Mpu));
+    }
+
+    #[test]
+    fn track_without_mmtp_mode_round_trips() {
         let t = Track {
             name: "v".into(),
             ..Default::default()
         };
         let json = serde_json::to_string(&t).unwrap();
-        assert!(!json.contains("container"), "json = {json}");
+        assert!(!json.contains("mmtpMode"), "json = {json}");
     }
 
     #[test]
@@ -178,6 +184,7 @@ mod tests {
             (TrackPackaging::Cmaf, "\"cmaf\""),
             (TrackPackaging::Loc, "\"loc\""),
             (TrackPackaging::Mmtp, "\"mmtp\""),
+            (TrackPackaging::FecRepair, "\"fec-repair\""),
         ] {
             let json = serde_json::to_string(&v).unwrap();
             assert_eq!(json, expected, "serialize {v:?}");
@@ -192,7 +199,6 @@ mod tests {
     // to library-level validation so subscribers can reject malformed
     // catalogs without re-implementing the same checks. Publisher keeps
     // its own runtime guards as defense in depth.
-
     #[test]
     fn expand_common_fields_inherits_when_track_field_is_none() {
         // commonTrackFields supplies namespace + packaging + renderGroup.
@@ -245,11 +251,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_fec_repair_in_catalog_tracks() {
-        // Per ADR T3: repair tracks are publisher-derived (auto-named
-        // `<source>/repair`) — they MUST NOT appear in catalog.tracks[].
-        // A catalog that pre-declares a Container::FecRepair entry is
-        // either misconfigured or relying on M.1b receiver semantics.
+    fn validate_accepts_fec_repair_in_catalog_tracks() {
+        // Per draft-ramadan-moq-fec §5.2: repair tracks are catalog-signaled
+        // for multicast. The publisher may still derive its own repair sibling.
         let json = r#"{
             "version": 1,
             "streamingFormat": 1,
@@ -257,18 +261,80 @@ mod tests {
             "supportsDeltaUpdates": true,
             "commonTrackFields": {},
             "tracks": [
-                {"name":"v","container":"mmtp","selectionParams":{}},
-                {"name":"v/repair","container":"fec-repair","selectionParams":{}}
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","selectionParams":{}},
+                {"name":"v/repair","packaging":"fec-repair","selectionParams":{}}
+            ]
+        }"#;
+        let root: Root = serde_json::from_str(json).unwrap();
+        root.validate()
+            .expect("FEC repair catalog tracks are valid");
+    }
+
+    #[test]
+    fn validate_rejects_mmtp_track_without_mmtp_mode() {
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","selectionParams":{}}
             ]
         }"#;
         let root: Root = serde_json::from_str(json).unwrap();
         let err = root
             .validate()
-            .expect_err("FecRepair in catalog.tracks must fail");
+            .expect_err("mmtpMode is required for mmtp tracks");
         assert!(
-            matches!(&err, CatalogValidationError::FecRepairInCatalog { track_name } if track_name == "v/repair"),
-            "expected FecRepairInCatalog(v/repair), got: {err:?}"
+            matches!(&err, CatalogValidationError::MissingMmtpMode { track_name } if track_name == "v"),
+            "expected MissingMmtpMode(v), got: {err:?}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_inherited_mmtp_packaging_without_mmtp_mode() {
+        // 0a02292: packaging may be INHERITED from commonTrackFields. A track
+        // with no per-track packaging is still effectively mmtp when common
+        // says so, and §12.1's REQUIRED mmtpMode must apply to it — validate()
+        // runs before expand_common_fields(), so it must consider the
+        // effective (track-or-common) packaging, not just the track field.
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"packaging": "mmtp"},
+            "tracks": [
+                {"name":"v","selectionParams":{}}
+            ]
+        }"#;
+        let root: Root = serde_json::from_str(json).unwrap();
+        let err = root
+            .validate()
+            .expect_err("inherited mmtp packaging still requires mmtpMode");
+        assert!(
+            matches!(&err, CatalogValidationError::MissingMmtpMode { track_name } if track_name == "v"),
+            "expected MissingMmtpMode(v), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_inherited_mmtp_packaging_with_track_mmtp_mode() {
+        // Counterpart: inherited mmtp packaging + per-track mmtpMode is valid.
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"packaging": "mmtp"},
+            "tracks": [
+                {"name":"v","mmtpMode":"mpu","selectionParams":{}}
+            ]
+        }"#;
+        let root: Root = serde_json::from_str(json).unwrap();
+        root.validate()
+            .expect("inherited mmtp packaging with mmtpMode is valid");
     }
 
     #[test]
@@ -361,12 +427,9 @@ pub enum CatalogValidationError {
     /// `tracks[]`. Receivers cannot resolve selectionParams for an
     /// unknown track.
     UnknownTrackReference { track_name: String },
-    /// A `tracks[]` entry carries `container: fec-repair`. Repair
-    /// tracks are publisher-derived (auto-named `<source>/repair`
-    /// per ADR T3) and must not appear in the catalog directly.
-    /// M.1b will revisit if catalog-declared FEC tracks become
-    /// useful for receiver-side semantics.
-    FecRepairInCatalog { track_name: String },
+    /// A `tracks[]` entry declares MMTP packaging without the required
+    /// `mmtpMode` signal.
+    MissingMmtpMode { track_name: String },
 }
 
 impl std::fmt::Display for CatalogValidationError {
@@ -385,10 +448,9 @@ impl std::fmt::Display for CatalogValidationError {
                 f,
                 "multicast endpoint references track `{track_name}` not present in catalog.tracks[]"
             ),
-            Self::FecRepairInCatalog { track_name } => write!(
+            Self::MissingMmtpMode { track_name } => write!(
                 f,
-                "catalog.tracks[] entry `{track_name}` has container=fec-repair; \
-                 repair tracks are publisher-derived in M.1 and must not appear in the catalog"
+                "catalog.tracks[] entry `{track_name}` has packaging=mmtp but no required mmtpMode"
             ),
         }
     }
@@ -404,11 +466,18 @@ impl Root {
     /// them. Publishers run this in addition to their own runtime
     /// guards (defense in depth); subscribers run it standalone.
     pub fn validate(&self) -> Result<(), CatalogValidationError> {
-        // T5e — FecRepair must not appear in catalog.tracks (repair
-        // tracks are publisher-derived).
+        // draft-ramadan-moq-mmt §12.1 requires mmtpMode for MMTP packaging.
+        // validate() runs before expand_common_fields(), so the effective
+        // packaging is the track's own field OR the commonTrackFields default
+        // (track-level wins) — a track inheriting `packaging: "mmtp"` from
+        // common still requires its own mmtpMode.
         for t in &self.tracks {
-            if matches!(t.container, Some(Container::FecRepair)) {
-                return Err(CatalogValidationError::FecRepairInCatalog {
+            let effective_packaging = t
+                .packaging
+                .as_ref()
+                .or(self.common_track_fields.packaging.as_ref());
+            if matches!(effective_packaging, Some(TrackPackaging::Mmtp)) && t.mmtp_mode.is_none() {
+                return Err(CatalogValidationError::MissingMmtpMode {
                     track_name: t.name.clone(),
                 });
             }
@@ -486,42 +555,30 @@ pub enum TrackPackaging {
     #[serde(rename = "loc")]
     Loc,
 
-    /// MMTP packaging. Defined by draft-ramadan-moq-mmt as an additional value
-    /// of the IETF catalog `packaging` field (draft-ietf-moq-catalogformat
-    /// defines `cmaf` and `loc`). This is the coarse, MSF-facing packaging value
+    /// MMTP packaging. Defined by draft-ramadan-moq-mmt §12.1 as an additional
+    /// value of the IETF catalog `packaging` field (draft-ietf-moq-catalogformat
+    /// defines `cmaf` and `loc`). This is the MSF-facing packaging value
     /// (`shaka.msf` keys track selection on `packaging === "mmtp"`); the
-    /// optional `container` extension carries finer MMTP encapsulation detail.
-    #[serde(rename = "mmtp")]
-    Mmtp,
-}
-
-/// Container format per draft-ramadan-moq-mmt §11.1.
-///
-/// Identifies how media is encapsulated inside MoQ objects. Distinct from
-/// `TrackPackaging` (which describes the streaming format CMAF vs LOC at the
-/// IETF draft-01 catalog level). Tracks MAY carry both fields independently.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-pub enum Container {
-    /// Raw ISOBMFF/MPU with the MMTP header stripped. Default when MoQ
-    /// transport provides timestamps and FEC out-of-band.
-    #[serde(rename = "isobmff")]
-    Isobmff,
-
-    /// MMTP-encapsulated MPU (Standard MPU mode). Object 0 of each group
-    /// carries the MPU metadata (mmpu+moov+moof). Subsequent objects carry
-    /// MFU payloads.
+    /// REQUIRED per-track `mmtpMode` field carries the finer MPU-vs-MFU
+    /// encapsulation detail (the legacy `container` extension is gone).
     #[serde(rename = "mmtp")]
     Mmtp,
 
-    /// MMTP MFU mode. Object 0 carries MPU metadata only; each subsequent
-    /// object carries one complete MFU (one coded frame). Enables per-frame
-    /// FEC protection and frame-level prioritization.
-    #[serde(rename = "mfu")]
-    Mfu,
-
-    /// FEC repair track per draft-ramadan-moq-fec.
+    /// AL-FEC repair track packaging, per draft-ramadan-moq-fec §5.2 (repair
+    /// tracks are catalog-signaled; REQUIRED for multicast where no back
+    /// channel exists). The publisher skips these when building its source
+    /// track map and derives its own `<name>/repair` siblings.
     #[serde(rename = "fec-repair")]
     FecRepair,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub enum MmtpMode {
+    #[serde(rename = "mpu")]
+    Mpu,
+
+    #[serde(rename = "mfu")]
+    Mfu,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
