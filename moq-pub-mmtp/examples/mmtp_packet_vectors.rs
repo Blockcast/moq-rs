@@ -13,7 +13,7 @@
 // parser and its JS test.
 //
 // A MoQ object on the wire is one full raw MMTP packet (raw-passthrough
-// container mode, M.1b §B1):
+// MMTP packaging, M.1b §B1):
 //   MMTP header (12 B) [+ SourceFecPayloadId (4 B) iff fec_type==1]
 //     + MPU header (8 B, only for packet_type=Mpu) + media payload
 //
@@ -180,7 +180,14 @@ fn sequence_vector(
     let mut packets: Vec<Value> = Vec::new();
     // Init object (carries the init segment; FI=0).
     packets.push(Value::String(to_hex(&build_mpu_packet(
-        packet_id, true, mpu_sequence, FragmentType::Init, 0, 0, mpu_sequence, init_payload,
+        packet_id,
+        true,
+        mpu_sequence,
+        FragmentType::Init,
+        0,
+        0,
+        mpu_sequence,
+        init_payload,
     ))));
     // MFU fragments: FI=1 first, 2 middle(s), 3 last.
     let n = frag_payloads.len();
@@ -196,7 +203,14 @@ fn sequence_vector(
             2
         };
         packets.push(Value::String(to_hex(&build_mpu_packet(
-            packet_id, fi == 1, mpu_sequence, FragmentType::Mfu, fi, i as u8, mpu_sequence, p,
+            packet_id,
+            fi == 1,
+            mpu_sequence,
+            FragmentType::Mfu,
+            fi,
+            i as u8,
+            mpu_sequence,
+            p,
         ))));
         reassembled.extend_from_slice(p);
     }
@@ -269,7 +283,13 @@ fn main() -> anyhow::Result<()> {
             b"track=1;mpu_seq=0;frag=0;fi=1",
         ),
         // fec_type==1: 4-byte SourceFecPayloadId between MMTP and MPU headers.
-        fec_vector("mfu_with_fec_source_id", 2, 0xCAFE_BABE, 7, b"fec-protected-mfu"),
+        fec_vector(
+            "mfu_with_fec_source_id",
+            2,
+            0xCAFE_BABE,
+            7,
+            b"fec-protected-mfu",
+        ),
         // Non-MPU packet: Repair, no MPU header.
         repair_vector("repair_packet", 1, b"\x00\x01\x02\x03repair-symbols"),
     ];
@@ -299,7 +319,10 @@ fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1) {
         Some(path) => {
             std::fs::write(&path, format!("{serialised}\n"))?;
-            eprintln!("wrote {} vectors to {path}", doc["vectors"].as_array().unwrap().len());
+            eprintln!(
+                "wrote {} vectors to {path}",
+                doc["vectors"].as_array().unwrap().len()
+            );
         }
         None => println!("{serialised}"),
     }

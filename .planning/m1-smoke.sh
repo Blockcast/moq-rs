@@ -47,8 +47,8 @@ cat > "$SMOKE/catalog.json" <<EOF
   "supportsDeltaUpdates": true,
   "commonTrackFields": {"namespace": "$NAME"},
   "tracks": [
-    {"name": "v", "container": "mmtp", "selectionParams": {"codec": "hev1.synth"}},
-    {"name": "a", "container": "mmtp", "selectionParams": {"codec": "mp4a.synth"}}
+    {"name": "v", "packaging": "mmtp", "mmtpMode": "mpu", "selectionParams": {"codec": "hev1.synth"}},
+    {"name": "a", "packaging": "mmtp", "mmtpMode": "mpu", "selectionParams": {"codec": "mp4a.synth"}}
   ],
   "multicast": {
     "subgroupHistoryGroups": 8,

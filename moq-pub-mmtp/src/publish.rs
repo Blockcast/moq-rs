@@ -63,7 +63,7 @@ pub trait TrackSubgroups {
 pub struct TrackState<T: TrackSubgroups> {
     /// Catalog track name (informational, used for log context).
     pub name: String,
-    /// Object-level priority (typically derived from track container).
+    /// Object-level priority for source media objects.
     pub priority: u8,
     /// Subgroup factory wired to one moq-transport TrackWriter::subgroups().
     pub sink: T,
@@ -89,9 +89,9 @@ pub struct TrackState<T: TrackSubgroups> {
     /// are seen. Reset on group advance.
     next_mfu_subgroup_id: u64,
     /// Sibling `<name>/repair` track for AL-FEC repair packets. Per
-    /// draft-ramadan-moq-mmt §7.2 repair tracks run at priority 7 and
-    /// inherit the source track's group_id so the receiver can
-    /// correlate source/repair by MPU sequence. None means no FEC is
+    /// draft-ramadan-moq-mmt §8.2 and draft-ramadan-moq-fec §6.1 repair
+    /// tracks run at priority 7 and inherit the source track's group_id so the
+    /// receiver can correlate source/repair by MPU sequence. None means no FEC is
     /// configured for this packet_id (subscriber gets no recovery).
     pub repair: Option<RepairSink<T>>,
 }
@@ -142,7 +142,7 @@ pub struct RepairSink<T: TrackSubgroups> {
 ///
 /// `payload` is the full MMTP packet (header + body) — exactly what
 /// the receiver will see when this lands as a MoQ object payload, per
-/// the raw-passthrough container mode (see .planning/moq-rs-m1-adr.md
+/// the raw-passthrough MMTP packaging (see .planning/moq-rs-m1-adr.md
 /// "MMTP framing — already done").
 pub fn dispatch<T: TrackSubgroups>(
     state_map: &mut HashMap<u16, TrackState<T>>,
@@ -213,7 +213,9 @@ pub fn dispatch<T: TrackSubgroups>(
                     let ts = routing.timestamp;
                     if !state.mfu_groups.contains_key(&ts) {
                         let subgroup_id = state.next_mfu_subgroup_id;
-                        let g = state.sink.create_group(group_id, subgroup_id, state.priority)?;
+                        let g = state
+                            .sink
+                            .create_group(group_id, subgroup_id, state.priority)?;
                         state.next_mfu_subgroup_id += 1;
                         state.mfu_groups.insert(ts, g);
                     }
@@ -339,7 +341,12 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             packet_id,
-            TrackState::new(format!("track-{packet_id}"), priority, MockSubgroups::default(), repair),
+            TrackState::new(
+                format!("track-{packet_id}"),
+                priority,
+                MockSubgroups::default(),
+                repair,
+            ),
         );
         map
     }
@@ -407,7 +414,10 @@ mod tests {
             vec![(1, 1, 5)],
             "MFU opens subgroup 1 of group 1 (0 reserved for Init)"
         );
-        assert!(state.init_group.is_none(), "no Init seen → subgroup 0 not opened");
+        assert!(
+            state.init_group.is_none(),
+            "no Init seen → subgroup 0 not opened"
+        );
     }
 
     #[test]
@@ -453,10 +463,30 @@ mod tests {
         // Mapping B: Init -> subgroup 0; each distinct MFU timestamp -> a new
         // subgroup (1, 2, ...); the same timestamp reuses its subgroup.
         let mut map = make_state_map(1, 5);
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"init")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a0")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xB), Bytes::from_static(b"b0")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a1")).unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Init, 0),
+            Bytes::from_static(b"init"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xA),
+            Bytes::from_static(b"a0"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xB),
+            Bytes::from_static(b"b0"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xA),
+            Bytes::from_static(b"a1"),
+        )
+        .unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
@@ -471,7 +501,10 @@ mod tests {
             state.mfu_groups[&0xA].writes,
             vec![Bytes::from_static(b"a0"), Bytes::from_static(b"a1")]
         );
-        assert_eq!(state.mfu_groups[&0xB].writes, vec![Bytes::from_static(b"b0")]);
+        assert_eq!(
+            state.mfu_groups[&0xB].writes,
+            vec![Bytes::from_static(b"b0")]
+        );
     }
 
     #[test]
@@ -479,10 +512,30 @@ mod tests {
         // Advancing to a new group resets the MFU subgroup counter to 1 and
         // clears the previous group's subgroups.
         let mut map = make_state_map(1, 5);
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"i10")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xA), Bytes::from_static(b"a")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 11, FragmentType::Init, 0), Bytes::from_static(b"i11")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 11, FragmentType::Mfu, 0xC), Bytes::from_static(b"c")).unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Init, 0),
+            Bytes::from_static(b"i10"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xA),
+            Bytes::from_static(b"a"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 11, FragmentType::Init, 0),
+            Bytes::from_static(b"i11"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 11, FragmentType::Mfu, 0xC),
+            Bytes::from_static(b"c"),
+        )
+        .unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
@@ -505,10 +558,7 @@ mod tests {
         // Repair for a packet_id not in the source map → hard error.
         let mut map = make_state_map_with_repair(1, 5, true);
         let err = dispatch(&mut map, &repair(99), Bytes::from_static(b"r")).unwrap_err();
-        assert!(
-            err.to_string().contains("unknown packet_id"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("unknown packet_id"), "got: {err}");
     }
 
     #[test]
@@ -551,7 +601,8 @@ mod tests {
     #[test]
     fn repair_packet_routes_to_repair_sink_at_priority_7() {
         // Repair packets MUST land on the repair sibling sink (not the
-        // source sink), with priority 7 per draft-ramadan-moq-mmt §7.2.
+        // source sink), with priority 7 per draft-ramadan-moq-mmt §8.2 and
+        // draft-ramadan-moq-fec §6.1.
         let mut map = make_state_map_with_repair(1, 5, true);
         // Open source MPU 10 first.
         dispatch(
@@ -612,10 +663,30 @@ mod tests {
         // ordered objects in one subgroup — even though the publisher never reads
         // the Fragmentation Indicator (§5.1).
         let mut map = make_state_map(1, 5);
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Init, 0), Bytes::from_static(b"init")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f1")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f2")).unwrap();
-        dispatch(&mut map, &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD), Bytes::from_static(b"f3")).unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Init, 0),
+            Bytes::from_static(b"init"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
+            Bytes::from_static(b"f1"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
+            Bytes::from_static(b"f2"),
+        )
+        .unwrap();
+        dispatch(
+            &mut map,
+            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
+            Bytes::from_static(b"f3"),
+        )
+        .unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
@@ -647,7 +718,10 @@ mod tests {
     // validates the dispatch against real muxer output, not just synthetic vectors.
     #[test]
     fn replays_real_moq_mmt_capture_into_mapping_b_subgroups() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets/moq_mmt_capture.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/assets/moq_mmt_capture.json"
+        );
         let raw = std::fs::read_to_string(path).expect("real-capture fixture present");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid fixture JSON");
         let packets: Vec<Vec<u8>> = doc["packets_hex"]
@@ -691,24 +765,41 @@ mod tests {
         let mut saw_multi_mfu_group = false;
         for (g, subs) in &by_group {
             let init_count = subs.iter().filter(|x| **x == 0).count();
-            assert!(init_count <= 1, "group {g}: Init subgroup 0 created more than once");
+            assert!(
+                init_count <= 1,
+                "group {g}: Init subgroup 0 created more than once"
+            );
             if init_count == 1 {
                 saw_init_subgroup_zero = true;
             }
             let mut mfus: Vec<u64> = subs.iter().copied().filter(|x| *x != 0).collect();
             mfus.sort_unstable();
             let expected: Vec<u64> = (1..=mfus.len() as u64).collect();
-            assert_eq!(mfus, expected, "group {g}: MFU subgroups must be contiguous 1..=M");
+            assert_eq!(
+                mfus, expected,
+                "group {g}: MFU subgroups must be contiguous 1..=M"
+            );
             if mfus.len() >= 2 {
                 saw_multi_mfu_group = true;
             }
         }
-        assert!(saw_init_subgroup_zero, "expected an Init object on subgroup 0");
-        assert!(saw_multi_mfu_group, "expected a group with multiple MFU subgroups");
+        assert!(
+            saw_init_subgroup_zero,
+            "expected an Init object on subgroup 0"
+        );
+        assert!(
+            saw_multi_mfu_group,
+            "expected a group with multiple MFU subgroups"
+        );
 
         // A fragmented MFU: some MFU subgroup of the final (still-open) group
         // received more than one object (its FI=1,2,..,3 fragments).
-        let max_objs = state.mfu_groups.values().map(|g| g.writes.len()).max().unwrap_or(0);
+        let max_objs = state
+            .mfu_groups
+            .values()
+            .map(|g| g.writes.len())
+            .max()
+            .unwrap_or(0);
         assert!(
             max_objs >= 2,
             "expected a fragmented MFU (>1 object in one subgroup), got max {max_objs}"
