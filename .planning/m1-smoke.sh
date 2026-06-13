@@ -47,8 +47,8 @@ cat > "$SMOKE/catalog.json" <<EOF
   "supportsDeltaUpdates": true,
   "commonTrackFields": {"namespace": "$NAME"},
   "tracks": [
-    {"name": "v", "container": "mmtp", "selectionParams": {"codec": "hev1.synth"}},
-    {"name": "a", "container": "mmtp", "selectionParams": {"codec": "mp4a.synth"}}
+    {"name": "v", "packaging": "mmtp", "mmtpMode": "mpu", "selectionParams": {"codec": "hev1.synth"}},
+    {"name": "a", "packaging": "mmtp", "mmtpMode": "mpu", "selectionParams": {"codec": "mp4a.synth"}}
   ],
   "multicast": {
     "subgroupHistoryGroups": 8,
@@ -64,8 +64,20 @@ cat > "$SMOKE/catalog.json" <<EOF
 }
 EOF
 
-# Ensure TLS certs exist (dev/cert is idempotent).
+# Ensure TLS certs exist (dev/cert is idempotent). In locked-down agent
+# containers dev/cert fails (mkcert -install wants sudo / no_new_privileges),
+# so fall back to a plain openssl self-signed cert — the relay only needs a
+# localhost cert+key pair; trust-store installation is irrelevant here because
+# the smoke subscriber disables verification in --dev mode.
 ./dev/cert >/dev/null 2>&1 || true
+if [[ ! -f dev/localhost.crt || ! -f dev/localhost.key ]]; then
+    echo "[cert] dev/cert unavailable; generating self-signed localhost cert"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout dev/localhost.key -out dev/localhost.crt \
+        -days 14 -nodes -subj "/CN=localhost" \
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" \
+        >/dev/null 2>&1
+fi
 
 cleanup() {
     local code=$?
