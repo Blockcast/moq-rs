@@ -84,7 +84,8 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         res = session.run() => res.context("session error")?,
-        _ = wait_tasks(&mut tasks) => {
+        res = wait_tasks(&mut tasks) => {
+            res?;
             tracing::info!("all drain tasks finished");
         }
     }
@@ -92,13 +93,42 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Wait for all spawned drain tasks to complete, logging any errors.
-async fn wait_tasks(tasks: &mut tokio::task::JoinSet<Result<()>>) {
+/// Wait for all spawned drain tasks to complete, returning the first drain
+/// error or join panic. A raw-capture run whose tracks fail to drain (bad
+/// output path, non-subgroup track, read/write error, panic) MUST exit
+/// non-zero so smoke/E2E wrappers observe the failure instead of treating an
+/// empty capture as success (repo rule: no silent fallbacks).
+async fn wait_tasks(tasks: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
     while let Some(res) = tasks.join_next().await {
         match res {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!("drain task error: {err:?}"),
-            Err(join_err) => tracing::warn!("drain task panicked: {join_err:?}"),
+            Ok(Err(err)) => return Err(err.context("drain task failed")),
+            Err(join_err) => return Err(anyhow!("drain task panicked: {join_err:?}")),
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // wait_tasks must surface the first drain error, not swallow it — otherwise
+    // a capture run that produced no valid output still exits 0.
+    #[tokio::test]
+    async fn wait_tasks_propagates_first_drain_error() {
+        let mut tasks: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+        tasks.spawn(async { Ok(()) });
+        tasks.spawn(async { Err(anyhow!("drain boom")) });
+        let res = wait_tasks(&mut tasks).await;
+        assert!(res.is_err(), "a failing drain task must propagate an error");
+    }
+
+    #[tokio::test]
+    async fn wait_tasks_ok_when_all_succeed() {
+        let mut tasks: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+        tasks.spawn(async { Ok(()) });
+        tasks.spawn(async { Ok(()) });
+        assert!(wait_tasks(&mut tasks).await.is_ok());
     }
 }
