@@ -898,6 +898,162 @@ mod tests {
             .validate()
             .expect("repair track inheriting fec-repair packaging from common is valid");
     }
+
+    #[test]
+    fn validate_accepts_aligned_switching_set() {
+        // Two mmtp renditions in altGroup 1, same timescale + group duration:
+        // their MoQ group numbers stay media-time-aligned. §4.4.2.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"v720","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"altGroup":1,"selectionParams":{}},
+                {"name":"v1080","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"altGroup":1,"selectionParams":{}}
+            ]
+        }"#;
+        serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect("an aligned switching set is valid");
+    }
+
+    #[test]
+    fn validate_rejects_switching_set_group_duration_mismatch() {
+        // Same altGroup, same timescale, but 1000 ms vs 2000 ms group durations:
+        // group numbers drift, so ABR switches would land off a group boundary.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"v720","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"altGroup":1,"selectionParams":{}},
+                {"name":"v1080","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":2000,"altGroup":1,"selectionParams":{}}
+            ]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("mismatched group durations in a switching set must be rejected");
+        assert!(
+            matches!(
+                &err,
+                CatalogValidationError::SwitchingSetGroupDurationMismatch { alt_group: 1, track_name, other_track }
+                    if track_name == "v1080" && other_track == "v720"
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_mixed_timescale_switching_set_when_wall_clock_equal() {
+        // Different timescales but equal wall-clock group duration (both 1 s):
+        // cross-multiplication makes raw tick counts (90000 vs 48000) agree.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"hi","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationTicks":90000,"altGroup":2,"selectionParams":{}},
+                {"name":"lo","packaging":"mmtp","mmtpMode":"mfu","timescale":48000,"groupDurationTicks":48000,"altGroup":2,"selectionParams":{}}
+            ]
+        }"#;
+        serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect("equal wall-clock group durations agree across timescales");
+    }
+
+    #[test]
+    fn validate_accepts_lone_alt_group_member() {
+        // A single track carrying an altGroup has nothing to disagree with.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"altGroup":7,"selectionParams":{}}
+            ]
+        }"#;
+        serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect("a lone switching-set member is valid");
+    }
+
+    #[test]
+    fn validate_rejects_switching_set_mismatch_with_inherited_alt_group() {
+        // altGroup is hoisted into commonTrackFields (the compaction real catalogs
+        // use via from_tracks); the switching-set check must still read it through
+        // `.or(common)` and reject the group-duration mismatch. Locks the
+        // inheritance path that the four direct-altGroup tests above never take.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"altGroup": 1},
+            "tracks": [
+                {"name":"v720","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"selectionParams":{}},
+                {"name":"v1080","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":2000,"selectionParams":{}}
+            ]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("a mismatch under an inherited altGroup must still be rejected");
+        assert!(
+            matches!(
+                &err,
+                CatalogValidationError::SwitchingSetGroupDurationMismatch { alt_group: 1, track_name, other_track }
+                    if track_name == "v1080" && other_track == "v720"
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_third_switching_set_member_against_anchor() {
+        // Members 1+2 agree (1000 ms); member 3 (2000 ms) disagrees. The error
+        // must name the anchor (v1, first-seen), not the predecessor (v2) — the
+        // comparison is always against the sticky anchor, not the prior member.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"v1","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"altGroup":1,"selectionParams":{}},
+                {"name":"v2","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"altGroup":1,"selectionParams":{}},
+                {"name":"v3","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":2000,"altGroup":1,"selectionParams":{}}
+            ]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("third member disagreeing with the anchor must be rejected");
+        assert!(
+            matches!(
+                &err,
+                CatalogValidationError::SwitchingSetGroupDurationMismatch { alt_group: 1, track_name, other_track }
+                    if track_name == "v3" && other_track == "v1"
+            ),
+            "the error must name the anchor (v1), not the predecessor (v2); got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_skips_switching_set_check_for_non_mmtp_tracks() {
+        // §4.4.2 group-number alignment is an MMTP-over-MoQ concept. Non-mmtp
+        // renditions (e.g. cmaf) in a switching set are out of its scope and must
+        // NOT be subjected to the group-duration agreement check — which would
+        // also hit the ms→tick truncation the per-track loop exactness-guards only
+        // for mmtp. Differing (and non-exact) cmaf group durations validate.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"c720","packaging":"cmaf","timescale":44100,"groupDurationMs":1001,"altGroup":1,"selectionParams":{}},
+                {"name":"c1080","packaging":"cmaf","timescale":44100,"groupDurationMs":2002,"altGroup":1,"selectionParams":{}}
+            ]
+        }"#;
+        serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect("non-mmtp switching-set members are out of §4.4.2 scope");
+    }
 }
 
 /// Library-level validation errors raised by `Root::validate`.
@@ -951,6 +1107,17 @@ pub enum CatalogValidationError {
     /// (zero source/repair symbols or symbol size; moq-fec §5.1). FEC params are
     /// out-of-band for multicast, so a degenerate descriptor silently fails recovery.
     InvalidFecParams { track_name: String, reason: String },
+    /// Two MMTP tracks in the same switching set (same effective `altGroup`)
+    /// publish different effective group durations, so their MoQ group
+    /// numbers cannot stay media-time-aligned (draft-ramadan-moq-mmt §4.4.2).
+    SwitchingSetGroupDurationMismatch {
+        /// The switching set (effective `altGroup`) the two tracks share.
+        alt_group: u16,
+        /// The offending track — the one whose group duration differs.
+        track_name: String,
+        /// The first-seen member of the set; the anchor compared against.
+        other_track: String,
+    },
 }
 
 impl std::fmt::Display for CatalogValidationError {
@@ -1008,6 +1175,16 @@ impl std::fmt::Display for CatalogValidationError {
             Self::InvalidFecParams { track_name, reason } => write!(
                 f,
                 "catalog.tracks[] entry `{track_name}` has an invalid fec descriptor: {reason} (moq-fec §5.1)"
+            ),
+            Self::SwitchingSetGroupDurationMismatch {
+                alt_group,
+                track_name,
+                other_track,
+            } => write!(
+                f,
+                "switching set altGroup {alt_group}: track `{track_name}` and `{other_track}` publish \
+                 different effective group durations — MoQ group numbers cannot stay media-time-aligned \
+                 (draft-ramadan-moq-mmt §4.4.2)"
             ),
         }
     }
@@ -1136,6 +1313,72 @@ impl Root {
                         track_name: t.name.clone(),
                         repair_track: fec.repair_track.clone(),
                     });
+                }
+            }
+        }
+        // draft-ramadan-moq-mmt §4.4.2 "Switching Sets": every MMTP track in the
+        // same switching set — identified by the IETF-catalog `altGroup` (multicast
+        // draft §4.1) — MUST publish the same effective group duration. The group
+        // number is `floor(media_ticks / group_duration_ticks)`, and `media_ticks`
+        // scales with the track's own `timescale`, so two tracks produce the same
+        // group number for a given media time iff their group durations are equal
+        // in WALL-CLOCK terms (ticks / timescale), not as raw tick counts. We
+        // compare wall-clock equality in the integer domain via cross-
+        // multiplication (`ticks_a * ts_b == ticks_b * ts_a`); for the common case
+        // where set members share a timescale this reduces to plain tick equality.
+        // u128 products avoid overflow (each operand is a u64-bounded field).
+        //
+        // Scoped to effective-MMTP tracks: §4.4.2 group numbering is an
+        // MMTP-over-MoQ concept, and the per-track loop above already requires —
+        // and exactness-checks — timescale + group duration for exactly these
+        // tracks, so the `continue` skips below can only fire for a non-MMTP set
+        // member, which is out of scope. (Without this packaging gate a non-MMTP
+        // altGroup member carrying timescale + groupDurationMs would reach the
+        // unguarded ms→tick truncation and could be mis-compared.)
+        let mut anchor: std::collections::HashMap<u16, (u128, u128, String)> =
+            std::collections::HashMap::new();
+        for t in &self.tracks {
+            if !matches!(
+                t.packaging
+                    .as_ref()
+                    .or(self.common_track_fields.packaging.as_ref()),
+                Some(TrackPackaging::Mmtp)
+            ) {
+                continue;
+            }
+            let alt = match t.alt_group.or(self.common_track_fields.alt_group) {
+                Some(alt) => alt,
+                None => continue,
+            };
+            let ts = match t.timescale.or(self.common_track_fields.timescale) {
+                Some(ts) => ts as u128,
+                None => continue,
+            };
+            let ticks = match t
+                .group_duration_ticks
+                .or(self.common_track_fields.group_duration_ticks)
+            {
+                Some(ticks) => ticks as u128,
+                None => match t
+                    .group_duration_ms
+                    .or(self.common_track_fields.group_duration_ms)
+                {
+                    Some(ms) => ms as u128 * ts / 1000,
+                    None => continue,
+                },
+            };
+            match anchor.get(&alt) {
+                None => {
+                    anchor.insert(alt, (ticks, ts, t.name.clone()));
+                }
+                Some((a_ticks, a_ts, a_name)) => {
+                    if ticks * a_ts != *a_ticks * ts {
+                        return Err(CatalogValidationError::SwitchingSetGroupDurationMismatch {
+                            alt_group: alt,
+                            track_name: t.name.clone(),
+                            other_track: a_name.clone(),
+                        });
+                    }
                 }
             }
         }
