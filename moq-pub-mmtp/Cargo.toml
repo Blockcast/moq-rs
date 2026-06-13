@@ -34,3 +34,15 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { version = "1", features = ["backtrace"] }
 serde_json = "1"
+
+# Run the parity-vector example test modules under `cargo test` (CI). Without
+# `test = true`, the `#[test]` fns in these examples are never compiled or run.
+[[example]]
+name = "mmtp_packet_vectors"
+path = "examples/mmtp_packet_vectors.rs"
+test = true
+
+[[example]]
+name = "reassembler_vectors"
+path = "examples/reassembler_vectors.rs"
+test = true
