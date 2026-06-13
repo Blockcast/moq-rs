@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use moq_catalog::{Container, Root};
+use moq_catalog::{Root, TrackPackaging};
 use moq_native_ietf::quic;
 use moq_transport::{
     coding::TrackNamespace,
@@ -138,7 +138,14 @@ fn build_state_map(
                         track_ref.name
                     )
                 })?;
-            let priority = priority_for_container(catalog_track.container.as_ref());
+            if matches!(catalog_track.packaging, Some(TrackPackaging::FecRepair)) {
+                tracing::debug!(
+                    track = %track_ref.name,
+                    packet_id = track_ref.packet_id,
+                    "skipping catalog-declared FEC repair track; publisher creates repair siblings"
+                );
+                continue;
+            }
 
             let track_writer = tracks_writer.create(&track_ref.name).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -166,7 +173,7 @@ fn build_state_map(
 
             // Auto-create the AL-FEC repair sibling. The track name
             // convention `<source>/repair` is publisher-internal per
-            // draft-ramadan-moq-mmt §7.2; the catalog does not list it.
+            // draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1.
             let repair_name = format!("{}/repair", track_ref.name);
             let repair_writer = tracks_writer.create(&repair_name).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -181,9 +188,12 @@ fn build_state_map(
 
             map.insert(
                 track_ref.packet_id,
+                // Source tracks publish at priority 0; the old
+                // priority_for_container() indirection died with the catalog
+                // `container` field (repair siblings hardcode 7 in publish.rs).
                 TrackState::new(
                     track_ref.name.clone(),
-                    priority,
+                    0,
                     subgroups,
                     Some(RepairSink {
                         sink: repair_subgroups,
@@ -271,19 +281,6 @@ fn check_namespace_consistency(catalog: &Root, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Object-level priority for a source track keyed by container type.
-///
-/// Per draft-ramadan-moq-mmt §7.2:
-///   - Source media (mmtp / mfu / isobmff / unset) → priority 0 (highest).
-///   - FEC repair tracks → priority 7 (lower than source).
-/// Repair sibling tracks (created in T3) bypass this fn and use 7 directly.
-fn priority_for_container(container: Option<&Container>) -> u8 {
-    match container {
-        Some(Container::FecRepair) => 7,
-        _ => 0,
-    }
-}
-
 /// Drive the publisher dispatch loop until the input ends.
 ///
 /// `tracks_writer` is held here only to keep the broadcast alive — once
@@ -369,17 +366,23 @@ async fn run_stdin_loop(state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>
 mod tests {
     use super::*;
     use moq_catalog::multicast::{MulticastConfig, MulticastEndpoint, MulticastTrackRef};
-    use moq_catalog::{CommonTrackFields, SelectionParam, Track};
+    use moq_catalog::{CommonTrackFields, MmtpMode, SelectionParam, Track};
     use moq_transport::serve::Tracks;
 
     fn ns() -> TrackNamespace {
         TrackNamespace::from_utf8_path("test-broadcast")
     }
 
-    fn track(name: &str, container: Option<Container>) -> Track {
+    fn track(name: &str, packaging: Option<TrackPackaging>) -> Track {
+        let mmtp_mode = if matches!(packaging, Some(TrackPackaging::Mmtp)) {
+            Some(MmtpMode::Mpu)
+        } else {
+            None
+        };
         Track {
             name: name.into(),
-            container,
+            packaging,
+            mmtp_mode,
             selection_params: SelectionParam::default(),
             ..Default::default()
         }
@@ -415,18 +418,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn priority_for_container_pins_spec() {
-        // Per draft-ramadan-moq-mmt §7.2: source media gets priority 0,
-        // FEC repair tracks get priority 7. If anyone moves these
-        // numbers, the smoke test mlog will reveal it — pin them here.
-        assert_eq!(priority_for_container(None), 0);
-        assert_eq!(priority_for_container(Some(&Container::Mmtp)), 0);
-        assert_eq!(priority_for_container(Some(&Container::Mfu)), 0);
-        assert_eq!(priority_for_container(Some(&Container::Isobmff)), 0);
-        assert_eq!(priority_for_container(Some(&Container::FecRepair)), 7);
-    }
-
     fn expect_err(r: Result<HashMap<u16, TrackState<SubgroupsWriter>>>) -> anyhow::Error {
         match r {
             Err(e) => e,
@@ -436,7 +427,7 @@ mod tests {
 
     #[test]
     fn build_state_map_errors_when_no_multicast_extension() {
-        let cat = catalog_with(vec![track("v", Some(Container::Mmtp))], None);
+        let cat = catalog_with(vec![track("v", Some(TrackPackaging::Mmtp))], None);
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
         let err = expect_err(build_state_map(&mut tw, &cat));
         assert!(
@@ -448,7 +439,7 @@ mod tests {
     #[test]
     fn build_state_map_errors_when_endpoints_missing() {
         let cat = catalog_with(
-            vec![track("v", Some(Container::Mmtp))],
+            vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig::default()),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -463,8 +454,8 @@ mod tests {
     fn build_state_map_errors_on_duplicate_packet_id() {
         let cat = catalog_with(
             vec![
-                track("v", Some(Container::Mmtp)),
-                track("a", Some(Container::Mmtp)),
+                track("v", Some(TrackPackaging::Mmtp)),
+                track("a", Some(TrackPackaging::Mmtp)),
             ],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1), ("a", 1)])]),
@@ -483,7 +474,7 @@ mod tests {
     #[test]
     fn build_state_map_errors_on_missing_track_reference() {
         let cat = catalog_with(
-            vec![track("v", Some(Container::Mmtp))],
+            vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("does-not-exist", 1)])]),
                 network_source: None,
@@ -504,7 +495,7 @@ mod tests {
         // Mapping B opens many subgroups per group; there is no silent unbounded
         // default.
         let cat = catalog_with(
-            vec![track("v", Some(Container::Mmtp))],
+            vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
@@ -529,7 +520,7 @@ mod tests {
         // pins both registrations; the byte-for-byte write contract is covered
         // in T9 smoke.
         let cat = catalog_with(
-            vec![track("v", Some(Container::Mmtp))],
+            vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
@@ -556,10 +547,7 @@ mod tests {
     #[test]
     fn build_state_map_happy_path_with_two_tracks() {
         let cat = catalog_with(
-            vec![
-                track("v", Some(Container::Mmtp)),
-                track("a", None), // no container → defaults to 0
-            ],
+            vec![track("v", Some(TrackPackaging::Mmtp)), track("a", None)],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17), ("a", 18)])]),
                 network_source: None,
@@ -581,13 +569,33 @@ mod tests {
         assert!(a.repair.is_some(), "track `a` must have a repair sibling");
     }
 
+    #[test]
+    fn build_state_map_skips_catalog_declared_fec_repair_tracks() {
+        let cat = catalog_with(
+            vec![
+                track("v", Some(TrackPackaging::Mmtp)),
+                track("v/repair", Some(TrackPackaging::FecRepair)),
+            ],
+            Some(MulticastConfig {
+                endpoints: Some(vec![endpoint(vec![("v", 17), ("v/repair", 18)])]),
+                network_source: None,
+                subgroup_history_groups: Some(8),
+            }),
+        );
+        let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
+        let map = build_state_map(&mut tw, &cat).unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&17));
+        assert!(!map.contains_key(&18));
+    }
+
     #[tokio::test]
     async fn udp_recv_dispatches_one_packet() {
         // T4: each UDP datagram is one MMTP packet (no length prefix —
         // the datagram boundary IS the packet boundary). recv_one_udp_packet
         // must read one datagram and pass it through to dispatch.
         let cat = catalog_with(
-            vec![track("v", Some(Container::Mmtp))],
+            vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
@@ -630,7 +638,7 @@ mod tests {
     #[test]
     fn check_namespace_consistency_passes_when_common_namespace_matches() {
         // commonTrackFields.namespace = "bbb" matches --name=bbb → OK.
-        let mut cat = catalog_with(vec![track("v", Some(Container::Mmtp))], None);
+        let mut cat = catalog_with(vec![track("v", Some(TrackPackaging::Mmtp))], None);
         cat.common_track_fields.namespace = Some("bbb".into());
         check_namespace_consistency(&cat, "bbb").expect("matching namespace is OK");
     }
@@ -638,7 +646,7 @@ mod tests {
     #[test]
     fn check_namespace_consistency_passes_when_no_common_namespace() {
         // Common has no namespace → publisher sets it from --name; OK.
-        let cat = catalog_with(vec![track("v", Some(Container::Mmtp))], None);
+        let cat = catalog_with(vec![track("v", Some(TrackPackaging::Mmtp))], None);
         check_namespace_consistency(&cat, "anything").expect("no common namespace is OK");
     }
 
@@ -647,7 +655,7 @@ mod tests {
         // commonTrackFields.namespace = "foo" but --name=bar → hard error.
         // Catches publisher misconfiguration where the broadcast name
         // and the embedded catalog namespace disagree.
-        let mut cat = catalog_with(vec![track("v", Some(Container::Mmtp))], None);
+        let mut cat = catalog_with(vec![track("v", Some(TrackPackaging::Mmtp))], None);
         cat.common_track_fields.namespace = Some("foo".into());
         let err = match check_namespace_consistency(&cat, "bar") {
             Err(e) => e,
@@ -664,7 +672,7 @@ mod tests {
         // Pin the naming convention: source `v` → repair track named
         // `v/repair`, reachable via TracksReader.get_track_reader.
         let cat = catalog_with(
-            vec![track("v", Some(Container::Mmtp))],
+            vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
