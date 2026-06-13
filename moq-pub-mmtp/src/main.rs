@@ -147,15 +147,12 @@ fn build_state_map(
                 continue;
             }
 
-            let track_writer = tracks_writer.create(&track_ref.name).ok_or_else(|| {
+            let mut track_writer = tracks_writer.create(&track_ref.name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "TracksWriter::create returned None for `{}` (broadcast already closed?)",
                     track_ref.name
                 )
             })?;
-            let mut subgroups = track_writer
-                .subgroups()
-                .with_context(|| format!("track `{}`: subgroups() failed", track_ref.name))?;
 
             // Config-or-throw: MMTP publishing under Mapping B opens many
             // concurrent subgroups per group (Init + one per MFU). The publisher
@@ -169,22 +166,29 @@ fn build_state_map(
             if history_window < 1 {
                 bail!("multicast.subgroupHistoryGroups must be >= 1 (got {history_window})");
             }
-            subgroups.set_history_window(history_window)?;
+            // Set on the Track BEFORE `.subgroups()` consumes it: `subgroups()`
+            // inherits the window to bound local pruning, AND the publisher
+            // session advertises it in SUBSCRIBE_OK (BLO-10339) so a downstream
+            // relay mirror bounds its own retention to the same window.
+            track_writer.set_history_window(history_window)?;
+            let subgroups = track_writer
+                .subgroups()
+                .with_context(|| format!("track `{}`: subgroups() failed", track_ref.name))?;
 
             // Auto-create the AL-FEC repair sibling. The track name
             // convention `<source>/repair` is publisher-internal per
             // draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1.
             let repair_name = format!("{}/repair", track_ref.name);
-            let repair_writer = tracks_writer.create(&repair_name).ok_or_else(|| {
+            let mut repair_writer = tracks_writer.create(&repair_name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "TracksWriter::create returned None for `{}` (broadcast already closed?)",
                     repair_name
                 )
             })?;
-            let mut repair_subgroups = repair_writer
+            repair_writer.set_history_window(history_window)?;
+            let repair_subgroups = repair_writer
                 .subgroups()
                 .with_context(|| format!("track `{repair_name}`: subgroups() failed"))?;
-            repair_subgroups.set_history_window(history_window)?;
 
             map.insert(
                 track_ref.packet_id,

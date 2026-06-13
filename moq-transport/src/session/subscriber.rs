@@ -236,8 +236,20 @@ impl Subscriber {
             // Notify waiting tasks that the alias map has been updated
             self.subscribe_alias_notify.notify_waiters();
 
+            // Extract the publisher's per-track subgroup history window
+            // (BLO-10339), if advertised, so the local mirror bounds its
+            // retention. Absent / malformed (0) → None = unbounded (status quo).
+            let history_window = msg
+                .params
+                .get(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM)
+                .and_then(|kvp| match &kvp.value {
+                    crate::coding::Value::IntValue(v) => Some(*v),
+                    _ => None,
+                })
+                .filter(|&v| v >= 1);
+
             // Notify the subscribe of the successful subscription
-            subscribe.ok(msg.track_alias)?;
+            subscribe.ok(msg.track_alias, history_window)?;
         }
 
         Ok(())
@@ -815,5 +827,80 @@ mod tests {
 
         assert!(observer.subscribes.lock().unwrap().is_empty());
         assert!(observer.subscribe_alias_map.lock().unwrap().is_empty());
+    }
+
+    // BLO-10339: a SUBSCRIBE_OK carrying the subgroup-history-window param makes
+    // the subscriber bound its local mirror. With window=1, group 0 is pruned
+    // once group 1 arrives. Proves the relay path end-to-end: extract from the
+    // param → stash on SubscribeRecv → apply in subgroup().
+    #[tokio::test]
+    async fn recv_subscribe_ok_applies_history_window_to_mirror() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        let subscribe = subscriber.subscribe_open(writer);
+        futures::pin_mut!(subscribe);
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+
+        let mut params = crate::coding::KeyValuePairs::new();
+        params.set_intvalue(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM, 1);
+
+        let mut receiver = observer.clone();
+        receiver
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 10,
+                expires: 0,
+                group_order: GroupOrder::Publisher,
+                content_exists: false,
+                largest_location: None,
+                params,
+            })
+            .unwrap();
+
+        // Resolve the subscribe future so dropping it later runs Subscribe::drop
+        // → remove_subscribe, which closes the mirror writer (EOF). Dropping the
+        // still-pending future would NOT run that cleanup, hanging next().
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(s)) => s,
+            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
+            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
+        };
+
+        // Drive two groups through the mirror writer held in the SubscribeRecv.
+        {
+            let mut guard = observer.subscribes.lock().unwrap();
+            let recv = guard.get_mut(&0).expect("subscribe recv present");
+            for g in 0..=1u64 {
+                recv.subgroup(crate::data::SubgroupHeader {
+                    header_type: crate::data::StreamHeaderType::SubgroupIdExt,
+                    track_alias: 10,
+                    group_id: g,
+                    subgroup_id: Some(0),
+                    publisher_priority: 0,
+                })
+                .expect("subgroup create");
+            }
+        }
+
+        // Dropping the resolved Subscribe removes + drops the SubscribeRecv and
+        // its mirror writer, so the reader sees EOF after the retained subgroups.
+        drop(subscribe);
+
+        let mut sg_reader = match reader.mode().await.expect("mode") {
+            crate::serve::TrackReaderMode::Subgroups(r) => r,
+            _ => panic!("expected subgroups mode"),
+        };
+        let mut got = Vec::new();
+        while let Some(s) = sg_reader.next().await.unwrap() {
+            got.push((s.group_id, s.subgroup_id));
+        }
+        assert_eq!(
+            got,
+            vec![(1, 0)],
+            "window=1 from SUBSCRIBE_OK params applied to mirror → group 0 pruned"
+        );
     }
 }

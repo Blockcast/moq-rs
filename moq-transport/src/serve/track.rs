@@ -56,6 +56,11 @@ struct TrackState {
     reader_mode: Option<TrackReaderMode>,
     /// Watchable closed state
     closed: Result<(), ServeError>,
+    /// Per-track subgroup history window (group count) the publisher set
+    /// (BLO-10339). `subgroups()` inherits it into the SubgroupsWriter (to
+    /// enforce pruning) and the session reads it via `TrackReader` to
+    /// advertise it in SUBSCRIBE_OK. None = unbounded retention.
+    history_window_groups: Option<u64>,
 }
 
 impl Default for TrackState {
@@ -63,6 +68,7 @@ impl Default for TrackState {
         Self {
             reader_mode: None,
             closed: Ok(()),
+            history_window_groups: None,
         }
     }
 }
@@ -77,6 +83,23 @@ impl TrackWriter {
     /// Create a track with the given name (info/Track)
     fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
         Self { state, info }
+    }
+
+    /// Set the per-track subgroup history window (group count) to enforce and
+    /// advertise (BLO-10339). Must be called BEFORE `subgroups()` (which
+    /// consumes `self`); `subgroups()` inherits this into the SubgroupsWriter,
+    /// and the publisher session advertises it in SUBSCRIBE_OK so a downstream
+    /// mirror bounds its retention to the same window. `groups` must be >= 1
+    /// (errors, not panics, on 0 — matching SubgroupsWriter::set_history_window).
+    pub fn set_history_window(&mut self, groups: u64) -> Result<(), ServeError> {
+        if groups < 1 {
+            return Err(ServeError::Internal(
+                "history window must retain at least one group (got 0)".to_string(),
+            ));
+        }
+        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        state.history_window_groups = Some(groups);
+        Ok(())
     }
 
     /// Create a new stream with the given priority, inserting it into the track.
@@ -106,23 +129,35 @@ impl TrackWriter {
     // TODO: rework this whole interface for clarity?
     /// Create a new subgroups stream with the given priority, inserting it into the track.
     pub fn subgroups(self) -> Result<SubgroupsWriter, ServeError> {
-        let (writer, reader) = Subgroups {
+        let (mut writer, reader) = Subgroups {
             track: self.info.clone(),
         }
         .produce();
 
-        // Lock state to modify it
-        let mut state = self.state.lock_mut().ok_or_else(|| {
-            tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
-                track = %self.info.name,
-                "track state dropped (Cancel) in subgroups()"
-            );
-            ServeError::Cancel
-        })?;
+        // Lock state to set the mode and read the inherited history window,
+        // then drop the guard before touching the writer.
+        let history_window = {
+            let mut state = self.state.lock_mut().ok_or_else(|| {
+                tracing::debug!(
+                    namespace = %self.info.namespace.to_utf8_path(),
+                    track = %self.info.name,
+                    "track state dropped (Cancel) in subgroups()"
+                );
+                ServeError::Cancel
+            })?;
 
-        // Set the Stream mode to TrackReaderMode::Subgroups
-        state.reader_mode = Some(reader.into());
+            // Set the Stream mode to TrackReaderMode::Subgroups
+            state.reader_mode = Some(reader.into());
+            state.history_window_groups
+        };
+
+        // Inherit the Track-level window into the writer (BLO-10339), so a
+        // single publisher-side `TrackWriter::set_history_window` both bounds
+        // pruning here and is advertised via the TrackReader in SUBSCRIBE_OK.
+        if let Some(window) = history_window {
+            writer.set_history_window(window)?;
+        }
+
         Ok(writer)
     }
 
@@ -215,6 +250,13 @@ impl TrackReader {
         // We don't even know the mode yet.
         // TODO populate from SUBSCRIBE_OK
         None
+    }
+
+    /// The per-track subgroup history window the publisher set (BLO-10339), if
+    /// any. Read by the publisher session to advertise it in SUBSCRIBE_OK.
+    /// None = unbounded retention.
+    pub fn history_window(&self) -> Option<u64> {
+        self.state.lock().history_window_groups
     }
 
     /// Wait until the track is closed, returning the closing error.
@@ -330,6 +372,64 @@ mod tests {
     use super::*;
     use crate::coding::TrackNamespace;
     use crate::serve::Subgroup;
+
+    // BLO-10339: the per-track history window round-trips writer → reader so the
+    // publisher session can advertise it in SUBSCRIBE_OK before track mode resolves.
+    #[test]
+    fn track_history_window_set_and_read() {
+        let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
+        let (mut writer, reader) = track.produce();
+
+        assert_eq!(reader.history_window(), None, "unset → None (unbounded)");
+        writer.set_history_window(2).unwrap();
+        assert_eq!(reader.history_window(), Some(2));
+    }
+
+    // BLO-10339: window=0 errors (no panic), mirroring SubgroupsWriter.
+    #[test]
+    fn track_set_history_window_zero_errors() {
+        let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
+        let (mut writer, _reader) = track.produce();
+        assert!(
+            writer.set_history_window(0).is_err(),
+            "window=0 must error, not panic or silently accept"
+        );
+    }
+
+    // BLO-10339: a window set on the Track BEFORE `.subgroups()` is inherited by
+    // the SubgroupsWriter, so its pruning bounds memory without a second set call.
+    #[tokio::test]
+    async fn subgroups_inherits_track_history_window_and_prunes() {
+        let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
+        let (mut writer, reader) = track.produce();
+
+        writer.set_history_window(1).unwrap();
+        let mut subgroups = writer.subgroups().expect("subgroups transition");
+        for g in 0..=1u64 {
+            subgroups
+                .create(Subgroup {
+                    group_id: g,
+                    subgroup_id: 0,
+                    priority: 0,
+                })
+                .unwrap();
+        }
+        drop(subgroups);
+
+        let mut sg_reader = match reader.mode().await.expect("mode") {
+            TrackReaderMode::Subgroups(r) => r,
+            _ => panic!("expected subgroups mode"),
+        };
+        let mut got = Vec::new();
+        while let Some(s) = sg_reader.next().await.unwrap() {
+            got.push((s.group_id, s.subgroup_id));
+        }
+        assert_eq!(
+            got,
+            vec![(1, 0)],
+            "window=1 inherited from Track → group 0 pruned once group 1 arrived"
+        );
+    }
 
     #[test]
     fn test_is_closed_false_before_mode_set() {

@@ -121,6 +121,7 @@ impl Subscribe {
         let recv = SubscribeRecv {
             state: recv,
             writer: Some(track.into()),
+            history_window_groups: None,
         };
 
         (send, recv)
@@ -180,10 +181,17 @@ impl ops::Deref for Subscribe {
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
     writer: Option<TrackWriterMode>,
+    /// Per-track subgroup history window advertised by the publisher in
+    /// SUBSCRIBE_OK (BLO-10339). Applied to the local mirror writer in
+    /// `subgroup()` so the relay's cache retains the publisher's window
+    /// instead of growing unbounded. `None` = unbounded (status quo).
+    history_window_groups: Option<u64>,
 }
 
 impl SubscribeRecv {
-    pub fn ok(&mut self, alias: u64) -> Result<(), ServeError> {
+    pub fn ok(&mut self, alias: u64, history_window_groups: Option<u64>) -> Result<(), ServeError> {
+        self.history_window_groups = history_window_groups;
+
         let state = self.state.lock();
         if state.ok {
             return Err(ServeError::Duplicate);
@@ -224,7 +232,17 @@ impl SubscribeRecv {
 
         let mut subgroups = match writer {
             // TODO SLG - understand why both of these are needed, clock demo won't run if I comment out TrackWriteMode::Track
-            TrackWriterMode::Track(track) => track.subgroups()?,
+            TrackWriterMode::Track(track) => {
+                // First subgroup converts the local mirror Track -> Subgroups.
+                // Bound its retention to the publisher's window (BLO-10339),
+                // received via SUBSCRIBE_OK params. The Subgroups arm below
+                // already carries this window on subsequent subgroups.
+                let mut subgroups = track.subgroups()?;
+                if let Some(window) = self.history_window_groups {
+                    subgroups.set_history_window(window)?;
+                }
+                subgroups
+            }
             TrackWriterMode::Subgroups(subgroups) => subgroups,
             _ => return Err(ServeError::Mode),
         };
