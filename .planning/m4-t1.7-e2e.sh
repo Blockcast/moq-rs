@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# M.4 Track 1 / T1.7 stage 3 — live single-pipe E2E:
+# M.4 Track 1 / T1.2 — live single-pipe PLAYBACK E2E (evolves the T1.7 harness):
 #   real moq_mmt capture  -> moq-pub-mmtp -> moq-relay-ietf
-#                         -> Shaka MSF (headless Chrome, real WebTransport)
-#                         -> observe dump  -> assert Mapping B.
+#                         -> Shaka (headless Chrome, real WebTransport)
+#                         -> MSE SourceBuffer -> assert video playback.
 #
-# The harness page (shaka-player/demo/observe-mmtp.html) drives
-# shaka.msf.MSFParser.start() directly and POSTs its observe records to the
-# control server (.planning/m4-t1.7-e2e/serve.py), which also replays the
-# capture into the publisher on the page's cue (deterministic ordering).
+# The harness page (default demo/play-mmtp.html; override via HARNESS=) loads
+# the MMTP stream into an MSE pipeline (hand-rolled or production Player.load)
+# and POSTs {status, bufferedSeconds, currentTime} to the control server
+# (.planning/m4-t1.7-e2e/serve.py), which replays the capture into the publisher
+# on the page's cue — with optional adversarial shaping (start=mid-GOP join,
+# drop=frame loss, reorder=out-of-order) selected via the Player.load harness
+# query string. PASS = MSE buffered >0s and the video advanced past t=0.
 #
 # Env knobs:
 #   SHAKA_ROOT   shaka-player repo (default ../shaka-player rel to moq-rs)
