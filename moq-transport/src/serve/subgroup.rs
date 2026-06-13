@@ -153,15 +153,23 @@ impl SubgroupsWriter {
         };
         let (writer, reader) = subgroup.produce();
 
-        // Append unconditionally — every subgroup is retained and delivered, in
-        // creation order. (The old latest-wins logic dropped all but the newest
-        // subgroup of a group, which is incompatible with Mapping B's
-        // subgroup-per-MFU.) MoQ permits subgroups in any order; the subscriber
-        // reorders by (group, subgroup, object) ids. NOTE: this no longer returns
-        // ServeError::Duplicate on a repeated (group_id, subgroup_id) — uniqueness
-        // is now the caller's responsibility (the MMTP publisher guarantees it:
-        // Init=0, MFUs monotonic from next_mfu_subgroup_id).
+        // Retain and deliver every subgroup in creation order. (The old
+        // latest-wins logic dropped all but the newest subgroup of a group, which
+        // is incompatible with Mapping B's subgroup-per-MFU.) MoQ permits
+        // subgroups in any order; the subscriber reorders by (group, subgroup,
+        // object) ids. Deliver-all and uniqueness are orthogonal: a repeated
+        // (group_id, subgroup_id) among retained subgroups is still rejected so
+        // readers never receive two entries with the same ordering key. (Pruned
+        // tuples are gone from delivery, so a monotonic publisher (A2) can't
+        // collide.)
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        if state
+            .subgroups
+            .iter()
+            .any(|r| r.group_id == writer.group_id && r.subgroup_id == writer.subgroup_id)
+        {
+            return Err(ServeError::Duplicate);
+        }
         self.next_subgroup_id = writer.subgroup_id + 1;
         self.next_group_id = writer.group_id + 1;
         self.last_group_id = writer.group_id;
@@ -740,6 +748,32 @@ mod tests {
             got,
             vec![(0, 0), (0, 1)],
             "both subgroups of group 0 must be delivered (latest-wins drops subgroup 0)"
+        );
+    }
+
+    // Deliver-all retains every subgroup, so a repeated (group_id, subgroup_id)
+    // among retained subgroups would hand readers two entries with the same
+    // ordering key. create() must reject the duplicate (shared-library invariant
+    // — the API must not trust arbitrary callers, even though today's only caller,
+    // the MMTP publisher, guarantees uniqueness).
+    #[tokio::test]
+    async fn create_rejects_duplicate_group_subgroup() {
+        let (mut writer, _reader) = Subgroups { track: track() }.produce();
+        let _first = writer
+            .create(Subgroup {
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        let dup = writer.create(Subgroup {
+            group_id: 0,
+            subgroup_id: 0,
+            priority: 0,
+        });
+        assert!(
+            matches!(dup, Err(ServeError::Duplicate)),
+            "repeated (group,subgroup) among retained subgroups must return ServeError::Duplicate"
         );
     }
 
