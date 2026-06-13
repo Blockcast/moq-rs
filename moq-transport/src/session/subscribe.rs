@@ -121,7 +121,6 @@ impl Subscribe {
         let recv = SubscribeRecv {
             state: recv,
             writer: Some(track.into()),
-            history_window_groups: None,
         };
 
         (send, recv)
@@ -181,16 +180,28 @@ impl ops::Deref for Subscribe {
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
     writer: Option<TrackWriterMode>,
-    /// Per-track subgroup history window advertised by the publisher in
-    /// SUBSCRIBE_OK (BLO-10339). Applied to the local mirror writer in
-    /// `subgroup()` so the relay's cache retains the publisher's window
-    /// instead of growing unbounded. `None` = unbounded (status quo).
-    history_window_groups: Option<u64>,
 }
 
 impl SubscribeRecv {
     pub fn ok(&mut self, alias: u64, history_window_groups: Option<u64>) -> Result<(), ServeError> {
-        self.history_window_groups = history_window_groups;
+        // Apply the publisher's subgroup history window (BLO-10339) to the local
+        // mirror's Track. Setting it on the shared TrackState both bounds the
+        // mirror (TrackWriter::subgroups() inherits it) AND makes the
+        // downstream-facing TrackReader::history_window() expose it, so a relay
+        // re-serving this track re-advertises the window in its own SUBSCRIBE_OK
+        // (serve_inner reads TrackReader::history_window). The window thus
+        // propagates transitively across relay hops (BLO-10419). The writer is
+        // still in Track mode here: SUBSCRIBE_OK precedes any subgroup stream
+        // (subscribed.rs sends it via send_message_and_wait).
+        if let Some(window) = history_window_groups {
+            match self.writer.as_mut() {
+                Some(TrackWriterMode::Track(track)) => track.set_history_window(window)?,
+                Some(TrackWriterMode::Subgroups(subgroups)) => {
+                    subgroups.set_history_window(window)?
+                }
+                _ => {}
+            }
+        }
 
         let state = self.state.lock();
         if state.ok {
@@ -232,17 +243,9 @@ impl SubscribeRecv {
 
         let mut subgroups = match writer {
             // TODO SLG - understand why both of these are needed, clock demo won't run if I comment out TrackWriteMode::Track
-            TrackWriterMode::Track(track) => {
-                // First subgroup converts the local mirror Track -> Subgroups.
-                // Bound its retention to the publisher's window (BLO-10339),
-                // received via SUBSCRIBE_OK params. The Subgroups arm below
-                // already carries this window on subsequent subgroups.
-                let mut subgroups = track.subgroups()?;
-                if let Some(window) = self.history_window_groups {
-                    subgroups.set_history_window(window)?;
-                }
-                subgroups
-            }
+            // The local mirror Track carries the publisher's history window (set
+            // in ok(), BLO-10339); subgroups() inherits it to bound retention.
+            TrackWriterMode::Track(track) => track.subgroups()?,
             TrackWriterMode::Subgroups(subgroups) => subgroups,
             _ => return Err(ServeError::Mode),
         };

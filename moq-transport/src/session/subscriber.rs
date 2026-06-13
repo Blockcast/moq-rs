@@ -832,7 +832,7 @@ mod tests {
     // BLO-10339: a SUBSCRIBE_OK carrying the subgroup-history-window param makes
     // the subscriber bound its local mirror. With window=1, group 0 is pruned
     // once group 1 arrives. Proves the relay path end-to-end: extract from the
-    // param → stash on SubscribeRecv → apply in subgroup().
+    // param → apply to the mirror Track in ok() → subgroups() inherits the window.
     #[tokio::test]
     async fn recv_subscribe_ok_applies_history_window_to_mirror() {
         let mut subscriber = subscriber();
@@ -902,5 +902,62 @@ mod tests {
             vec![(1, 0)],
             "window=1 from SUBSCRIBE_OK params applied to mirror → group 0 pruned"
         );
+    }
+
+    // BLO-10419: applying the window to the mirror Track (in ok()) also makes the
+    // downstream-facing TrackReader expose it. A relay re-serving this track reads
+    // TrackReader::history_window() in serve_inner to build its own SUBSCRIBE_OK,
+    // so the window propagates transitively across relay hops (relay → relay →
+    // player) instead of stopping at the first hop's mirror.
+    #[tokio::test]
+    async fn recv_subscribe_ok_readvertises_history_window_to_downstream() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        assert_eq!(
+            reader.history_window(),
+            None,
+            "no window before SUBSCRIBE_OK (unbounded, status quo)"
+        );
+
+        let subscribe = subscriber.subscribe_open(writer);
+        futures::pin_mut!(subscribe);
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+
+        let mut params = crate::coding::KeyValuePairs::new();
+        params.set_intvalue(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM, 4);
+
+        let mut receiver = observer.clone();
+        receiver
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 11,
+                expires: 0,
+                group_order: GroupOrder::Publisher,
+                content_exists: false,
+                largest_location: None,
+                params,
+            })
+            .unwrap();
+
+        // The mirror Track now carries the publisher's window on its shared
+        // TrackState, so the downstream-facing reader (which serve_inner would
+        // read to advertise) exposes it — proving transitive re-advertisement.
+        assert_eq!(
+            reader.history_window(),
+            Some(4),
+            "window from SUBSCRIBE_OK is visible on the downstream TrackReader"
+        );
+
+        // Resolve + drop the subscribe so Subscribe::drop runs cleanup; leaving a
+        // pending future dangling would skip remove_subscribe.
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(s)) => s,
+            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
+            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
+        };
+        drop(subscribe);
     }
 }
