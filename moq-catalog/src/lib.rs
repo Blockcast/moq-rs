@@ -338,6 +338,196 @@ mod tests {
     }
 
     #[test]
+    fn expand_common_fields_inherits_mmtp_mode() {
+        // mmtpMode set once in commonTrackFields is pushed down to a track that
+        // omits it — the twin of packaging inheritance (BLO-10312).
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"packaging": "mmtp", "mmtpMode": "mfu"},
+            "tracks": [
+                {"name":"v","selectionParams":{}}
+            ]
+        }"#;
+        let mut root: Root = serde_json::from_str(json).unwrap();
+        assert_eq!(root.tracks[0].mmtp_mode, None);
+        root.expand_common_fields();
+        assert_eq!(root.tracks[0].mmtp_mode, Some(MmtpMode::Mfu));
+        assert_eq!(root.tracks[0].packaging, Some(TrackPackaging::Mmtp));
+    }
+
+    #[test]
+    fn validate_accepts_track_inheriting_both_packaging_and_mmtp_mode() {
+        // The point of BLO-10312: a single-mode catalog declares packaging +
+        // mmtpMode once in common; the bare track validates on effective values.
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"packaging": "mmtp", "mmtpMode": "mpu"},
+            "tracks": [
+                {"name":"v","selectionParams":{}}
+            ]
+        }"#;
+        let root: Root = serde_json::from_str(json).unwrap();
+        root.validate()
+            .expect("track inheriting both packaging and mmtpMode from common is valid");
+    }
+
+    #[test]
+    fn from_tracks_keeps_heterogeneous_mmtp_mode() {
+        // A real catalog mixes modes (video=mpu, audio=mfu). from_tracks must not
+        // hoist mmtpMode to common (the values differ) and must leave each track's
+        // value intact — otherwise the field is lost and validate() would then
+        // reject the mmtp tracks for a missing mmtpMode.
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","selectionParams":{}},
+                {"name":"a","packaging":"mmtp","mmtpMode":"mfu","selectionParams":{}}
+            ]
+        }"#;
+        let mut root: Root = serde_json::from_str(json).unwrap();
+        let common = CommonTrackFields::from_tracks(&mut root.tracks);
+        assert_eq!(
+            common.mmtp_mode, None,
+            "differing mmtpMode must not be hoisted to common"
+        );
+        assert_eq!(
+            root.tracks[0].mmtp_mode,
+            Some(MmtpMode::Mpu),
+            "video keeps mpu"
+        );
+        assert_eq!(
+            root.tracks[1].mmtp_mode,
+            Some(MmtpMode::Mfu),
+            "audio keeps mfu"
+        );
+    }
+
+    #[test]
+    fn common_track_fields_round_trips_mmtp_mode() {
+        let common: CommonTrackFields =
+            serde_json::from_str(r#"{"packaging":"mmtp","mmtpMode":"mpu"}"#).unwrap();
+        assert_eq!(common.mmtp_mode, Some(MmtpMode::Mpu));
+        let back = serde_json::to_string(&common).unwrap();
+        assert!(back.contains(r#""mmtpMode":"mpu""#), "json = {back}");
+    }
+
+    #[test]
+    fn from_tracks_keeps_heterogeneous_packaging() {
+        // Sibling of from_tracks_keeps_heterogeneous_mmtp_mode. A catalog mixing
+        // packaging (video=mmtp, audio=cmaf) must not hoist packaging to common
+        // (the values differ) and must leave each track's value intact. Before the
+        // uniform `common.is_some()` strip guard, the per-track packaging was
+        // stripped anyway and silently lost — never restored by expand. The same
+        // guard now covers renderGroup/altGroup.
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","selectionParams":{}},
+                {"name":"a","packaging":"cmaf","selectionParams":{}}
+            ]
+        }"#;
+        let mut root: Root = serde_json::from_str(json).unwrap();
+        let common = CommonTrackFields::from_tracks(&mut root.tracks);
+        assert_eq!(
+            common.packaging, None,
+            "differing packaging must not be hoisted to common"
+        );
+        assert_eq!(
+            root.tracks[0].packaging,
+            Some(TrackPackaging::Mmtp),
+            "video keeps mmtp"
+        );
+        assert_eq!(
+            root.tracks[1].packaging,
+            Some(TrackPackaging::Cmaf),
+            "audio keeps cmaf"
+        );
+    }
+
+    #[test]
+    fn expand_common_fields_does_not_override_track_mmtp_mode() {
+        // Track-level mmtpMode wins over common: expand_common_fields must NOT
+        // clobber a track that declares its own value (the is_none() guard in
+        // with_common). common=mpu, one track=mfu → that track keeps mfu.
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"packaging": "mmtp", "mmtpMode": "mpu"},
+            "tracks": [
+                {"name":"v","selectionParams":{}},
+                {"name":"a","mmtpMode":"mfu","selectionParams":{}}
+            ]
+        }"#;
+        let mut root: Root = serde_json::from_str(json).unwrap();
+        root.expand_common_fields();
+        assert_eq!(
+            root.tracks[0].mmtp_mode,
+            Some(MmtpMode::Mpu),
+            "v inherits common mpu"
+        );
+        assert_eq!(
+            root.tracks[1].mmtp_mode,
+            Some(MmtpMode::Mfu),
+            "a keeps its own mfu (override wins over common)"
+        );
+    }
+
+    #[test]
+    fn from_tracks_then_expand_round_trips_mmtp_mode() {
+        // Homogeneous hoist → expand is lossless: from_tracks strips a shared
+        // mmtpMode into common (both tracks → None), and expand_common_fields
+        // restores it per-track. Exercises the strip branch + the round-trip the
+        // whole inheritance design relies on.
+        let json = r#"{
+            "version": 1,
+            "streamingFormat": 1,
+            "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","selectionParams":{}},
+                {"name":"a","packaging":"mmtp","mmtpMode":"mpu","selectionParams":{}}
+            ]
+        }"#;
+        let mut root: Root = serde_json::from_str(json).unwrap();
+        root.common_track_fields = CommonTrackFields::from_tracks(&mut root.tracks);
+        assert_eq!(
+            root.common_track_fields.mmtp_mode,
+            Some(MmtpMode::Mpu),
+            "shared mpu hoisted to common"
+        );
+        assert_eq!(root.tracks[0].mmtp_mode, None, "stripped from track v");
+        assert_eq!(root.tracks[1].mmtp_mode, None, "stripped from track a");
+        root.expand_common_fields();
+        assert_eq!(
+            root.tracks[0].mmtp_mode,
+            Some(MmtpMode::Mpu),
+            "restored on v"
+        );
+        assert_eq!(
+            root.tracks[1].mmtp_mode,
+            Some(MmtpMode::Mpu),
+            "restored on a"
+        );
+    }
+
+    #[test]
     fn validate_rejects_unknown_track_reference() {
         // multicast.endpoints[].tracks[] references "video" but no
         // catalog.tracks[] entry has that name. The receiver would
@@ -467,16 +657,22 @@ impl Root {
     /// guards (defense in depth); subscribers run it standalone.
     pub fn validate(&self) -> Result<(), CatalogValidationError> {
         // draft-ramadan-moq-mmt §12.1 requires mmtpMode for MMTP packaging.
-        // validate() runs before expand_common_fields(), so the effective
-        // packaging is the track's own field OR the commonTrackFields default
-        // (track-level wins) — a track inheriting `packaging: "mmtp"` from
-        // common still requires its own mmtpMode.
+        // validate() runs before expand_common_fields(), so both packaging and
+        // mmtpMode are taken as effective values (the track's own field OR the
+        // commonTrackFields default; track-level wins). A track may inherit
+        // either or both from common — the requirement is on the effective pair.
         for t in &self.tracks {
             let effective_packaging = t
                 .packaging
                 .as_ref()
                 .or(self.common_track_fields.packaging.as_ref());
-            if matches!(effective_packaging, Some(TrackPackaging::Mmtp)) && t.mmtp_mode.is_none() {
+            let effective_mmtp_mode = t
+                .mmtp_mode
+                .as_ref()
+                .or(self.common_track_fields.mmtp_mode.as_ref());
+            if matches!(effective_packaging, Some(TrackPackaging::Mmtp))
+                && effective_mmtp_mode.is_none()
+            {
                 return Err(CatalogValidationError::MissingMmtpMode {
                     track_name: t.name.clone(),
                 });
@@ -536,6 +732,9 @@ impl Track {
         }
         if self.packaging.is_none() {
             self.packaging.clone_from(&common.packaging);
+        }
+        if self.mmtp_mode.is_none() {
+            self.mmtp_mode.clone_from(&common.mmtp_mode);
         }
         if self.render_group.is_none() {
             self.render_group = common.render_group;
@@ -625,6 +824,14 @@ pub struct CommonTrackFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packaging: Option<TrackPackaging>,
 
+    /// MMTP packetization mode, inheritable per-catalog like `packaging`.
+    /// draft-ramadan-moq-mmt §12.1 marks `mmtpMode` REQUIRED per-track; setting
+    /// it here lets a single-mode catalog declare it once. `validate()` enforces
+    /// the requirement on the *effective* value (track OR common), and
+    /// `expand_common_fields()` pushes it down so consumers see it per-track.
+    #[serde(rename = "mmtpMode", skip_serializing_if = "Option::is_none")]
+    pub mmtp_mode: Option<MmtpMode>,
+
     #[serde(rename = "renderGroup", skip_serializing_if = "Option::is_none")]
     pub render_group: Option<u16>,
 
@@ -643,6 +850,7 @@ impl CommonTrackFields {
         let mut common = Self {
             namespace: tracks[0].namespace.clone(),
             packaging: tracks[0].packaging.clone(),
+            mmtp_mode: tracks[0].mmtp_mode.clone(),
             render_group: tracks[0].render_group,
             alt_group: tracks[0].alt_group,
         };
@@ -655,6 +863,9 @@ impl CommonTrackFields {
             if track.packaging != common.packaging {
                 common.packaging = None;
             }
+            if track.mmtp_mode != common.mmtp_mode {
+                common.mmtp_mode = None;
+            }
             if track.render_group != common.render_group {
                 common.render_group = None
             }
@@ -663,18 +874,27 @@ impl CommonTrackFields {
             }
         }
 
-        // Loop again to remove the common fields from the tracks
+        // Loop again to remove the common fields from the tracks. Strip a field
+        // only when it was actually hoisted to common (`common.<field>.is_some()`).
+        // For a heterogeneous catalog the disagreeing field stays None in common
+        // (set above), so each track keeps its own value instead of losing it —
+        // e.g. video=mpu/audio=mfu mmtpMode, or video=mmtp/audio=cmaf packaging.
+        // expand_common_fields() is the exact inverse: it only pushes down values
+        // that are Some in common.
         for track in tracks {
             if common.namespace.is_some() {
                 track.namespace = None;
             }
-            if track.packaging.is_some() {
+            if common.packaging.is_some() {
                 track.packaging = None;
             }
-            if track.render_group.is_some() {
+            if common.mmtp_mode.is_some() {
+                track.mmtp_mode = None;
+            }
+            if common.render_group.is_some() {
                 track.render_group = None;
             }
-            if track.alt_group.is_some() {
+            if common.alt_group.is_some() {
                 track.alt_group = None;
             }
         }
