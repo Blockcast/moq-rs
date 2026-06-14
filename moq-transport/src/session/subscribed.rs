@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use crate::coding::{Encode, Location, ReasonPhrase};
+use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase, SUBGROUP_HISTORY_GROUPS_PARAM};
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
@@ -103,6 +103,14 @@ impl Subscribed {
             .ok_or(ServeError::Cancel)?
             .largest_location = largest_location;
 
+        // Advertise the per-track subgroup history window (BLO-10339) when the
+        // publisher set one, so a subscribing relay can bound its mirror's
+        // retention to ours rather than retaining unbounded. Omitted when None.
+        let mut params = KeyValuePairs::new();
+        if let Some(window) = track.history_window() {
+            params.set_intvalue(SUBGROUP_HISTORY_GROUPS_PARAM, window.get());
+        }
+
         // Send SubscribeOk using send_message_and_wait to ensure it is sent at least to the QUIC stack before
         // we start serving the track.  If a subscriber gets the stream before SubscribeOk
         // then they won't recognize the track_alias in the stream header.
@@ -114,7 +122,7 @@ impl Subscribed {
                 group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
                 content_exists: largest_location.is_some(),
                 largest_location,
-                params: Default::default(),
+                params,
             })
             .await;
 

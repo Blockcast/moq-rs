@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::ops;
+use std::{num::NonZeroU64, ops};
 
 use crate::{
     coding::{KeyValuePairs, Location, TrackNamespace},
@@ -183,15 +183,64 @@ pub(super) struct SubscribeRecv {
 }
 
 impl SubscribeRecv {
-    pub fn ok(&mut self, alias: u64) -> Result<(), ServeError> {
-        let state = self.state.lock();
-        if state.ok {
-            return Err(ServeError::Duplicate);
+    pub fn ok(
+        &mut self,
+        alias: u64,
+        history_window_groups: Option<NonZeroU64>,
+    ) -> Result<(), ServeError> {
+        // Acknowledge first: reject a duplicate OK and record the alias. The
+        // history window is applied AFTER, best-effort — it is an advisory
+        // retention optimization (BLO-10339/10419), so a failure to apply it
+        // must not fail an otherwise-valid subscription (and must not route into
+        // the session-level Serve-error swallow that would leave it un-acked).
+        {
+            let state = self.state.lock();
+            if state.ok {
+                return Err(ServeError::Duplicate);
+            }
+
+            if let Some(mut state) = state.into_mut() {
+                state.ok = true;
+                state.track_alias = Some(alias);
+            }
         }
 
-        if let Some(mut state) = state.into_mut() {
-            state.ok = true;
-            state.track_alias = Some(alias);
+        // Apply the publisher's subgroup history window to the local mirror's
+        // Track. Setting it on the shared TrackState both bounds the mirror
+        // (TrackWriter::subgroups() inherits it) AND makes the downstream-facing
+        // TrackReader::history_window() expose it, so a relay re-serving this
+        // track re-advertises the window in its own SUBSCRIBE_OK (serve_inner
+        // reads TrackReader::history_window). The window thus propagates
+        // transitively across relay hops (BLO-10419). The writer is still in
+        // Track mode here: SUBSCRIBE_OK precedes any subgroup stream
+        // (subscribed.rs sends it via send_message_and_wait).
+        if let Some(window) = history_window_groups {
+            match self.writer.as_mut() {
+                Some(TrackWriterMode::Track(track)) => {
+                    if let Err(err) = track.set_history_window(window) {
+                        tracing::warn!(
+                            ?err,
+                            "subgroup history window not applied to mirror track; retention unbounded"
+                        );
+                    }
+                }
+                Some(TrackWriterMode::Subgroups(subgroups)) => {
+                    if let Err(err) = subgroups.set_history_window(window.get()) {
+                        tracing::warn!(
+                            ?err,
+                            "subgroup history window not applied to mirror subgroups; retention unbounded"
+                        );
+                    }
+                }
+                // Datagram tracks carry no subgroups, so there is no retention
+                // window to bound. Any other mode would mean SUBSCRIBE_OK arrived
+                // after the writer was converted/taken — unreachable today (OK
+                // precedes stream data); logged so a future ordering regression
+                // surfaces instead of silently dropping the window.
+                _ => tracing::debug!(
+                    "subgroup history window ignored: mirror writer not in Track/Subgroups mode"
+                ),
+            }
         }
 
         Ok(())
@@ -224,6 +273,8 @@ impl SubscribeRecv {
 
         let mut subgroups = match writer {
             // TODO SLG - understand why both of these are needed, clock demo won't run if I comment out TrackWriteMode::Track
+            // The local mirror Track carries the publisher's history window (set
+            // in ok(), BLO-10339); subgroups() inherits it to bound retention.
             TrackWriterMode::Track(track) => track.subgroups()?,
             TrackWriterMode::Subgroups(subgroups) => subgroups,
             _ => return Err(ServeError::Mode),
