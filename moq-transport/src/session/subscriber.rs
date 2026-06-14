@@ -5,6 +5,7 @@
 use std::{
     collections::{hash_map, HashMap},
     io,
+    num::NonZeroU64,
     sync::{atomic, Arc, Mutex},
     time::Duration,
 };
@@ -236,8 +237,20 @@ impl Subscriber {
             // Notify waiting tasks that the alias map has been updated
             self.subscribe_alias_notify.notify_waiters();
 
+            // Extract the publisher's per-track subgroup history window
+            // (BLO-10339), if advertised, so the local mirror bounds its
+            // retention. Absent / malformed (0) → None = unbounded (status quo).
+            let history_window = msg
+                .params
+                .get(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM)
+                .and_then(|kvp| match &kvp.value {
+                    crate::coding::Value::IntValue(v) => Some(*v),
+                    _ => None,
+                })
+                .and_then(NonZeroU64::new);
+
             // Notify the subscribe of the successful subscription
-            subscribe.ok(msg.track_alias)?;
+            subscribe.ok(msg.track_alias, history_window)?;
         }
 
         Ok(())
@@ -815,5 +828,222 @@ mod tests {
 
         assert!(observer.subscribes.lock().unwrap().is_empty());
         assert!(observer.subscribe_alias_map.lock().unwrap().is_empty());
+    }
+
+    // BLO-10339: a SUBSCRIBE_OK carrying the subgroup-history-window param makes
+    // the subscriber bound its local mirror. With window=1, group 0 is pruned
+    // once group 1 arrives. Proves the relay path end-to-end: extract from the
+    // param → apply to the mirror Track in ok() → subgroups() inherits the window.
+    #[tokio::test]
+    async fn recv_subscribe_ok_applies_history_window_to_mirror() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        let subscribe = subscriber.subscribe_open(writer);
+        futures::pin_mut!(subscribe);
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+
+        let mut params = crate::coding::KeyValuePairs::new();
+        params.set_intvalue(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM, 1);
+
+        let mut receiver = observer.clone();
+        receiver
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 10,
+                expires: 0,
+                group_order: GroupOrder::Publisher,
+                content_exists: false,
+                largest_location: None,
+                params,
+            })
+            .unwrap();
+
+        // Resolve the subscribe future so dropping it later runs Subscribe::drop
+        // → remove_subscribe, which closes the mirror writer (EOF). Dropping the
+        // still-pending future would NOT run that cleanup, hanging next().
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(s)) => s,
+            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
+            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
+        };
+
+        // Drive two groups through the mirror writer held in the SubscribeRecv.
+        {
+            let mut guard = observer.subscribes.lock().unwrap();
+            let recv = guard.get_mut(&0).expect("subscribe recv present");
+            for g in 0..=1u64 {
+                recv.subgroup(crate::data::SubgroupHeader {
+                    header_type: crate::data::StreamHeaderType::SubgroupIdExt,
+                    track_alias: 10,
+                    group_id: g,
+                    subgroup_id: Some(0),
+                    publisher_priority: 0,
+                })
+                .expect("subgroup create");
+            }
+        }
+
+        // Dropping the resolved Subscribe removes + drops the SubscribeRecv and
+        // its mirror writer, so the reader sees EOF after the retained subgroups.
+        drop(subscribe);
+
+        let mut sg_reader = match reader.mode().await.expect("mode") {
+            crate::serve::TrackReaderMode::Subgroups(r) => r,
+            _ => panic!("expected subgroups mode"),
+        };
+        let mut got = Vec::new();
+        while let Some(s) = sg_reader.next().await.unwrap() {
+            got.push((s.group_id, s.subgroup_id));
+        }
+        assert_eq!(
+            got,
+            vec![(1, 0)],
+            "window=1 from SUBSCRIBE_OK params applied to mirror → group 0 pruned"
+        );
+    }
+
+    // BLO-10419: applying the window to the mirror Track (in ok()) also makes the
+    // downstream-facing TrackReader expose it. A relay re-serving this track reads
+    // TrackReader::history_window() in serve_inner to build its own SUBSCRIBE_OK,
+    // so the window propagates transitively across relay hops (relay → relay →
+    // player) instead of stopping at the first hop's mirror.
+    #[tokio::test]
+    async fn recv_subscribe_ok_readvertises_history_window_to_downstream() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        assert_eq!(
+            reader.history_window(),
+            None,
+            "no window before SUBSCRIBE_OK (unbounded, status quo)"
+        );
+
+        let subscribe = subscriber.subscribe_open(writer);
+        futures::pin_mut!(subscribe);
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+
+        let mut params = crate::coding::KeyValuePairs::new();
+        params.set_intvalue(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM, 4);
+
+        let mut receiver = observer.clone();
+        receiver
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 11,
+                expires: 0,
+                group_order: GroupOrder::Publisher,
+                content_exists: false,
+                largest_location: None,
+                params,
+            })
+            .unwrap();
+
+        // The mirror Track now carries the publisher's window on its shared
+        // TrackState, so the downstream-facing reader (which serve_inner would
+        // read to advertise) exposes it — proving transitive re-advertisement.
+        assert_eq!(
+            reader.history_window(),
+            NonZeroU64::new(4),
+            "window from SUBSCRIBE_OK is visible on the downstream TrackReader"
+        );
+
+        // Resolve + drop the subscribe so Subscribe::drop runs cleanup; leaving a
+        // pending future dangling would skip remove_subscribe.
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(s)) => s,
+            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
+            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
+        };
+        drop(subscribe);
+    }
+
+    // BLO-10339: a wire window of 0 is malformed (the publisher only sets >= 1).
+    // The subscriber must treat it as "no window" (None = unbounded, status quo),
+    // NOT propagate 0 inward and tear the subscription down. Guards the
+    // NonZeroU64::new extraction in recv_subscribe_ok.
+    #[tokio::test]
+    async fn recv_subscribe_ok_zero_window_is_unbounded() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        let subscribe = subscriber.subscribe_open(writer);
+        futures::pin_mut!(subscribe);
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+
+        let mut params = crate::coding::KeyValuePairs::new();
+        params.set_intvalue(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM, 0);
+
+        let mut receiver = observer.clone();
+        receiver
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 12,
+                expires: 0,
+                group_order: GroupOrder::Publisher,
+                content_exists: false,
+                largest_location: None,
+                params,
+            })
+            .expect("window=0 must not fail the subscribe");
+
+        assert_eq!(
+            reader.history_window(),
+            None,
+            "window=0 → None (unbounded), subscription intact"
+        );
+
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(s)) => s,
+            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
+            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
+        };
+        drop(subscribe);
+    }
+
+    // BLO-10339 backward-compat: a SUBSCRIBE_OK with NO history param leaves the
+    // mirror unbounded (None) — old publishers behave exactly as before.
+    #[tokio::test]
+    async fn recv_subscribe_ok_absent_window_is_unbounded() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+
+        let subscribe = subscriber.subscribe_open(writer);
+        futures::pin_mut!(subscribe);
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+
+        let mut receiver = observer.clone();
+        receiver
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: 0,
+                track_alias: 13,
+                expires: 0,
+                group_order: GroupOrder::Publisher,
+                content_exists: false,
+                largest_location: None,
+                params: crate::coding::KeyValuePairs::new(),
+            })
+            .expect("absent window must not fail the subscribe");
+
+        assert_eq!(
+            reader.history_window(),
+            None,
+            "no param → None (unbounded), status quo"
+        );
+
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(s)) => s,
+            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
+            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
+        };
+        drop(subscribe);
     }
 }

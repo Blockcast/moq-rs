@@ -4,6 +4,17 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use std::fmt;
 
+/// Control-message parameter key (Blockcast extension, BLO-10339): per-track
+/// subgroup history window, in group count. Carried as an `IntValue(u64)` (>= 1)
+/// in the SUBSCRIBE_OK `params`, letting a subscriber/relay bound its mirror's
+/// subgroup retention to the publisher's window without parsing the catalog.
+///
+/// Must be EVEN — even keys encode as `IntValue` VarInt, odd as bytes (see the
+/// `KeyValuePair` Encode/Decode below). 0x40 is an arbitrary even key squatted
+/// for this fork; it sits in the IETF-assignable range, so if MoQ later
+/// standardizes a SUBSCRIBE_OK parameter at key 64, revisit.
+pub const SUBGROUP_HISTORY_GROUPS_PARAM: u64 = 0x40;
+
 #[derive(Clone, Eq, PartialEq)]
 pub enum Value {
     IntValue(u64),
@@ -273,5 +284,28 @@ mod tests {
         assert_eq!(3, buf_vec[0]); // 3 KeyValuePairs
         let decoded = KeyValuePairs::decode(&mut buf).unwrap();
         assert_eq!(decoded, kvps);
+    }
+
+    // BLO-10339: the subgroup-history-window key is even, so it encodes as an
+    // IntValue VarInt and round-trips through KeyValuePairs.
+    #[test]
+    fn subgroup_history_groups_param_round_trips() {
+        assert_eq!(
+            SUBGROUP_HISTORY_GROUPS_PARAM % 2,
+            0,
+            "key must be even (IntValue)"
+        );
+
+        let mut kvps = KeyValuePairs::new();
+        kvps.set_intvalue(SUBGROUP_HISTORY_GROUPS_PARAM, 5);
+
+        let mut buf = BytesMut::new();
+        kvps.encode(&mut buf).unwrap();
+        let decoded = KeyValuePairs::decode(&mut buf).unwrap();
+        assert_eq!(decoded, kvps);
+        assert!(matches!(
+            decoded.get(SUBGROUP_HISTORY_GROUPS_PARAM).map(|k| &k.value),
+            Some(Value::IntValue(5))
+        ));
     }
 }
