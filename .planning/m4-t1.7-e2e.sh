@@ -52,7 +52,7 @@ cat > "$WORK/catalog.json" <<EOF
 {
   "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2", "supportsDeltaUpdates": true,
   "commonTrackFields": {"namespace": "$NAME"},
-  "tracks": [{"name": "v", "packaging": "mmtp", "framerate": 15, "selectionParams": {"codec": "avc1.42c01e"}}],
+  "tracks": [{"name": "v", "packaging": "mmtp", "mmtpMode": "mfu", "timescale": 90000, "groupDurationMs": 1000, "framerate": 15, "selectionParams": {"codec": "avc1.42c01e"}}],
   "multicast": {
     "subgroupHistoryGroups": 8,
     "endpoints": [{"groupAddress": "239.1.1.1", "port": 5000, "tracks": [{"name": "v", "packetId": 1}]}]

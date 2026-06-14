@@ -56,6 +56,40 @@ pub struct Track {
     #[serde(rename = "mmtpMode", skip_serializing_if = "Option::is_none")]
     pub mmtp_mode: Option<MmtpMode>,
 
+    /// Media timescale in Hz (§4.4.2). REQUIRED for mmtp tracks — the catalog
+    /// does not infer it. Inheritable via commonTrackFields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timescale: Option<u32>,
+
+    /// Group (GOP) duration in integer milliseconds (§4.4.2). REQUIRED for mmtp
+    /// tracks unless `groupDurationTicks` is given; must satisfy
+    /// `(groupDurationMs * timescale) % 1000 == 0`. Inheritable.
+    #[serde(rename = "groupDurationMs", skip_serializing_if = "Option::is_none")]
+    pub group_duration_ms: Option<u32>,
+
+    /// Exact group duration in timescale ticks (§4.4.2). Optional override used
+    /// when the integer-millisecond form cannot be exact; wins over
+    /// `groupDurationMs` when both are present. Inheritable.
+    #[serde(rename = "groupDurationTicks", skip_serializing_if = "Option::is_none")]
+    pub group_duration_ticks: Option<u64>,
+
+    /// MPU metadata delivery mode (§4.5); effective default is `inline`.
+    /// Inheritable.
+    #[serde(rename = "initMode", skip_serializing_if = "Option::is_none")]
+    pub init_mode: Option<InitMode>,
+
+    /// Per-track AL-FEC descriptor (§8.3 / moq-fec §5.1). When present, its
+    /// `repairTrack` must name a catalog track with `fec-repair` packaging.
+    /// Per-track; not inherited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fec: Option<FecDescriptor>,
+
+    /// MoQ delivery priority (base catalog field). Repair tracks SHOULD use a
+    /// lower priority (e.g. 7) so repair data is dropped first under congestion
+    /// (moq-fec §6.1). Per-track; not inherited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+
     #[serde(rename = "renderGroup", skip_serializing_if = "Option::is_none")]
     pub render_group: Option<u16>,
 
@@ -261,7 +295,7 @@ mod tests {
             "supportsDeltaUpdates": true,
             "commonTrackFields": {},
             "tracks": [
-                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","selectionParams":{}},
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"groupDurationMs":1000,"selectionParams":{}},
                 {"name":"v/repair","packaging":"fec-repair","selectionParams":{}}
             ]
         }"#;
@@ -329,7 +363,7 @@ mod tests {
             "supportsDeltaUpdates": true,
             "commonTrackFields": {"packaging": "mmtp"},
             "tracks": [
-                {"name":"v","mmtpMode":"mpu","selectionParams":{}}
+                {"name":"v","mmtpMode":"mpu","timescale":90000,"groupDurationMs":1000,"selectionParams":{}}
             ]
         }"#;
         let root: Root = serde_json::from_str(json).unwrap();
@@ -367,7 +401,7 @@ mod tests {
             "streamingFormat": 1,
             "streamingFormatVersion": "0.2",
             "supportsDeltaUpdates": true,
-            "commonTrackFields": {"packaging": "mmtp", "mmtpMode": "mpu"},
+            "commonTrackFields": {"packaging": "mmtp", "mmtpMode": "mpu", "timescale": 90000, "groupDurationMs": 1000},
             "tracks": [
                 {"name":"v","selectionParams":{}}
             ]
@@ -596,6 +630,274 @@ mod tests {
             "expected DuplicatePacketId, got: {err:?}"
         );
     }
+
+    #[test]
+    fn init_mode_defaults_to_inline() {
+        assert_eq!(InitMode::default(), InitMode::Inline);
+    }
+
+    #[test]
+    fn track_round_trips_full_mmt_fields() {
+        let json = r#"{
+            "name":"v","packaging":"mmtp","mmtpMode":"mfu",
+            "timescale":90000,"groupDurationMs":2000,"groupDurationTicks":180000,
+            "initMode":"track","priority":3,
+            "fec":{"algorithm":"raptorq","sourceSymbols":32,"repairSymbols":8,
+                   "interleaveDepth":30,"symbolSize":1312,"repairTrack":"v/repair"},
+            "selectionParams":{"codec":"avc1.42c01e"}
+        }"#;
+        let t: Track = serde_json::from_str(json).unwrap();
+        assert_eq!(t.timescale, Some(90000));
+        assert_eq!(t.group_duration_ms, Some(2000));
+        assert_eq!(t.group_duration_ticks, Some(180000));
+        assert_eq!(t.init_mode, Some(InitMode::Track));
+        assert_eq!(t.priority, Some(3));
+        let fec = t.fec.as_ref().expect("fec present");
+        assert_eq!(fec.algorithm, FecAlgorithm::RaptorQ);
+        assert_eq!(fec.source_symbols, 32);
+        assert_eq!(fec.repair_symbols, 8);
+        assert_eq!(fec.symbol_size, 1312);
+        assert_eq!(fec.interleave_depth, Some(30));
+        assert_eq!(fec.repair_track, "v/repair");
+        // Round-trips back to the camelCase wire form.
+        let back = serde_json::to_string(&t).unwrap();
+        assert!(
+            back.contains(r#""groupDurationTicks":180000"#),
+            "json = {back}"
+        );
+        assert!(
+            back.contains(r#""repairTrack":"v/repair""#),
+            "json = {back}"
+        );
+    }
+
+    #[test]
+    fn expand_common_fields_inherits_new_mmt_fields() {
+        // timescale + groupDurationMs + initMode declared once in common are
+        // pushed down to a bare track (BLO-10313, same pattern as mmtpMode).
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"timescale": 48000, "groupDurationMs": 500, "initMode": "track"},
+            "tracks": [{"name":"a","selectionParams":{}}]
+        }"#;
+        let mut root: Root = serde_json::from_str(json).unwrap();
+        root.expand_common_fields();
+        assert_eq!(root.tracks[0].timescale, Some(48000));
+        assert_eq!(root.tracks[0].group_duration_ms, Some(500));
+        assert_eq!(root.tracks[0].init_mode, Some(InitMode::Track));
+    }
+
+    #[test]
+    fn validate_rejects_mmtp_without_timescale() {
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"v","packaging":"mmtp","mmtpMode":"mpu","groupDurationMs":1000,"selectionParams":{}}]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("mmtp requires timescale");
+        assert!(
+            matches!(&err, CatalogValidationError::MissingTimescale { track_name } if track_name == "v"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_mmtp_without_group_duration() {
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"selectionParams":{}}]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("mmtp requires a group duration");
+        assert!(
+            matches!(&err, CatalogValidationError::MissingGroupDuration { track_name } if track_name == "v"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_inexact_group_duration() {
+        // 333ms * 44100Hz = 14_685_300 ticks → not a whole-ms tick count.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"a","packaging":"mmtp","mmtpMode":"mfu","timescale":44100,"groupDurationMs":333,"selectionParams":{}}]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("inexact groupDurationMs must be rejected");
+        assert!(
+            matches!(&err, CatalogValidationError::GroupDurationNotExact { track_name, .. } if track_name == "a"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_inexact_group_duration_with_ticks_override() {
+        // Same inexact ms, but an explicit groupDurationTicks override is valid.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"a","packaging":"mmtp","mmtpMode":"mfu","timescale":44100,"groupDurationMs":333,"groupDurationTicks":14700,"selectionParams":{}}]
+        }"#;
+        serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect("ticks override bypasses the ms exactness rule");
+    }
+
+    #[test]
+    fn validate_accepts_fec_with_valid_repair_track() {
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"groupDurationMs":1000,
+                 "fec":{"algorithm":"raptorq","sourceSymbols":32,"repairSymbols":8,"symbolSize":1312,"repairTrack":"v/repair"},
+                 "selectionParams":{}},
+                {"name":"v/repair","packaging":"fec-repair","selectionParams":{}}
+            ]
+        }"#;
+        serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect("fec referencing a fec-repair track is valid");
+    }
+
+    #[test]
+    fn validate_rejects_fec_with_dangling_repair_track() {
+        // repairTrack names a track that is not present / not fec-repair.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"groupDurationMs":1000,
+                 "fec":{"algorithm":"raptorq","sourceSymbols":32,"repairSymbols":8,"symbolSize":1312,"repairTrack":"v/missing"},
+                 "selectionParams":{}}
+            ]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("dangling fec.repairTrack must be rejected");
+        assert!(
+            matches!(&err, CatalogValidationError::UnknownRepairTrack { repair_track, .. } if repair_track == "v/missing"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_timescale() {
+        // A zero timescale is bad init: tick math is undefined and (ms × 0) % 1000
+        // is always 0, which would silently neutralize the exactness check.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":0,"groupDurationMs":1000,"selectionParams":{}}]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("timescale 0 must be rejected");
+        assert!(
+            matches!(&err, CatalogValidationError::ZeroTimescale { track_name } if track_name == "v"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_group_duration() {
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"groupDurationMs":0,"selectionParams":{}}]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("zero groupDurationMs must be rejected");
+        assert!(
+            matches!(&err, CatalogValidationError::ZeroGroupDuration { track_name } if track_name == "v"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_fec_zero_symbols() {
+        // An active FEC scheme with zero repair symbols repairs nothing, and a
+        // multicast receiver has no back channel to renegotiate — reject it.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"groupDurationMs":1000,
+                 "fec":{"algorithm":"raptorq","sourceSymbols":32,"repairSymbols":0,"symbolSize":1312,"repairTrack":"v/repair"},
+                 "selectionParams":{}},
+                {"name":"v/repair","packaging":"fec-repair","selectionParams":{}}
+            ]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("zero repairSymbols on an active scheme must be rejected");
+        assert!(
+            matches!(&err, CatalogValidationError::InvalidFecParams { track_name, .. } if track_name == "v"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_tracks_keeps_heterogeneous_timescale() {
+        // Sibling of from_tracks_keeps_heterogeneous_mmtp_mode for the §4.4.2
+        // fields: tracks disagree on timescale → not hoisted, each kept (the
+        // uniform common.is_some() strip guard, BLO-10446).
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [
+                {"name":"v","timescale":90000,"selectionParams":{}},
+                {"name":"a","timescale":48000,"selectionParams":{}}
+            ]
+        }"#;
+        let mut root: Root = serde_json::from_str(json).unwrap();
+        let common = CommonTrackFields::from_tracks(&mut root.tracks);
+        assert_eq!(
+            common.timescale, None,
+            "differing timescale must not be hoisted"
+        );
+        assert_eq!(root.tracks[0].timescale, Some(90000), "video keeps 90000");
+        assert_eq!(root.tracks[1].timescale, Some(48000), "audio keeps 48000");
+    }
+
+    #[test]
+    fn validate_accepts_fec_with_inherited_repair_packaging() {
+        // The repair track's `fec-repair` packaging is inherited from common; the
+        // fec check uses effective packaging, so this must validate (covers the
+        // .or(common) arm on the accept path).
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"packaging": "fec-repair"},
+            "tracks": [
+                {"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"groupDurationMs":1000,
+                 "fec":{"algorithm":"raptorq","sourceSymbols":32,"repairSymbols":8,"symbolSize":1312,"repairTrack":"v/repair"},
+                 "selectionParams":{}},
+                {"name":"v/repair","selectionParams":{}}
+            ]
+        }"#;
+        serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect("repair track inheriting fec-repair packaging from common is valid");
+    }
 }
 
 /// Library-level validation errors raised by `Root::validate`.
@@ -620,6 +922,35 @@ pub enum CatalogValidationError {
     /// A `tracks[]` entry declares MMTP packaging without the required
     /// `mmtpMode` signal.
     MissingMmtpMode { track_name: String },
+    /// An MMTP track has no effective `timescale` (§4.4.2 requires one;
+    /// the catalog never infers it).
+    MissingTimescale { track_name: String },
+    /// An MMTP track has neither `groupDurationMs` nor `groupDurationTicks`
+    /// (§4.4.2 requires a group duration).
+    MissingGroupDuration { track_name: String },
+    /// `groupDurationMs * timescale` is not a whole number of ticks and no
+    /// `groupDurationTicks` override is given (§4.4.2 exactness).
+    GroupDurationNotExact {
+        track_name: String,
+        group_duration_ms: u32,
+        timescale: u32,
+    },
+    /// A track's `fec.repairTrack` does not name a catalog track whose
+    /// effective packaging is `fec-repair` (moq-fec §5.1).
+    UnknownRepairTrack {
+        track_name: String,
+        repair_track: String,
+    },
+    /// An MMTP track declares `timescale: 0` — bad init; the §4.4.2 tick math is
+    /// undefined and would silently neutralize the exactness check.
+    ZeroTimescale { track_name: String },
+    /// An MMTP track declares a zero `groupDurationMs` or `groupDurationTicks`
+    /// (a zero-length group is bad init; §4.4.2).
+    ZeroGroupDuration { track_name: String },
+    /// A track's `fec` descriptor has a degenerate parameter for an active scheme
+    /// (zero source/repair symbols or symbol size; moq-fec §5.1). FEC params are
+    /// out-of-band for multicast, so a degenerate descriptor silently fails recovery.
+    InvalidFecParams { track_name: String, reason: String },
 }
 
 impl std::fmt::Display for CatalogValidationError {
@@ -641,6 +972,42 @@ impl std::fmt::Display for CatalogValidationError {
             Self::MissingMmtpMode { track_name } => write!(
                 f,
                 "catalog.tracks[] entry `{track_name}` has packaging=mmtp but no required mmtpMode"
+            ),
+            Self::MissingTimescale { track_name } => write!(
+                f,
+                "catalog.tracks[] entry `{track_name}` has packaging=mmtp but no required timescale (draft-ramadan-moq-mmt §4.4.2)"
+            ),
+            Self::MissingGroupDuration { track_name } => write!(
+                f,
+                "catalog.tracks[] entry `{track_name}` has packaging=mmtp but no groupDurationMs or groupDurationTicks (§4.4.2)"
+            ),
+            Self::GroupDurationNotExact {
+                track_name,
+                group_duration_ms,
+                timescale,
+            } => write!(
+                f,
+                "catalog.tracks[] entry `{track_name}`: groupDurationMs {group_duration_ms} × timescale {timescale} \
+                 is not a whole number of ticks — supply groupDurationTicks (§4.4.2)"
+            ),
+            Self::UnknownRepairTrack {
+                track_name,
+                repair_track,
+            } => write!(
+                f,
+                "catalog.tracks[] entry `{track_name}` fec.repairTrack `{repair_track}` does not name a fec-repair track (moq-fec §5.1)"
+            ),
+            Self::ZeroTimescale { track_name } => write!(
+                f,
+                "catalog.tracks[] entry `{track_name}` has timescale 0 (§4.4.2 requires a positive timescale)"
+            ),
+            Self::ZeroGroupDuration { track_name } => write!(
+                f,
+                "catalog.tracks[] entry `{track_name}` has a zero groupDurationMs/groupDurationTicks (§4.4.2 requires a positive group duration)"
+            ),
+            Self::InvalidFecParams { track_name, reason } => write!(
+                f,
+                "catalog.tracks[] entry `{track_name}` has an invalid fec descriptor: {reason} (moq-fec §5.1)"
             ),
         }
     }
@@ -666,16 +1033,110 @@ impl Root {
                 .packaging
                 .as_ref()
                 .or(self.common_track_fields.packaging.as_ref());
-            let effective_mmtp_mode = t
-                .mmtp_mode
+            if !matches!(effective_packaging, Some(TrackPackaging::Mmtp)) {
+                continue;
+            }
+            // §12.1: mmtpMode REQUIRED (effective: track OR common).
+            if t.mmtp_mode
                 .as_ref()
-                .or(self.common_track_fields.mmtp_mode.as_ref());
-            if matches!(effective_packaging, Some(TrackPackaging::Mmtp))
-                && effective_mmtp_mode.is_none()
+                .or(self.common_track_fields.mmtp_mode.as_ref())
+                .is_none()
             {
                 return Err(CatalogValidationError::MissingMmtpMode {
                     track_name: t.name.clone(),
                 });
+            }
+            // §4.4.2: mmtp tracks MUST publish an explicit timescale; the catalog
+            // never infers one.
+            let timescale = match t.timescale.or(self.common_track_fields.timescale) {
+                Some(ts) => ts,
+                None => {
+                    return Err(CatalogValidationError::MissingTimescale {
+                        track_name: t.name.clone(),
+                    })
+                }
+            };
+            // §4.4.2: a zero timescale is bad init — the tick math is undefined and
+            // would silently neutralize the exactness check below (`ms × 0 % 1000`
+            // is always 0).
+            if timescale == 0 {
+                return Err(CatalogValidationError::ZeroTimescale {
+                    track_name: t.name.clone(),
+                });
+            }
+            // §4.4.2: group duration REQUIRED, as ms or an explicit tick override.
+            let gd_ms = t
+                .group_duration_ms
+                .or(self.common_track_fields.group_duration_ms);
+            let gd_ticks = t
+                .group_duration_ticks
+                .or(self.common_track_fields.group_duration_ticks);
+            if gd_ms.is_none() && gd_ticks.is_none() {
+                return Err(CatalogValidationError::MissingGroupDuration {
+                    track_name: t.name.clone(),
+                });
+            }
+            // A present-but-zero group duration is bad init (zero-length group).
+            if matches!(gd_ms, Some(0)) || matches!(gd_ticks, Some(0)) {
+                return Err(CatalogValidationError::ZeroGroupDuration {
+                    track_name: t.name.clone(),
+                });
+            }
+            // §4.4.2 exactness: the ms form must convert to a whole tick count
+            // unless an explicit ticks override is supplied. `% == 0` is kept over
+            // `u64::is_multiple_of` (stable only since Rust 1.87) to honor the
+            // repo's documented 1.70+ MSRV.
+            #[allow(clippy::manual_is_multiple_of)]
+            if let (Some(ms), None) = (gd_ms, gd_ticks) {
+                if (ms as u64 * timescale as u64) % 1000 != 0 {
+                    return Err(CatalogValidationError::GroupDurationNotExact {
+                        track_name: t.name.clone(),
+                        group_duration_ms: ms,
+                        timescale,
+                    });
+                }
+            }
+        }
+        // moq-fec §5.1: a track's fec.repairTrack must reference a catalog track
+        // whose effective packaging is fec-repair.
+        for t in &self.tracks {
+            if let Some(fec) = &t.fec {
+                // FEC params are out-of-band for multicast (no back channel to
+                // renegotiate), so a degenerate descriptor silently breaks recovery
+                // for every receiver. Reject zero counts for an active scheme.
+                if !matches!(fec.algorithm, FecAlgorithm::None) {
+                    let bad = if fec.source_symbols == 0 {
+                        Some("sourceSymbols (K) must be >= 1")
+                    } else if fec.repair_symbols == 0 {
+                        Some("repairSymbols (P) must be >= 1")
+                    } else if fec.symbol_size == 0 {
+                        Some("symbolSize (T) must be >= 1")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = bad {
+                        return Err(CatalogValidationError::InvalidFecParams {
+                            track_name: t.name.clone(),
+                            reason: reason.to_string(),
+                        });
+                    }
+                }
+                let target_is_repair = match self.tracks.iter().find(|x| x.name == fec.repair_track)
+                {
+                    Some(x) => matches!(
+                        x.packaging
+                            .as_ref()
+                            .or(self.common_track_fields.packaging.as_ref()),
+                        Some(TrackPackaging::FecRepair)
+                    ),
+                    None => false,
+                };
+                if !target_is_repair {
+                    return Err(CatalogValidationError::UnknownRepairTrack {
+                        track_name: t.name.clone(),
+                        repair_track: fec.repair_track.clone(),
+                    });
+                }
             }
         }
         if let Some(mc) = &self.multicast {
@@ -736,6 +1197,18 @@ impl Track {
         if self.mmtp_mode.is_none() {
             self.mmtp_mode.clone_from(&common.mmtp_mode);
         }
+        if self.timescale.is_none() {
+            self.timescale = common.timescale;
+        }
+        if self.group_duration_ms.is_none() {
+            self.group_duration_ms = common.group_duration_ms;
+        }
+        if self.group_duration_ticks.is_none() {
+            self.group_duration_ticks = common.group_duration_ticks;
+        }
+        if self.init_mode.is_none() {
+            self.init_mode.clone_from(&common.init_mode);
+        }
         if self.render_group.is_none() {
             self.render_group = common.render_group;
         }
@@ -778,6 +1251,65 @@ pub enum MmtpMode {
 
     #[serde(rename = "mfu")]
     Mfu,
+}
+
+/// MPU metadata delivery mode per draft-ramadan-moq-mmt §4.5. `inline` (default)
+/// carries the MPU metadata box as subgroup 0 of each group; `track` delivers it
+/// on a separate init track.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+pub enum InitMode {
+    #[serde(rename = "inline")]
+    #[default]
+    Inline,
+
+    #[serde(rename = "track")]
+    Track,
+}
+
+/// AL-FEC scheme identifier per draft-ramadan-moq-fec §5.1.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub enum FecAlgorithm {
+    #[serde(rename = "none")]
+    None,
+
+    #[serde(rename = "raptorq")]
+    RaptorQ,
+
+    #[serde(rename = "reed-solomon")]
+    ReedSolomon,
+}
+
+/// Per-track AL-FEC descriptor (draft-ramadan-moq-fec §5.1, referenced by
+/// draft-ramadan-moq-mmt §8.3). Out-of-band FEC_CONFIG for multicast, where no
+/// back channel exists to negotiate it. Per-track; not inherited via common.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct FecDescriptor {
+    /// FEC scheme.
+    pub algorithm: FecAlgorithm,
+
+    /// K — source symbols per FEC block.
+    #[serde(rename = "sourceSymbols")]
+    pub source_symbols: u32,
+
+    /// P — repair symbols per FEC block.
+    #[serde(rename = "repairSymbols")]
+    pub repair_symbols: u32,
+
+    /// T — bytes per symbol.
+    #[serde(rename = "symbolSize")]
+    pub symbol_size: u32,
+
+    /// AL-FEC interleave window (per group), `D × 1000/fps` — NOT the block span.
+    /// The FEC block span is `(K-1) × interleaveDepth` (the consumer derives it;
+    /// see moq-transport `serve/subgroup.rs`). OPTIONAL; absent ⇒ no interleaving
+    /// (D=1), resolved by the consumer — the catalog never materializes a `0`.
+    #[serde(rename = "interleaveDepth", skip_serializing_if = "Option::is_none")]
+    pub interleave_depth: Option<u32>,
+
+    /// Repair track name, convention `[namespace, track_name, "repair"]`. Must
+    /// reference a catalog track whose effective packaging is `fec-repair`.
+    #[serde(rename = "repairTrack")]
+    pub repair_track: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -832,6 +1364,22 @@ pub struct CommonTrackFields {
     #[serde(rename = "mmtpMode", skip_serializing_if = "Option::is_none")]
     pub mmtp_mode: Option<MmtpMode>,
 
+    /// Media timescale (Hz), inheritable like `mmtpMode`. §4.4.2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timescale: Option<u32>,
+
+    /// Group duration (integer ms), inheritable. §4.4.2.
+    #[serde(rename = "groupDurationMs", skip_serializing_if = "Option::is_none")]
+    pub group_duration_ms: Option<u32>,
+
+    /// Exact group-duration tick override, inheritable. §4.4.2.
+    #[serde(rename = "groupDurationTicks", skip_serializing_if = "Option::is_none")]
+    pub group_duration_ticks: Option<u64>,
+
+    /// MPU metadata delivery mode, inheritable. §4.5.
+    #[serde(rename = "initMode", skip_serializing_if = "Option::is_none")]
+    pub init_mode: Option<InitMode>,
+
     #[serde(rename = "renderGroup", skip_serializing_if = "Option::is_none")]
     pub render_group: Option<u16>,
 
@@ -851,6 +1399,10 @@ impl CommonTrackFields {
             namespace: tracks[0].namespace.clone(),
             packaging: tracks[0].packaging.clone(),
             mmtp_mode: tracks[0].mmtp_mode.clone(),
+            timescale: tracks[0].timescale,
+            group_duration_ms: tracks[0].group_duration_ms,
+            group_duration_ticks: tracks[0].group_duration_ticks,
+            init_mode: tracks[0].init_mode.clone(),
             render_group: tracks[0].render_group,
             alt_group: tracks[0].alt_group,
         };
@@ -865,6 +1417,18 @@ impl CommonTrackFields {
             }
             if track.mmtp_mode != common.mmtp_mode {
                 common.mmtp_mode = None;
+            }
+            if track.timescale != common.timescale {
+                common.timescale = None;
+            }
+            if track.group_duration_ms != common.group_duration_ms {
+                common.group_duration_ms = None;
+            }
+            if track.group_duration_ticks != common.group_duration_ticks {
+                common.group_duration_ticks = None;
+            }
+            if track.init_mode != common.init_mode {
+                common.init_mode = None;
             }
             if track.render_group != common.render_group {
                 common.render_group = None
@@ -890,6 +1454,19 @@ impl CommonTrackFields {
             }
             if common.mmtp_mode.is_some() {
                 track.mmtp_mode = None;
+            }
+            // New §12.1 fields use the correct `common.is_some()` strip form too.
+            if common.timescale.is_some() {
+                track.timescale = None;
+            }
+            if common.group_duration_ms.is_some() {
+                track.group_duration_ms = None;
+            }
+            if common.group_duration_ticks.is_some() {
+                track.group_duration_ticks = None;
+            }
+            if common.init_mode.is_some() {
+                track.init_mode = None;
             }
             if common.render_group.is_some() {
                 track.render_group = None;
