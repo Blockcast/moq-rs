@@ -289,7 +289,11 @@ mod tests {
     // IntValue VarInt and round-trips through KeyValuePairs.
     #[test]
     fn subgroup_history_groups_param_round_trips() {
-        assert_eq!(SUBGROUP_HISTORY_GROUPS_PARAM % 2, 0, "key must be even (IntValue)");
+        assert_eq!(
+            SUBGROUP_HISTORY_GROUPS_PARAM % 2,
+            0,
+            "key must be even (IntValue)"
+        );
 
         let mut kvps = KeyValuePairs::new();
         kvps.set_intvalue(SUBGROUP_HISTORY_GROUPS_PARAM, 5);
