@@ -179,10 +179,20 @@ fn build_state_map(
                 .subgroups()
                 .with_context(|| format!("track `{}`: subgroups() failed", track_ref.name))?;
 
-            // Auto-create the AL-FEC repair sibling. The track name
-            // convention `<source>/repair` is publisher-internal per
-            // draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1.
-            let repair_name = format!("{}/repair", track_ref.name);
+            // Auto-create the AL-FEC repair sibling. The catalog is
+            // authoritative for the repair track name when the source track
+            // declares a `fec` descriptor (draft-ramadan-moq-fec §5.1
+            // `fec.repairTrack`). Callers that run Root::validate() first — as
+            // main() does before build_state_map — have had that name checked
+            // against the catalog's tracks[] (it must resolve to a `fec-repair`
+            // track); build_state_map itself does not re-verify it. Absent a
+            // `fec` descriptor, fall back to the publisher-internal
+            // `<source>/repair` convention
+            // (draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1).
+            let repair_name = match &catalog_track.fec {
+                Some(fec) => fec.repair_track.clone(),
+                None => format!("{}/repair", track_ref.name),
+            };
             let mut repair_writer = tracks_writer.create(&repair_name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "TracksWriter::create returned None for `{}` (broadcast already closed?)",
@@ -324,6 +334,10 @@ async fn run_udp_loop(
     loop {
         recv_one_udp_packet(&socket, state_map, &mut buf).await?;
         packet_count = packet_count.wrapping_add(1);
+        // `% == 0` is kept over `u64::is_multiple_of` (stable only since Rust
+        // 1.87) to honor the repo's documented 1.70+ MSRV — same rationale as
+        // moq-catalog's group-duration exactness check.
+        #[allow(clippy::manual_is_multiple_of)]
         if packet_count % 1000 == 0 {
             tracing::debug!(packet_count, "UDP packets dispatched");
         }
@@ -374,7 +388,9 @@ async fn run_stdin_loop(state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>
 mod tests {
     use super::*;
     use moq_catalog::multicast::{MulticastConfig, MulticastEndpoint, MulticastTrackRef};
-    use moq_catalog::{CommonTrackFields, MmtpMode, SelectionParam, Track};
+    use moq_catalog::{
+        CommonTrackFields, FecAlgorithm, FecDescriptor, MmtpMode, SelectionParam, Track,
+    };
     use moq_transport::serve::Tracks;
 
     fn ns() -> TrackNamespace {
@@ -595,6 +611,64 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(&17));
         assert!(!map.contains_key(&18));
+    }
+
+    #[test]
+    fn build_state_map_uses_catalog_fec_repair_track_name() {
+        // When the source track declares `fec`, the repair sibling is registered
+        // under the catalog's fec.repairTrack name (draft-ramadan-moq-fec §5.1),
+        // not the `<source>/repair` convention.
+        let mut v = track("v", Some(TrackPackaging::Mmtp));
+        v.fec = Some(FecDescriptor {
+            algorithm: FecAlgorithm::RaptorQ,
+            source_symbols: 32,
+            repair_symbols: 8,
+            symbol_size: 1312,
+            interleave_depth: None,
+            repair_track: "v/fec-custom".into(),
+        });
+        let cat = catalog_with(
+            vec![v],
+            Some(MulticastConfig {
+                endpoints: Some(vec![endpoint(vec![("v", 17)])]),
+                network_source: None,
+                subgroup_history_groups: Some(8),
+            }),
+        );
+        let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();
+        let map = build_state_map(&mut tw, &cat).unwrap();
+        assert!(
+            map.get(&17).expect("source track present").repair.is_some(),
+            "a fec-declaring track still gets a repair sibling"
+        );
+        assert!(
+            tr.get_track_reader(&ns(), "v/fec-custom").is_some(),
+            "repair sibling is registered under the catalog fec.repairTrack name"
+        );
+        assert!(
+            tr.get_track_reader(&ns(), "v/repair").is_none(),
+            "the `<source>/repair` convention name is not used when fec names one"
+        );
+    }
+
+    #[test]
+    fn build_state_map_falls_back_to_repair_convention_without_fec() {
+        // No `fec` descriptor: the repair sibling keeps the `<source>/repair`
+        // convention name (preserves existing behavior; FEC delivery unchanged).
+        let cat = catalog_with(
+            vec![track("v", Some(TrackPackaging::Mmtp))],
+            Some(MulticastConfig {
+                endpoints: Some(vec![endpoint(vec![("v", 17)])]),
+                network_source: None,
+                subgroup_history_groups: Some(8),
+            }),
+        );
+        let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();
+        let _map = build_state_map(&mut tw, &cat).unwrap();
+        assert!(
+            tr.get_track_reader(&ns(), "v/repair").is_some(),
+            "without fec, the repair sibling uses the `<source>/repair` convention"
+        );
     }
 
     #[tokio::test]
