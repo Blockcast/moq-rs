@@ -57,8 +57,9 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
     let hdr = MmtpHeader::read_from(&mut cursor)
         .map_err(|e| anyhow!("MMTP header decode failed: {e:?}"))?;
 
-    // Compile-time anchor: WithSourcePayloadId must remain 0x01 per §3.1.
-    const _: u8 = FecType::WithSourcePayloadId as u8; // = 1
+    // Compile-time assertion: wire value must be exactly 0x01 per ISO/IEC 23008-1 §3.1.
+    // Fails the build if the enum discriminant drifts.
+    const _: () = assert!(FecType::WithSourcePayloadId as u8 == 1);
 
     // B2: parse SourceFecPayloadId immediately after the MMTP header when
     // fec_type=1 (per MmtpHeaderExt convention). The cursor is now positioned

@@ -252,7 +252,7 @@ pub fn dispatch<T: TrackSubgroups>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mmt_core::header::SourceFecPayloadId;
+    use mmt_core::header::{FecType, SourceFecPayloadId};
 
     // ---- in-memory mocks ----
 
@@ -345,7 +345,7 @@ mod tests {
         PacketRouting {
             packet_id,
             packet_type: PacketType::Mpu,
-            fec_type: 1,
+            fec_type: FecType::WithSourcePayloadId as u8,
             rap_flag: false,
             mpu_sequence: Some(mpu_seq),
             fragment_type: Some(frag),
@@ -490,8 +490,7 @@ mod tests {
         let mut map = make_state_map_with_repair(1, 5, true);
         let err = dispatch(&mut map, &repair(1), Bytes::from_static(b"r")).unwrap_err();
         assert!(
-            err.to_string().contains("before any source FEC block")
-                || err.to_string().contains("SourceFecPayloadId"),
+            err.to_string().contains("before any source FEC block"),
             "got: {err}"
         );
     }
@@ -535,7 +534,7 @@ mod tests {
         //   ss_id 0  → SBN 0 (block 0: ss_ids 0..31)
         //   ss_id 32 → SBN 1 (block 1: ss_ids 32..63)
         let mut map = make_state_map_with_repair(1, 5, true);
-        // Source packets in FEC block 0 (ss_ids 0 and 15, both SBN=0).
+        // Source packet in FEC block 0 (ss_id=0 → SBN=0).
         dispatch(
             &mut map,
             &mpu_with_fec(1, 10, FragmentType::Init, 0),
@@ -543,7 +542,20 @@ mod tests {
         )
         .unwrap();
         dispatch(&mut map, &repair(1), Bytes::from_static(b"r_sbn0")).unwrap();
-        // Source advances to FEC block 1 (ss_id=32 → SBN=1), still MPU 11.
+        // ss_id=31 is the last symbol of FEC block 0; SBN must still be 0.
+        // Exercises the off-by-one boundary: 31 / 32 = 0 (integer division), not 1.
+        dispatch(
+            &mut map,
+            &mpu_with_fec(1, 10, FragmentType::Mfu, 31),
+            Bytes::from_static(b"m10"),
+        )
+        .unwrap();
+        assert_eq!(
+            map.get(&1).unwrap().current_sbn,
+            Some(0),
+            "ss_id=31 must remain in SBN=0 (off-by-one guard)"
+        );
+        // Source advances to FEC block 1 (ss_id=32 → SBN=1), new MPU 11.
         dispatch(
             &mut map,
             &mpu_with_fec(1, 11, FragmentType::Init, 32),
