@@ -57,6 +57,9 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
     let hdr = MmtpHeader::read_from(&mut cursor)
         .map_err(|e| anyhow!("MMTP header decode failed: {e:?}"))?;
 
+    // Compile-time anchor: WithSourcePayloadId must remain 0x01 per §3.1.
+    const _: u8 = FecType::WithSourcePayloadId as u8; // = 1
+
     // B2: parse SourceFecPayloadId immediately after the MMTP header when
     // fec_type=1 (per MmtpHeaderExt convention). The cursor is now positioned
     // at the first byte after the 12-byte header; if FEC is active, the next
@@ -187,6 +190,40 @@ mod tests {
         mpu.write_to(&mut buf).unwrap();
         buf.put_slice(payload);
         buf.to_vec()
+    }
+
+    /// Build a raw MMTP packet with fec_type=1 (SourceFecPayloadId) preceding the MPU header.
+    fn synth_fec_source_packet(packet_id: u16, ss_id: u32, mpu_sequence: u32) -> Vec<u8> {
+        let mut hdr = MmtpHeader::new(packet_id, PacketType::Mpu);
+        hdr.fec_type = FecType::WithSourcePayloadId as u8;
+        let fec_id = SourceFecPayloadId { ss_id };
+        let mut mpu = MpuHeader::new(FragmentType::Init, mpu_sequence);
+        mpu.payload_length = 0;
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+        fec_id.write_to(&mut buf).unwrap();
+        mpu.write_to(&mut buf).unwrap();
+        buf.put_slice(&[0xAA, 0xBB]);
+        buf.to_vec()
+    }
+
+    #[test]
+    fn parses_fec_source_packet_populates_source_fec_payload_id() {
+        // Verifies cursor alignment: SourceFecPayloadId (4 bytes) is consumed
+        // before MpuHeader::read_from, so mpu_sequence is read from the right offset.
+        let pkt = synth_fec_source_packet(9, 37, 11);
+        let r = route(&pkt).unwrap();
+        assert_eq!(r.packet_id, 9);
+        assert_eq!(r.fec_type, 1);
+        assert_eq!(
+            r.mpu_sequence,
+            Some(11),
+            "cursor must advance past FEC payload ID before reading MPU header"
+        );
+        assert_eq!(
+            r.source_fec_payload_id,
+            Some(SourceFecPayloadId { ss_id: 37 })
+        );
     }
 
     #[test]

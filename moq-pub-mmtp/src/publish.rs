@@ -187,12 +187,6 @@ pub fn dispatch<T: TrackSubgroups>(
                     state.current_group = Some(group);
                     state.current_group_id = Some(mpu_seq as u64);
                     state.last_seen_mpu_seq = Some(mpu_seq);
-                    // B2: update current_sbn when this source packet carries
-                    // a SourceFecPayloadId (fec_type=1). Repair dispatcher
-                    // uses this to key repair subgroups by SBN, not MPU.
-                    if let Some(ref fec_id) = routing.source_fec_payload_id {
-                        state.current_sbn = Some(fec_id.sbn(FEC_K));
-                    }
                     state
                         .current_group
                         .as_mut()
@@ -200,9 +194,11 @@ pub fn dispatch<T: TrackSubgroups>(
                         .put_object(payload)?;
                 }
             }
-            // B2: update current_sbn on continuation packets (same MPU seq)
-            // too — the SBN can advance mid-MPU if the FEC block boundary
-            // does not align with MPU boundaries (rare but spec-legal).
+            // B2: update current_sbn for every source packet (both new-group
+            // and continuation). The SBN can advance mid-MPU when a FEC block
+            // boundary does not align with MPU boundaries (rare but spec-legal).
+            // This single update covers both paths; the new-group branch above
+            // does not need a separate update.
             if let Some(ref fec_id) = routing.source_fec_payload_id {
                 state.current_sbn = Some(fec_id.sbn(FEC_K));
             }
