@@ -8,7 +8,9 @@
 // header decode. We do not re-implement the bit-twiddling.
 
 use anyhow::{anyhow, Context, Result};
-use mmt_core::header::{FragmentType, MmtpHeader, MpuHeader, PacketType, MMTP_HEADER_SIZE};
+use mmt_core::header::{
+    FecType, FragmentType, MmtpHeader, MpuHeader, PacketType, SourceFecPayloadId, MMTP_HEADER_SIZE,
+};
 
 /// Routing key extracted from one MMTP packet's headers.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +33,11 @@ pub struct PacketRouting {
     /// MUST carry FragmentType::Init (the MPU metadata box). Present
     /// only when `packet_type == PacketType::Mpu`.
     pub fragment_type: Option<FragmentType>,
+    /// Source FEC Payload ID — present on source packets (fec_type=1,
+    /// ISO/IEC 23008-1 §C.5.2). Carries the SS_ID from which the
+    /// publisher derives the FEC Source Block Number (SBN = SS_ID / K).
+    /// Absent on non-FEC (fec_type=0) and repair (fec_type=2/3) packets.
+    pub source_fec_payload_id: Option<SourceFecPayloadId>,
 }
 
 /// Parse routing info from a raw MMTP packet. Does not copy the packet.
@@ -49,9 +56,27 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
     let mut cursor: &[u8] = packet;
     let hdr = MmtpHeader::read_from(&mut cursor)
         .map_err(|e| anyhow!("MMTP header decode failed: {e:?}"))?;
+
+    // Compile-time assertion: wire value must be exactly 0x01 per ISO/IEC 23008-1 §3.1.
+    // Fails the build if the enum discriminant drifts.
+    const _: () = assert!(FecType::WithSourcePayloadId as u8 == 1);
+
+    // B2: parse SourceFecPayloadId immediately after the MMTP header when
+    // fec_type=1 (per MmtpHeaderExt convention). The cursor is now positioned
+    // at the first byte after the 12-byte header; if FEC is active, the next
+    // 4 bytes are the SS_ID before the MPU payload.
+    let source_fec_payload_id = if hdr.fec_type == FecType::WithSourcePayloadId as u8 {
+        Some(
+            SourceFecPayloadId::read_from(&mut cursor)
+                .map_err(|e| anyhow!("SourceFecPayloadId decode failed: {e:?}"))?,
+        )
+    } else {
+        None
+    };
+
     let (mpu_sequence, fragment_type) = if hdr.packet_type == PacketType::Mpu {
-        let mut payload: &[u8] = &packet[MMTP_HEADER_SIZE..];
-        let (mpu, _payload_len) = MpuHeader::read_from(&mut payload)
+        // cursor is now past header + optional FEC payload ID.
+        let (mpu, _payload_len) = MpuHeader::read_from(&mut cursor)
             .map_err(|e| anyhow!("MPU header decode failed: {e:?}"))
             .context("MMTP packet_type=Mpu but MPU header decode failed")?;
         (Some(mpu.mpu_sequence), Some(mpu.fragment_type))
@@ -65,6 +90,7 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
         rap_flag: hdr.rap_flag,
         mpu_sequence,
         fragment_type,
+        source_fec_payload_id,
     })
 }
 
@@ -165,6 +191,40 @@ mod tests {
         mpu.write_to(&mut buf).unwrap();
         buf.put_slice(payload);
         buf.to_vec()
+    }
+
+    /// Build a raw MMTP packet with fec_type=1 (SourceFecPayloadId) preceding the MPU header.
+    fn synth_fec_source_packet(packet_id: u16, ss_id: u32, mpu_sequence: u32) -> Vec<u8> {
+        let mut hdr = MmtpHeader::new(packet_id, PacketType::Mpu);
+        hdr.fec_type = FecType::WithSourcePayloadId as u8;
+        let fec_id = SourceFecPayloadId { ss_id };
+        let mut mpu = MpuHeader::new(FragmentType::Init, mpu_sequence);
+        mpu.payload_length = 0;
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+        fec_id.write_to(&mut buf).unwrap();
+        mpu.write_to(&mut buf).unwrap();
+        buf.put_slice(&[0xAA, 0xBB]);
+        buf.to_vec()
+    }
+
+    #[test]
+    fn parses_fec_source_packet_populates_source_fec_payload_id() {
+        // Verifies cursor alignment: SourceFecPayloadId (4 bytes) is consumed
+        // before MpuHeader::read_from, so mpu_sequence is read from the right offset.
+        let pkt = synth_fec_source_packet(9, 37, 11);
+        let r = route(&pkt).unwrap();
+        assert_eq!(r.packet_id, 9);
+        assert_eq!(r.fec_type, 1);
+        assert_eq!(
+            r.mpu_sequence,
+            Some(11),
+            "cursor must advance past FEC payload ID before reading MPU header"
+        );
+        assert_eq!(
+            r.source_fec_payload_id,
+            Some(SourceFecPayloadId { ss_id: 37 })
+        );
     }
 
     #[test]
