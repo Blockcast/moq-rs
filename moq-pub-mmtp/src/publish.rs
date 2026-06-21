@@ -26,6 +26,12 @@ use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use mmt_core::header::{FragmentType, PacketType};
 
+/// AL-FEC source block size: K source symbols per FEC block.
+///
+/// K=32 × ~1416 B MTU ≈ 45 KB per block. Matches the encoder constant in
+/// moq-rs/mmtp-fec and the receiver's mmt-core::FecDecoder::new(K).
+const FEC_K: u32 = 32;
+
 use crate::mmtp_parse::PacketRouting;
 
 /// Object-level writer for one MoQ subgroup (≈ one MPU group).
@@ -76,6 +82,11 @@ pub struct TrackState<T: TrackSubgroups> {
     /// Last MPU sequence seen on this track; used for the A2
     /// monotonicity check.
     pub last_seen_mpu_seq: Option<u32>,
+    /// FEC Source Block Number of the most recently seen source packet
+    /// that carried a SourceFecPayloadId (fec_type=1). Derived as
+    /// `SourceFecPayloadId::sbn(FEC_K)`. None when the track does not
+    /// carry FEC (fec_type=0 only). Used by the repair dispatcher (B2).
+    pub current_sbn: Option<u32>,
     /// Sibling `<name>/repair` track for AL-FEC repair packets. Per
     /// draft-ramadan-moq-mmt §7.2 repair tracks run at priority 7 and
     /// inherit the source track's group_id so the receiver can
@@ -86,17 +97,19 @@ pub struct TrackState<T: TrackSubgroups> {
 
 /// Repair sibling state for one source packet_id.
 ///
-/// For M.1 we tie repair group_id to the source MPU group_id so the
-/// receiver can match repair symbols to source data. Per-FEC-block
-/// grouping (parsing FEC Payload ID for SBN) is M.1b.
+/// B2: repair subgroups are now keyed by FEC Source Block Number (SBN),
+/// not by source MPU group_id. One repair subgroup per SBN so the receiver
+/// can correlate repair symbols to exactly the K source symbols they protect
+/// (draft-ramadan-moq-fec §6.1; K=`FEC_K`=32 per constants above).
 pub struct RepairSink<T: TrackSubgroups> {
     /// Subgroup factory for the `<source>/repair` MoQ track.
     pub sink: T,
     /// Currently open repair subgroup — None before first repair on
-    /// this track. Replaced when source MPU advances.
+    /// this track. Replaced when the SBN advances.
     pub current_group: Option<T::Group>,
-    /// Repair group_id mirroring the source track's current MPU group.
-    pub current_group_id: Option<u64>,
+    /// SBN of the currently open repair subgroup. Updated when a new
+    /// SBN is seen (i.e. the FEC encoder moved to the next block).
+    pub current_sbn: Option<u32>,
 }
 
 /// Dispatch one MMTP packet to its owning track.
@@ -174,6 +187,12 @@ pub fn dispatch<T: TrackSubgroups>(
                     state.current_group = Some(group);
                     state.current_group_id = Some(mpu_seq as u64);
                     state.last_seen_mpu_seq = Some(mpu_seq);
+                    // B2: update current_sbn when this source packet carries
+                    // a SourceFecPayloadId (fec_type=1). Repair dispatcher
+                    // uses this to key repair subgroups by SBN, not MPU.
+                    if let Some(ref fec_id) = routing.source_fec_payload_id {
+                        state.current_sbn = Some(fec_id.sbn(FEC_K));
+                    }
                     state
                         .current_group
                         .as_mut()
@@ -181,17 +200,24 @@ pub fn dispatch<T: TrackSubgroups>(
                         .put_object(payload)?;
                 }
             }
+            // B2: update current_sbn on continuation packets (same MPU seq)
+            // too — the SBN can advance mid-MPU if the FEC block boundary
+            // does not align with MPU boundaries (rare but spec-legal).
+            if let Some(ref fec_id) = routing.source_fec_payload_id {
+                state.current_sbn = Some(fec_id.sbn(FEC_K));
+            }
         }
         PacketType::Repair => {
-            // T3: route AL-FEC repair to the `<name>/repair` sibling
-            // track at priority 7. The repair group_id mirrors the
-            // source track's current MPU group so the receiver can
-            // correlate repair symbols with the data they protect.
-            let source_group_id = state.current_group_id.ok_or_else(|| {
+            // T3 / B2: route AL-FEC repair to the `<name>/repair` sibling
+            // track at priority 7. B2: repair group_id = SBN (not source
+            // MPU group_id), so the receiver can match repair symbols to
+            // exactly the K source symbols in one FEC source block
+            // (draft-ramadan-moq-fec §6.1, K=FEC_K=32).
+            let repair_sbn = state.current_sbn.ok_or_else(|| {
                 anyhow!(
-                    "repair packet for packet_id {} arrived before any source MPU \
-                     (publisher cannot pick a group_id; FEC encoder should emit \
-                     source MPUs first)",
+                    "repair packet for packet_id {} arrived before any source FEC block \
+                     (no SourceFecPayloadId seen; FEC encoder must emit source packets \
+                     with fec_type=1 before repair symbols)",
                     routing.packet_id
                 )
             })?;
@@ -203,11 +229,11 @@ pub fn dispatch<T: TrackSubgroups>(
                     state.name
                 )
             })?;
-            // Advance the repair group iff the source MPU advanced.
-            if repair.current_group_id != Some(source_group_id) {
-                let group = repair.sink.create_group(source_group_id, 0, 7)?;
+            // Advance the repair subgroup when the SBN advances.
+            if repair.current_sbn != Some(repair_sbn) {
+                let group = repair.sink.create_group(repair_sbn as u64, 0, 7)?;
                 repair.current_group = Some(group);
-                repair.current_group_id = Some(source_group_id);
+                repair.current_sbn = Some(repair_sbn);
             }
             repair
                 .current_group
@@ -230,6 +256,7 @@ pub fn dispatch<T: TrackSubgroups>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mmt_core::header::SourceFecPayloadId;
 
     // ---- in-memory mocks ----
 
@@ -280,7 +307,7 @@ mod tests {
             Some(RepairSink {
                 sink: MockSubgroups::default(),
                 current_group: None,
-                current_group_id: None,
+                current_sbn: None,
             })
         } else {
             None
@@ -295,12 +322,15 @@ mod tests {
                 current_group: None,
                 current_group_id: None,
                 last_seen_mpu_seq: None,
+                current_sbn: None,
                 repair,
             },
         );
         map
     }
 
+    /// Source MPU packet without FEC (fec_type=0). Use for non-FEC tests
+    /// and for A1/A2/A3 invariant tests where FEC is not under test.
     fn mpu(packet_id: u16, mpu_seq: u32, frag: FragmentType) -> PacketRouting {
         PacketRouting {
             packet_id,
@@ -309,6 +339,21 @@ mod tests {
             rap_flag: false,
             mpu_sequence: Some(mpu_seq),
             fragment_type: Some(frag),
+            source_fec_payload_id: None,
+        }
+    }
+
+    /// Source MPU packet with FEC (fec_type=1, SourceFecPayloadId.ss_id=`ss_id`).
+    /// Use for B2 repair tests where SBN-keyed grouping is under test.
+    fn mpu_with_fec(packet_id: u16, mpu_seq: u32, frag: FragmentType, ss_id: u32) -> PacketRouting {
+        PacketRouting {
+            packet_id,
+            packet_type: PacketType::Mpu,
+            fec_type: 1,
+            rap_flag: false,
+            mpu_sequence: Some(mpu_seq),
+            fragment_type: Some(frag),
+            source_fec_payload_id: Some(SourceFecPayloadId { ss_id }),
         }
     }
 
@@ -322,6 +367,7 @@ mod tests {
             rap_flag: false,
             mpu_sequence: None,
             fragment_type: None,
+            source_fec_payload_id: None,
         }
     }
 
@@ -424,11 +470,11 @@ mod tests {
         // auto-creates `<name>/repair`. A missing repair sibling means a
         // misconfigured build_state_map call — surface it loudly.
         let mut map = make_state_map_with_repair(1, 5, false);
-        // Open the source MPU first so we know we are past the "no MPU"
-        // error path — this isolates the missing-repair-sibling check.
+        // Open the source MPU with FEC first so we pass the "no FEC block"
+        // error path and isolate the missing-repair-sibling check.
         dispatch(
             &mut map,
-            &mpu(1, 10, FragmentType::Init),
+            &mpu_with_fec(1, 10, FragmentType::Init, 0),
             Bytes::from_static(b"i"),
         )
         .unwrap();
@@ -441,15 +487,15 @@ mod tests {
     }
 
     #[test]
-    fn repair_before_source_mpu_errors() {
-        // Repair packet arrives before any source MPU was seen on this
-        // packet_id. The publisher should error rather than write to an
+    fn repair_before_source_fec_block_errors() {
+        // Repair packet arrives before any source FEC block was seen on this
+        // packet_id. B2: the publisher errors rather than write to an
         // ambiguous group — the receiver would have nothing to repair.
         let mut map = make_state_map_with_repair(1, 5, true);
         let err = dispatch(&mut map, &repair(1), Bytes::from_static(b"r")).unwrap_err();
         assert!(
-            err.to_string().contains("before any source MPU")
-                || err.to_string().contains("source MPU"),
+            err.to_string().contains("before any source FEC block")
+                || err.to_string().contains("SourceFecPayloadId"),
             "got: {err}"
         );
     }
@@ -458,11 +504,12 @@ mod tests {
     fn repair_packet_routes_to_repair_sink_at_priority_7() {
         // Repair packets MUST land on the repair sibling sink (not the
         // source sink), with priority 7 per draft-ramadan-moq-mmt §7.2.
+        // B2: repair group_id = SBN (ss_id=0 → SBN=0 with K=32).
         let mut map = make_state_map_with_repair(1, 5, true);
-        // Open source MPU 10 first.
+        // Source MPU 10, ss_id=0 → SBN=0.
         dispatch(
             &mut map,
-            &mpu(1, 10, FragmentType::Init),
+            &mpu_with_fec(1, 10, FragmentType::Init, 0),
             Bytes::from_static(b"i"),
         )
         .unwrap();
@@ -471,44 +518,99 @@ mod tests {
         let state = map.get(&1).unwrap();
         // Source sink: 1 create_group at priority 5.
         assert_eq!(state.sink.groups_created, vec![(10, 0, 5)]);
-        // Repair sink: 1 create_group at priority 7, mirroring source group_id.
+        // Repair sink: 1 create_group at priority 7, group_id=SBN=0.
         let r = state.repair.as_ref().expect("repair sibling exists");
         assert_eq!(
             r.sink.groups_created,
-            vec![(10, 0, 7)],
-            "repair group_id mirrors source MPU; priority is 7"
+            vec![(0, 0, 7)],
+            "repair group_id is SBN (0); priority is 7"
         );
+        assert_eq!(r.current_sbn, Some(0));
         // The repair payload landed on the repair group, not the source.
         let rg = r.current_group.as_ref().expect("repair group open");
         assert_eq!(rg.writes, vec![Bytes::from_static(b"r1")]);
     }
 
     #[test]
-    fn repair_group_advances_with_source_mpu() {
-        // When the source MPU advances from 10 to 11, the next repair
-        // packet on that packet_id MUST open a new repair group at 11.
+    fn repair_group_advances_with_source_block() {
+        // B2: when the FEC source block advances (ss_id crosses a K=32
+        // boundary), the next repair packet MUST open a new repair subgroup
+        // keyed by the new SBN, NOT by the source MPU.
+        //   ss_id 0  → SBN 0 (block 0: ss_ids 0..31)
+        //   ss_id 32 → SBN 1 (block 1: ss_ids 32..63)
         let mut map = make_state_map_with_repair(1, 5, true);
+        // Source packets in FEC block 0 (ss_ids 0 and 15, both SBN=0).
         dispatch(
             &mut map,
-            &mpu(1, 10, FragmentType::Init),
+            &mpu_with_fec(1, 10, FragmentType::Init, 0),
             Bytes::from_static(b"i10"),
         )
         .unwrap();
-        dispatch(&mut map, &repair(1), Bytes::from_static(b"r10")).unwrap();
+        dispatch(&mut map, &repair(1), Bytes::from_static(b"r_sbn0")).unwrap();
+        // Source advances to FEC block 1 (ss_id=32 → SBN=1), still MPU 11.
         dispatch(
             &mut map,
-            &mpu(1, 11, FragmentType::Init),
+            &mpu_with_fec(1, 11, FragmentType::Init, 32),
             Bytes::from_static(b"i11"),
         )
         .unwrap();
-        dispatch(&mut map, &repair(1), Bytes::from_static(b"r11")).unwrap();
+        dispatch(&mut map, &repair(1), Bytes::from_static(b"r_sbn1")).unwrap();
         let r = map.get(&1).unwrap().repair.as_ref().unwrap();
         assert_eq!(
             r.sink.groups_created,
-            vec![(10, 0, 7), (11, 0, 7)],
-            "repair opens a new group each time source MPU advances"
+            vec![(0, 0, 7), (1, 0, 7)],
+            "repair opens a new group when SBN advances (0 → 1), keyed by SBN not MPU"
         );
-        assert_eq!(r.current_group_id, Some(11));
+        assert_eq!(r.current_sbn, Some(1));
+    }
+
+    #[test]
+    fn repair_group_keyed_by_sbn_not_mpu_group() {
+        // B2 RED→GREEN: repair group_id MUST be the SBN, not the source
+        // MPU group_id. Two MPUs in the same FEC block (same SBN) MUST
+        // share one repair subgroup; two MPUs in different FEC blocks MUST
+        // each open their own repair subgroup.
+        //
+        // Scenario:
+        //   MPU 10 → ss_id=5  → SBN=0 (5/32=0)
+        //   MPU 11 → ss_id=10 → SBN=0 (10/32=0)  ← same block as MPU 10
+        //   MPU 12 → ss_id=32 → SBN=1 (32/32=1)  ← new block
+        //
+        // Expected repair groups:  [(0,0,7), (1,0,7)]   (2 groups, by SBN)
+        // Wrong old MPU behaviour: [(10,0,7),(11,0,7),(12,0,7)] (3 groups)
+        let mut map = make_state_map_with_repair(1, 5, true);
+
+        dispatch(
+            &mut map,
+            &mpu_with_fec(1, 10, FragmentType::Init, 5),
+            Bytes::from_static(b"i10"),
+        )
+        .unwrap();
+        dispatch(&mut map, &repair(1), Bytes::from_static(b"r_mpu10")).unwrap();
+
+        dispatch(
+            &mut map,
+            &mpu_with_fec(1, 11, FragmentType::Init, 10),
+            Bytes::from_static(b"i11"),
+        )
+        .unwrap();
+        dispatch(&mut map, &repair(1), Bytes::from_static(b"r_mpu11")).unwrap();
+
+        dispatch(
+            &mut map,
+            &mpu_with_fec(1, 12, FragmentType::Init, 32),
+            Bytes::from_static(b"i12"),
+        )
+        .unwrap();
+        dispatch(&mut map, &repair(1), Bytes::from_static(b"r_mpu12")).unwrap();
+
+        let r = map.get(&1).unwrap().repair.as_ref().unwrap();
+        assert_eq!(
+            r.sink.groups_created,
+            vec![(0, 0, 7), (1, 0, 7)],
+            "repair subgroups keyed by SBN (2 groups), not by MPU sequence (3 groups)"
+        );
+        assert_eq!(r.current_sbn, Some(1), "current SBN is 1 after block advance");
     }
 
     #[test]
