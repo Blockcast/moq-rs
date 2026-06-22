@@ -16,12 +16,14 @@ use moq_transport::{
 use tokio::io::AsyncWriteExt;
 
 mod cli;
+mod datagram;
 mod framing;
 mod mmtp_parse;
 mod publish;
 mod udp;
 
 use cli::{Args, MmtpInput};
+use datagram::DatagramState;
 use mmtp_parse::route;
 use publish::{dispatch, RepairSink, TrackState};
 
@@ -57,12 +59,10 @@ async fn main() -> Result<()> {
     let namespace = TrackNamespace::from_utf8_path(&args.name);
     let (mut tracks_writer, _request, tracks_reader) = Tracks::new(namespace).produce();
 
-    // Build per-packet_id state map from the catalog's multicast extension.
-    let state_map = build_state_map(&mut tracks_writer, &catalog)?;
-    tracing::info!(
-        track_count = state_map.len(),
-        "built per-track state map from catalog"
-    );
+    // Select the publisher router from the catalog's track packaging: MMTP
+    // (per-packet_id MPU/MFU dispatch) or opaque datagram pass-through.
+    let router = build_router(&mut tracks_writer, &catalog)?;
+    tracing::info!(router = router.kind(), "built publisher router from catalog");
 
     // Publish the catalog JSON on the catalog tracks (canonical `catalog` per
     // draft-ietf-moq-msf-00 §5.2, plus the legacy `.catalog` alias). The
@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
     tokio::select! {
         res = session.run() => res.context("session error")?,
         res = publisher.announce(tracks_reader) => res.context("publisher error")?,
-        res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, state_map, tracks_writer) => res.context("publisher loop error")?,
+        res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, router, tracks_writer) => res.context("publisher loop error")?,
     }
 
     Ok(())
@@ -299,7 +299,112 @@ fn check_namespace_consistency(catalog: &Root, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Drive the publisher dispatch loop until the input ends.
+/// Publisher router: the per-protocol dispatch chosen from the catalog.
+///
+/// `Mmtp` interprets MMTP MPU/MFU structure (Mapping B subgrouping + AL-FEC
+/// repair siblings, see `publish::dispatch`); `Datagram` carries each UDP
+/// datagram as one opaque MoQ object (see `datagram::DatagramState`). Both
+/// arms own the concrete `SubgroupsWriter` sink.
+enum Router {
+    Mmtp(HashMap<u16, TrackState<SubgroupsWriter>>),
+    Datagram(DatagramState<SubgroupsWriter>),
+}
+
+impl Router {
+    fn kind(&self) -> &'static str {
+        match self {
+            Router::Mmtp(_) => "mmtp",
+            Router::Datagram(_) => "datagram",
+        }
+    }
+
+    /// Publish one received packet/datagram to its track(s).
+    fn handle(&mut self, packet: Bytes) -> Result<()> {
+        match self {
+            Router::Mmtp(state_map) => {
+                let routing = route(&packet).context("MMTP header parse error")?;
+                dispatch(state_map, &routing, packet)
+            }
+            Router::Datagram(state) => state.handle(packet),
+        }
+    }
+}
+
+/// Choose the publisher router from the catalog's track packaging.
+///
+/// A catalog with a `packaging=datagram` source track selects the opaque
+/// datagram router; anything else is MMTP (the default, preserving prior
+/// behavior). `expand_common_fields` has already run, so each track's
+/// `packaging` is its effective (track-or-common) value.
+fn build_router(tracks_writer: &mut TracksWriter, catalog: &Root) -> Result<Router> {
+    let has_datagram = catalog
+        .tracks
+        .iter()
+        .any(|t| matches!(t.packaging, Some(TrackPackaging::Datagram)));
+    if has_datagram {
+        Ok(Router::Datagram(build_datagram_state(tracks_writer, catalog)?))
+    } else {
+        Ok(Router::Mmtp(build_state_map(tracks_writer, catalog)?))
+    }
+}
+
+/// Build opaque datagram state from a catalog with exactly one
+/// `packaging=datagram` source track.
+///
+/// Errors:
+///   - no, or more than one, datagram track (the router maps a single stream)
+///   - catalog has no `multicast` extension or no `subgroupHistoryGroups`
+///     (config-or-throw: the window bounds how many recent datagrams are kept)
+///   - TracksWriter::create returns None (broadcast already closed)
+fn build_datagram_state(
+    tracks_writer: &mut TracksWriter,
+    catalog: &Root,
+) -> Result<DatagramState<SubgroupsWriter>> {
+    let mut datagram_tracks = catalog
+        .tracks
+        .iter()
+        .filter(|t| matches!(t.packaging, Some(TrackPackaging::Datagram)));
+    let track = datagram_tracks.next().ok_or_else(|| {
+        anyhow::anyhow!("datagram router selected but no packaging=datagram track present")
+    })?;
+    if datagram_tracks.next().is_some() {
+        bail!("datagram router supports exactly one packaging=datagram track");
+    }
+
+    let multicast = catalog.multicast.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("catalog has no `multicast` extension — required for datagram publishing")
+    })?;
+    let history_window_raw = multicast.subgroup_history_groups.ok_or_else(|| {
+        anyhow::anyhow!(
+            "catalog multicast.subgroupHistoryGroups is required for datagram publishing \
+             (config-or-throw): it bounds how many recent datagrams are retained"
+        )
+    })?;
+    // NonZeroU64 carries the ">= 1" invariant into TrackWriter::set_history_window.
+    let history_window = NonZeroU64::new(history_window_raw).ok_or_else(|| {
+        anyhow::anyhow!("multicast.subgroupHistoryGroups must be >= 1 (got {history_window_raw})")
+    })?;
+
+    let mut track_writer = tracks_writer.create(&track.name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "TracksWriter::create returned None for `{}` (broadcast already closed?)",
+            track.name
+        )
+    })?;
+    // Set on the Track BEFORE `.subgroups()` consumes it: subgroups() inherits
+    // the window for local pruning AND the session advertises it in SUBSCRIBE_OK
+    // (BLO-10339) so a downstream relay mirror bounds its own retention — matters
+    // for datagram, where one group per datagram creates many subgroups.
+    track_writer.set_history_window(history_window)?;
+    let subgroups = track_writer
+        .subgroups()
+        .with_context(|| format!("track `{}`: subgroups() failed", track.name))?;
+
+    // Datagram source objects publish at priority 0, matching MMTP source tracks.
+    Ok(DatagramState::new(track.name.clone(), 0, subgroups))
+}
+
+/// Drive the publisher loop until the input ends.
 ///
 /// `tracks_writer` is held here only to keep the broadcast alive — once
 /// dropped, TracksReader (held by `publisher.announce`) would see "done"
@@ -307,32 +412,29 @@ fn check_namespace_consistency(catalog: &Root, name: &str) -> Result<()> {
 async fn run_publisher(
     input: MmtpInput,
     udp_bind: std::net::SocketAddr,
-    mut state_map: HashMap<u16, TrackState<SubgroupsWriter>>,
+    mut router: Router,
     _tracks_writer: TracksWriter,
 ) -> Result<()> {
     match input {
-        MmtpInput::Stdin => run_stdin_loop(&mut state_map).await,
-        MmtpInput::Udp => run_udp_loop(udp_bind, &mut state_map).await,
+        MmtpInput::Stdin => run_stdin_loop(&mut router).await,
+        MmtpInput::Udp => run_udp_loop(udp_bind, &mut router).await,
     }
 }
 
-/// Drive the publisher dispatch loop reading one MMTP packet per UDP
-/// datagram. Per T4: each datagram is one MMTP packet — no length
-/// prefix, because the datagram boundary IS the packet framing.
-async fn run_udp_loop(
-    bind: std::net::SocketAddr,
-    state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>>,
-) -> Result<()> {
+/// Drive the publisher loop reading one packet/datagram per UDP datagram.
+/// Per T4: the datagram boundary IS the framing — no length prefix. The
+/// `Router` interprets each datagram per the catalog's packaging.
+async fn run_udp_loop(bind: std::net::SocketAddr, router: &mut Router) -> Result<()> {
     // open_udp_socket binds + (for multicast targets) joins the group
     // and enables loopback so cast/ffmpeg's multicast emission via
     // `moqenc_mmt` lands here without a separate flag.
     let socket = udp::open_udp_socket(bind).await?;
-    tracing::info!(addr = %socket.local_addr()?, "listening for MMTP datagrams");
+    tracing::info!(addr = %socket.local_addr()?, "listening for datagrams");
     // 65536 covers any IPv4/IPv6 MTU; oversized datagrams get truncated.
     let mut buf = vec![0u8; 65_536];
     let mut packet_count: u64 = 0;
     loop {
-        recv_one_udp_packet(&socket, state_map, &mut buf).await?;
+        recv_one_udp_packet(&socket, router, &mut buf).await?;
         packet_count = packet_count.wrapping_add(1);
         // `% == 0` is kept over `u64::is_multiple_of` (stable only since Rust
         // 1.87) to honor the repo's documented 1.70+ MSRV — same rationale as
@@ -344,26 +446,23 @@ async fn run_udp_loop(
     }
 }
 
-/// Receive one UDP datagram, parse its MMTP header, dispatch to the
-/// matching track. Extracted from the loop body so unit tests can
-/// drive it with a single synthetic packet rather than spawning the
-/// full loop.
+/// Receive one UDP datagram and hand it to the router. Extracted from the
+/// loop body so unit tests can drive it with a single synthetic packet
+/// rather than spawning the full loop.
 async fn recv_one_udp_packet(
     socket: &tokio::net::UdpSocket,
-    state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>>,
+    router: &mut Router,
     buf: &mut [u8],
 ) -> Result<()> {
     let (n, _addr) = socket.recv_from(buf).await.context("UDP recv_from error")?;
     if n == 0 {
         return Ok(());
     }
-    let packet = &buf[..n];
-    let routing = route(packet).context("MMTP header parse error (UDP)")?;
-    dispatch(state_map, &routing, Bytes::copy_from_slice(packet))?;
+    router.handle(Bytes::copy_from_slice(&buf[..n]))?;
     Ok(())
 }
 
-async fn run_stdin_loop(state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>>) -> Result<()> {
+async fn run_stdin_loop(router: &mut Router) -> Result<()> {
     let mut stdin = tokio::io::stdin();
     let mut packet_count: u64 = 0;
     loop {
@@ -376,10 +475,8 @@ async fn run_stdin_loop(state_map: &mut HashMap<u16, TrackState<SubgroupsWriter>
             tracing::info!(packet_count, "stdin EOF — publisher loop done");
             return Ok(());
         };
-        let routing = route(&packet).context("MMTP header parse error")?;
         // Move the frame body into Bytes so SubgroupWriter::write avoids a copy.
-        let payload = Bytes::from(packet);
-        dispatch(state_map, &routing, payload)?;
+        router.handle(Bytes::from(packet))?;
         packet_count += 1;
     }
 }
@@ -685,7 +782,8 @@ mod tests {
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
-        let mut state_map = build_state_map(&mut tw, &cat).unwrap();
+        let state_map = build_state_map(&mut tw, &cat).unwrap();
+        let mut router = Router::Mmtp(state_map);
 
         let recv_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let recv_addr = recv_sock.local_addr().unwrap();
@@ -696,10 +794,13 @@ mod tests {
         send_sock.send_to(&pkt, recv_addr).await.unwrap();
 
         let mut buf = vec![0u8; 65_536];
-        recv_one_udp_packet(&recv_sock, &mut state_map, &mut buf)
+        recv_one_udp_packet(&recv_sock, &mut router, &mut buf)
             .await
             .unwrap();
 
+        let Router::Mmtp(state_map) = &router else {
+            panic!("expected Mmtp router");
+        };
         let s = state_map.get(&1).expect("packet_id 1 present");
         assert_eq!(s.last_seen_mpu_seq, Some(42));
         assert_eq!(s.current_group_id, Some(42));

@@ -126,6 +126,7 @@ mod tests {
             (TrackPackaging::Loc, "\"loc\""),
             (TrackPackaging::Mmtp, "\"mmtp\""),
             (TrackPackaging::FecRepair, "\"fec-repair\""),
+            (TrackPackaging::Datagram, "\"datagram\""),
         ] {
             let json = serde_json::to_string(&v).unwrap();
             assert_eq!(json, expected, "serialize {v:?}");
@@ -219,6 +220,7 @@ mod tests {
             (TrackPackaging::Loc, "\"loc\""),
             (TrackPackaging::Mmtp, "\"mmtp\""),
             (TrackPackaging::FecRepair, "\"fec-repair\""),
+            (TrackPackaging::Datagram, "\"datagram\""),
         ] {
             let json = serde_json::to_string(&v).unwrap();
             assert_eq!(json, expected, "serialize {v:?}");
@@ -1485,6 +1487,17 @@ pub enum TrackPackaging {
     /// track map and derives its own `<name>/repair` siblings.
     #[serde(rename = "fec-repair")]
     FecRepair,
+
+    /// Opaque datagram packaging: each ingested UDP datagram becomes exactly
+    /// one MoQ object, carried verbatim with no protocol parsing. The publisher
+    /// maps one track per datagram stream, advancing the MoQ group on every
+    /// datagram (one object per group), so `multicast.subgroupHistoryGroups`
+    /// bounds retained datagrams. Used for non-MMTP payloads whose framing the
+    /// MoQ layer must not interpret (e.g. Solana shred frames, which the
+    /// receiver reassembles from the frames' own headers). Unlike `mmtp`, it
+    /// requires no `mmtpMode` and derives no `/repair` sibling.
+    #[serde(rename = "datagram")]
+    Datagram,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
