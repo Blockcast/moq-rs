@@ -173,10 +173,11 @@ fn build_state_map(
                     current_group: None,
                     current_group_id: None,
                     last_seen_mpu_seq: None,
+                    current_sbn: None,
                     repair: Some(RepairSink {
                         sink: repair_subgroups,
                         current_group: None,
-                        current_group_id: None,
+                        current_sbn: None,
                     }),
                 },
             );

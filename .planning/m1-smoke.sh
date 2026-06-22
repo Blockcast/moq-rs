@@ -15,6 +15,12 @@
 #   PORT=4443             relay port
 #   PACKET_DELAY_MS=50    pacing so SubgroupsReader's latest-only
 #                         semantics don't lose intermediate MPUs
+#   FRAGMENT=0            MFU fragments per MPU (BLO-8047 §B1.5). 0 keeps
+#                         the M.1 Init-only behavior; >= 2 exercises the
+#                         raw-passthrough fragmentation path with on-wire
+#                         FragmentType::Mfu + FI ∈ {1,2,3} packets. The
+#                         subscriber drains all fragments of one MPU
+#                         before the next mpu_seq opens a new subgroup.
 #
 # Exits non-zero if any per-track sha256 mismatches.
 
@@ -28,6 +34,7 @@ NAME="${NAME:-smoke}"
 GROUPS="${GROUPS:-8}"
 PORT="${PORT:-4443}"
 PACKET_DELAY_MS="${PACKET_DELAY_MS:-50}"
+FRAGMENT="${FRAGMENT:-0}"
 URL="https://localhost:$PORT"
 
 rm -rf "$SMOKE"
@@ -117,11 +124,12 @@ SUB_PID=$!
 # Give sub time to subscribe.
 sleep 2
 
-echo "[6/7] Sending synth_mmtp UDP packets to $UDP_TARGET ($GROUPS groups, ${PACKET_DELAY_MS}ms per packet)..."
+echo "[6/7] Sending synth_mmtp UDP packets to $UDP_TARGET ($GROUPS groups, ${PACKET_DELAY_MS}ms per packet, fragment=$FRAGMENT)..."
 "$REPO_ROOT/target/release/examples/synth_mmtp" \
     --output-dir "$SMOKE" \
     --groups "$GROUPS" \
     --packet-delay-ms "$PACKET_DELAY_MS" \
+    --fragment "$FRAGMENT" \
     --udp "$UDP_TARGET" \
     > "$SMOKE/synth.log" 2>&1
 

@@ -285,7 +285,11 @@ Synthesized from the engineering review's findings. Each task derives from a spe
 
 ## NOT in scope for M.1
 - **Object 0 = MPU metadata invariant ENFORCEMENT only** — the publisher errors on violation but does not synthesize MPU metadata from MFU data. Caller's responsibility (cast / ffmpeg).
-- **MMTP fragmentation reassembly** — if `fragmentation_indicator != 0`, publisher errors. Defer reassembly to M.1b.
+- **MMTP fragmentation reassembly** — **raw-passthrough contract** (locked 2026-05-28, BLO-8047 §B1). The publisher emits each MMTP packet — Init *and* every MFU fragment with `fragmentation_indicator` ∈ {0, 1, 2, 3} — as a separate MoQ object in the `(packet_id, mpu_sequence)` subgroup; the publisher does **not** interpret FI. Receivers reassemble using `mmt-core::MfuReassembler` (vendored at `moq-pub-mmtp/vendor/mmt-core/src/reassembler.rs`).
+
+  *The earlier draft of this ADR planned* "if FI != 0, publisher errors. Defer reassembly to M.1b". Overturned by dimensional math: AMT MTU floor ≈ 1416 bytes after IP/UDP/AMT/MMTP/MPU overhead, so a 4K I-frame needs ~220-1100 fragments and an 8K I-frame ~750-2900. An error-on-FI-non-zero rule would reject every video stream above 1080p audio. Both real receivers (`@moq/hang` in moqtail, Shaka via a WASM shim) already consume raw MMTP packets and reassemble themselves; publisher-side reassembly would force them to undo it before re-CMAF for MSE — strictly worse.
+
+  Pinned by `mmtp_parse::tests::accepts_fragmented_mfu_packets_at_fi_1_2_3` and `publish::tests::fragmented_mfu_packets_share_one_subgroup_raw_passthrough`. M.1 smoke exercises the path via `synth_mmtp --fragment N`.
 - **FEC source-block-correct grouping** — repair packets in M.1 land on a single rolling group per repair track. Per-FEC-block grouping (parsing Source/Repair FEC Payload ID) is M.1b.
 - **Receiver-side decode/render** — that's M.4.
 - **Subscriber `.catalog` auto-discovery** — moq-sub-raw takes track names explicitly. M.4 will wire catalog-driven discovery into real players.
@@ -323,7 +327,11 @@ Suggested lanes:
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | n/a (backend) |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | n/a (internal infra crate) |
 
-**CODEX:** 12 findings, 9 folded into Implementation Tasks (T1–T9), 3 acknowledged as M.1b TODOs (object_id_delta verification, MMTP fragmentation reassembly, FEC source-block grouping).
+**CODEX:** 12 findings, 9 folded into Implementation Tasks (T1–T9). The remaining 3 were originally tagged "M.1b TODO":
+
+- **MMTP fragmentation reassembly** — *resolved* 2026-05-28 as a raw-passthrough architectural pushback (see §"NOT in scope for M.1" above and BLO-8047 §B1). Closed by contract, not by code.
+- **Object_id_delta verification** — open, tracked as BLO-8047 §B3.
+- **FEC source-block (SBN) grouping for repair** — open, tracked as BLO-8047 §B2.
 **CROSS-MODEL:** Strong agreement on shape (sibling crate, mmt-core reuse, spec-true grouping). Tensions on **#1 input pipeline** and **#3 .catalog publication** — both resolved in favor of Codex's read, scope expanded with explicit tasks (T8, T2).
 **UNRESOLVED:** 0.
 **VERDICT:** ENG CLEARED — ready to implement T1–T9. Codex outside voice ran clean after fold-in.
