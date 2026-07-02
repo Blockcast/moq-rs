@@ -769,6 +769,40 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_interval_round_trips_fractional_cadence() {
+        // Fractional cadence: 14700 ticks / 44100 Hz = 333.333… ms, which has no
+        // exact integer-ms form. The advisory keyframeIntervalMs carries the
+        // rounded value (333) while keyframeIntervalTicks pins the exact cadence.
+        // Unlike groupDurationMs, the keyframe interval has NO §4.4.2 exactness
+        // rule, so this validates as-is — the rounded ms never has to be exact.
+        // Pins the serialize/round path so the rounded ms + exact ticks both ship.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":44100,"groupDurationMs":333,"groupDurationTicks":14700,"keyframeIntervalMs":333,"keyframeIntervalTicks":14700,"selectionParams":{}}]
+        }"#;
+        let root: Root = serde_json::from_str(json).unwrap();
+        root.validate()
+            .expect("fractional keyframe cadence has no exactness rule");
+        let t = &root.tracks[0];
+        assert_eq!(t.keyframe_interval_ms, Some(333), "rounded ms preserved");
+        assert_eq!(
+            t.keyframe_interval_ticks,
+            Some(14700),
+            "exact tick cadence preserved"
+        );
+        let back = serde_json::to_string(t).unwrap();
+        assert!(
+            back.contains(r#""keyframeIntervalMs":333"#),
+            "rounded ms round-trips: {back}"
+        );
+        assert!(
+            back.contains(r#""keyframeIntervalTicks":14700"#),
+            "exact ticks round-trip: {back}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_mmtp_without_timescale() {
         let json = r#"{
             "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
