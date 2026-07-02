@@ -73,6 +73,20 @@ pub struct Track {
     #[serde(rename = "groupDurationTicks", skip_serializing_if = "Option::is_none")]
     pub group_duration_ticks: Option<u64>,
 
+    /// Keyframe (GOP) repair cadence in integer milliseconds. The interval
+    /// between consecutive video keyframes, used by receivers to derive a
+    /// keyframe-loss repair timeout. Advisory and OPTIONAL. DISTINCT from
+    /// `groupDurationMs`, which is the per-MFU MMTP media-group duration (one
+    /// frame for frame-grouped streams), not a keyframe cadence. Inheritable.
+    #[serde(rename = "keyframeIntervalMs", skip_serializing_if = "Option::is_none")]
+    pub keyframe_interval_ms: Option<u32>,
+
+    /// Exact keyframe interval in timescale ticks. Optional override used when the
+    /// integer-millisecond form cannot be exact; wins over `keyframeIntervalMs`
+    /// when both are present. Advisory; inheritable.
+    #[serde(rename = "keyframeIntervalTicks", skip_serializing_if = "Option::is_none")]
+    pub keyframe_interval_ticks: Option<u64>,
+
     /// MPU metadata delivery mode (§4.5); effective default is `inline`.
     /// Inheritable.
     #[serde(rename = "initMode", skip_serializing_if = "Option::is_none")]
@@ -691,6 +705,104 @@ mod tests {
     }
 
     #[test]
+    fn track_round_trips_keyframe_interval() {
+        // keyframeIntervalMs is the keyframe/GOP repair cadence, DISTINCT from the
+        // per-frame groupDurationMs (here 33 ms ≈ one frame at 30 fps vs a 1 s GOP).
+        let json = r#"{
+            "name":"v","packaging":"mmtp","mmtpMode":"mfu",
+            "timescale":90000,"groupDurationMs":33,"groupDurationTicks":3000,
+            "keyframeIntervalMs":1000,"keyframeIntervalTicks":90000,
+            "selectionParams":{"codec":"avc1.42c01e"}
+        }"#;
+        let t: Track = serde_json::from_str(json).unwrap();
+        assert_eq!(t.keyframe_interval_ms, Some(1000));
+        assert_eq!(t.keyframe_interval_ticks, Some(90000));
+        assert_eq!(t.group_duration_ms, Some(33));
+        let back = serde_json::to_string(&t).unwrap();
+        assert!(back.contains(r#""keyframeIntervalMs":1000"#), "json = {back}");
+        assert!(back.contains(r#""keyframeIntervalTicks":90000"#), "json = {back}");
+    }
+
+    #[test]
+    fn expand_common_fields_inherits_keyframe_interval() {
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true,
+            "commonTrackFields": {"timescale": 90000, "groupDurationMs": 33, "keyframeIntervalMs": 1000},
+            "tracks": [{"name":"v","selectionParams":{}}]
+        }"#;
+        let mut root: Root = serde_json::from_str(json).unwrap();
+        root.expand_common_fields();
+        assert_eq!(root.tracks[0].keyframe_interval_ms, Some(1000));
+    }
+
+    #[test]
+    fn validate_rejects_zero_keyframe_interval() {
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"groupDurationMs":1000,"keyframeIntervalMs":0,"selectionParams":{}}]
+        }"#;
+        let err = serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect_err("zero keyframe interval is bad init");
+        assert!(
+            matches!(&err, CatalogValidationError::ZeroKeyframeInterval { track_name } if track_name == "v"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn keyframe_interval_is_optional() {
+        // Advisory field: an mmtp track with no keyframe cadence still validates
+        // (status quo — keyframe repair simply stays disabled receiver-side).
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"v","packaging":"mmtp","mmtpMode":"mpu","timescale":90000,"groupDurationMs":1000,"selectionParams":{}}]
+        }"#;
+        serde_json::from_str::<Root>(json)
+            .unwrap()
+            .validate()
+            .expect("keyframe interval is optional");
+    }
+
+    #[test]
+    fn keyframe_interval_round_trips_fractional_cadence() {
+        // Fractional cadence: 14700 ticks / 44100 Hz = 333.333… ms, which has no
+        // exact integer-ms form. The advisory keyframeIntervalMs carries the
+        // rounded value (333) while keyframeIntervalTicks pins the exact cadence.
+        // Unlike groupDurationMs, the keyframe interval has NO §4.4.2 exactness
+        // rule, so this validates as-is — the rounded ms never has to be exact.
+        // Pins the serialize/round path so the rounded ms + exact ticks both ship.
+        let json = r#"{
+            "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
+            "supportsDeltaUpdates": true, "commonTrackFields": {},
+            "tracks": [{"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":44100,"groupDurationMs":333,"groupDurationTicks":14700,"keyframeIntervalMs":333,"keyframeIntervalTicks":14700,"selectionParams":{}}]
+        }"#;
+        let root: Root = serde_json::from_str(json).unwrap();
+        root.validate()
+            .expect("fractional keyframe cadence has no exactness rule");
+        let t = &root.tracks[0];
+        assert_eq!(t.keyframe_interval_ms, Some(333), "rounded ms preserved");
+        assert_eq!(
+            t.keyframe_interval_ticks,
+            Some(14700),
+            "exact tick cadence preserved"
+        );
+        let back = serde_json::to_string(t).unwrap();
+        assert!(
+            back.contains(r#""keyframeIntervalMs":333"#),
+            "rounded ms round-trips: {back}"
+        );
+        assert!(
+            back.contains(r#""keyframeIntervalTicks":14700"#),
+            "exact ticks round-trip: {back}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_mmtp_without_timescale() {
         let json = r#"{
             "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2",
@@ -1105,6 +1217,10 @@ pub enum CatalogValidationError {
     /// An MMTP track declares a zero `groupDurationMs` or `groupDurationTicks`
     /// (a zero-length group is bad init; §4.4.2).
     ZeroGroupDuration { track_name: String },
+    /// An MMTP track declares a zero `keyframeIntervalMs` or
+    /// `keyframeIntervalTicks`. A zero cadence would drive the receiver's
+    /// keyframe-loss repair timeout to zero — bad init.
+    ZeroKeyframeInterval { track_name: String },
     /// A track's `fec` descriptor has a degenerate parameter for an active scheme
     /// (zero source/repair symbols or symbol size; moq-fec §5.1). FEC params are
     /// out-of-band for multicast, so a degenerate descriptor silently fails recovery.
@@ -1173,6 +1289,10 @@ impl std::fmt::Display for CatalogValidationError {
             Self::ZeroGroupDuration { track_name } => write!(
                 f,
                 "catalog.tracks[] entry `{track_name}` has a zero groupDurationMs/groupDurationTicks (§4.4.2 requires a positive group duration)"
+            ),
+            Self::ZeroKeyframeInterval { track_name } => write!(
+                f,
+                "catalog.tracks[] entry `{track_name}` has a zero keyframeIntervalMs/keyframeIntervalTicks (a positive keyframe cadence is required when present)"
             ),
             Self::InvalidFecParams { track_name, reason } => write!(
                 f,
@@ -1258,6 +1378,19 @@ impl Root {
             // A present-but-zero group duration is bad init (zero-length group).
             if matches!(gd_ms, Some(0)) || matches!(gd_ticks, Some(0)) {
                 return Err(CatalogValidationError::ZeroGroupDuration {
+                    track_name: t.name.clone(),
+                });
+            }
+            // A present-but-zero keyframe interval would zero the receiver's
+            // repair timeout — bad init. Advisory field, so not required.
+            let kf_ms = t
+                .keyframe_interval_ms
+                .or(self.common_track_fields.keyframe_interval_ms);
+            let kf_ticks = t
+                .keyframe_interval_ticks
+                .or(self.common_track_fields.keyframe_interval_ticks);
+            if matches!(kf_ms, Some(0)) || matches!(kf_ticks, Some(0)) {
+                return Err(CatalogValidationError::ZeroKeyframeInterval {
                     track_name: t.name.clone(),
                 });
             }
@@ -1451,6 +1584,12 @@ impl Track {
         if self.group_duration_ticks.is_none() {
             self.group_duration_ticks = common.group_duration_ticks;
         }
+        if self.keyframe_interval_ms.is_none() {
+            self.keyframe_interval_ms = common.keyframe_interval_ms;
+        }
+        if self.keyframe_interval_ticks.is_none() {
+            self.keyframe_interval_ticks = common.keyframe_interval_ticks;
+        }
         if self.init_mode.is_none() {
             self.init_mode.clone_from(&common.init_mode);
         }
@@ -1632,6 +1771,14 @@ pub struct CommonTrackFields {
     #[serde(rename = "groupDurationTicks", skip_serializing_if = "Option::is_none")]
     pub group_duration_ticks: Option<u64>,
 
+    /// Keyframe interval (integer ms), inheritable. Advisory repair cadence.
+    #[serde(rename = "keyframeIntervalMs", skip_serializing_if = "Option::is_none")]
+    pub keyframe_interval_ms: Option<u32>,
+
+    /// Exact keyframe-interval tick override, inheritable.
+    #[serde(rename = "keyframeIntervalTicks", skip_serializing_if = "Option::is_none")]
+    pub keyframe_interval_ticks: Option<u64>,
+
     /// MPU metadata delivery mode, inheritable. §4.5.
     #[serde(rename = "initMode", skip_serializing_if = "Option::is_none")]
     pub init_mode: Option<InitMode>,
@@ -1658,6 +1805,8 @@ impl CommonTrackFields {
             timescale: tracks[0].timescale,
             group_duration_ms: tracks[0].group_duration_ms,
             group_duration_ticks: tracks[0].group_duration_ticks,
+            keyframe_interval_ms: tracks[0].keyframe_interval_ms,
+            keyframe_interval_ticks: tracks[0].keyframe_interval_ticks,
             init_mode: tracks[0].init_mode.clone(),
             render_group: tracks[0].render_group,
             alt_group: tracks[0].alt_group,
@@ -1682,6 +1831,12 @@ impl CommonTrackFields {
             }
             if track.group_duration_ticks != common.group_duration_ticks {
                 common.group_duration_ticks = None;
+            }
+            if track.keyframe_interval_ms != common.keyframe_interval_ms {
+                common.keyframe_interval_ms = None;
+            }
+            if track.keyframe_interval_ticks != common.keyframe_interval_ticks {
+                common.keyframe_interval_ticks = None;
             }
             if track.init_mode != common.init_mode {
                 common.init_mode = None;
@@ -1720,6 +1875,12 @@ impl CommonTrackFields {
             }
             if common.group_duration_ticks.is_some() {
                 track.group_duration_ticks = None;
+            }
+            if common.keyframe_interval_ms.is_some() {
+                track.keyframe_interval_ms = None;
+            }
+            if common.keyframe_interval_ticks.is_some() {
+                track.keyframe_interval_ticks = None;
             }
             if common.init_mode.is_some() {
                 track.init_mode = None;
