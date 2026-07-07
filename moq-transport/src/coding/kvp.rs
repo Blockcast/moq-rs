@@ -127,8 +127,12 @@ impl KeyValuePair {
     ) -> Result<u64, EncodeError> {
         // Keys must be consistent with their value parity.
         match &self.value {
-            Value::IntValue(_) if self.key % 2 != 0 => return Err(EncodeError::InvalidValue),
-            Value::BytesValue(_) if self.key % 2 == 0 => return Err(EncodeError::InvalidValue),
+            Value::IntValue(_) if !self.key.is_multiple_of(2) => {
+                return Err(EncodeError::InvalidValue);
+            }
+            Value::BytesValue(_) if self.key.is_multiple_of(2) => {
+                return Err(EncodeError::InvalidValue);
+            }
             _ => {}
         }
 
