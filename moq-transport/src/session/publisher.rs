@@ -498,19 +498,14 @@ impl Publisher {
                 .subscribeds
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
-            let subscribed = subscribeds.get_mut(&msg.id).ok_or_else(|| {
-                SessionError::ProtocolViolation(format!(
-                    "UNSUBSCRIBE for unknown subscribe ID {}",
-                    msg.id
-                ))
-            })?;
-
-            subscribed.recv_unsubscribe()?;
+            if let Some(subscribed) = subscribeds.get_mut(&msg.id) {
+                subscribed.recv_unsubscribe()?;
+            } else {
+                return Ok(());
+            }
         }
 
-        self.remove_subscribe(msg.id)?;
-
-        Ok(())
+        self.remove_subscribe(msg.id)
     }
 
     /// Pre-send hook: clean up internal state when terminal publisher messages are enqueued.

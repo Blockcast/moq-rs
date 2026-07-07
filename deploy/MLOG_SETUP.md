@@ -136,16 +136,18 @@ The relay received your PUBLISH_NAMESPACE for `/moq-test/interop`.
   "data": {
     "event_type": "control_message_created",
     "stream_id": 0,
-    "message_type": "publish_namespace_ok",
-    "request_id": 0
+    "message_type": "request_ok",
+    "request_id": 0,
+    "request_kind": "publish_namespace",
+    "parameters": []
   }
 }
 ```
-The relay accepted the namespace with PUBLISH_NAMESPACE_OK. Your client is now registered as a publisher for this namespace, and the relay will route incoming subscriptions to you.
+The relay accepted the namespace with REQUEST_OK for `request_kind: "publish_namespace"`. Your client is now registered as a publisher for this namespace, and the relay will route incoming subscriptions to you.
 
 **What to look for:**
 - `publish_namespace` parsed confirms the relay received your announcement
-- `publish_namespace_ok` created confirms it was accepted
+- `request_ok` created with `request_kind: "publish_namespace"` confirms it was accepted
 - The `request_id` ties the response to the request
 
 ### Example 3: Full publish-subscribe flow (`publish-namespace-subscribe`)
@@ -184,7 +186,7 @@ curl https://interop-relay.cloudflare.mediaoverquic.com:443/mlog/08d0b03ede133f0
 
 ```json
 {"time":231.481,"name":"moqt:control_message_parsed","data":{"message_type":"publish_namespace","request_id":0,"track_namespace":"/moq-test/interop",...}}
-{"time":233.084,"name":"moqt:control_message_created","data":{"message_type":"publish_namespace_ok","request_id":0}}
+{"time":233.084,"name":"moqt:control_message_created","data":{"message_type":"request_ok","request_id":0,"request_kind":"publish_namespace","parameters":[]}}
 ```
 
 The publisher announced `/moq-test/interop` and the relay accepted it.
@@ -270,8 +272,8 @@ These appear in the `message_type` field of control message events:
 | Message Type | Protocol Reference |
 |-------------|-------------------|
 | `client_setup` / `server_setup` | MoQT §3.3 |
-| `publish_namespace` / `publish_namespace_ok` | MoQT §6.2 |
-| `subscribe` / `subscribe_ok` / `subscribe_error` | MoQT §5.1 |
+| `publish_namespace` / `request_ok` with `request_kind: "publish_namespace"` | MoQT §6.2, §9.7 |
+| `subscribe` / `subscribe_ok` / `request_error` with `request_kind: "subscribe"` | MoQT §5.1, §9.8 |
 | `unsubscribe` | MoQT §5.1 |
 
 ### Known limitations
