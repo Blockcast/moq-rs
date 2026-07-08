@@ -44,15 +44,19 @@ struct PendingRequestState {
 
 impl PendingRequest {
     fn accepts(self, response: PendingResponse) -> bool {
-        match (self, response) {
+        matches!(
+            (self, response),
             (
                 Self::PublishNamespace,
                 PendingResponse::RequestOk | PendingResponse::RequestError,
-            ) => true,
-            (Self::Publish, PendingResponse::PublishOk | PendingResponse::RequestError) => true,
-            (Self::Subscribe, PendingResponse::SubscribeOk | PendingResponse::RequestError) => true,
-            _ => false,
-        }
+            ) | (
+                Self::Publish,
+                PendingResponse::PublishOk | PendingResponse::RequestError
+            ) | (
+                Self::Subscribe,
+                PendingResponse::SubscribeOk | PendingResponse::RequestError,
+            )
+        )
     }
 }
 

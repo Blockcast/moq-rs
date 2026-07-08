@@ -178,7 +178,7 @@ impl Drop for Published {
 
         let state = match self.state.try_lock() {
             Ok(state) => state,
-            Err(()) => {
+            Err(_) => {
                 tracing::error!(
                     request_id = self.info.id,
                     "published state lock poisoned while dropping PUBLISH"

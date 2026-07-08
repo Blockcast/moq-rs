@@ -58,6 +58,11 @@ pub struct State<T> {
     drop: Arc<StateDrop<T>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateError {
+    Poisoned,
+}
+
 impl<T> State<T> {
     pub fn new(initial: T) -> Self {
         let state = Arc::new(Mutex::new(StateInner::new(initial)));
@@ -76,8 +81,8 @@ impl<T> State<T> {
         }
     }
 
-    pub fn try_lock(&self) -> Result<StateRef<'_, T>, ()> {
-        let lock = self.state.lock().map_err(|_| ())?;
+    pub fn try_lock(&self) -> Result<StateRef<'_, T>, StateError> {
+        let lock = self.state.lock().map_err(|_| StateError::Poisoned)?;
         Ok(StateRef {
             state: self.state.clone(),
             drop: self.drop.clone(),
@@ -94,8 +99,8 @@ impl<T> State<T> {
         })
     }
 
-    pub fn try_lock_mut(&self) -> Result<Option<StateMut<'_, T>>, ()> {
-        let lock = self.state.lock().map_err(|_| ())?;
+    pub fn try_lock_mut(&self) -> Result<Option<StateMut<'_, T>>, StateError> {
+        let lock = self.state.lock().map_err(|_| StateError::Poisoned)?;
         if lock.dropped.is_none() {
             return Ok(None);
         }

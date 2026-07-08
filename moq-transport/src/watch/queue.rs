@@ -26,7 +26,7 @@ impl<T> Queue<T> {
         match self.state.try_lock_mut() {
             Ok(Some(mut state)) => state.push_back((item, None)),
             Ok(None) => return Err(item),
-            Err(()) => {
+            Err(_) => {
                 tracing::error!("queue lock poisoned while pushing item");
                 return Err(item);
             }
