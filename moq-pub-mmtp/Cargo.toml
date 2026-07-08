@@ -28,6 +28,10 @@ url = "2"
 bytes = "1"
 
 tokio = { version = "1", features = ["full"] }
+# Source-specific (S,G) multicast joins: std/tokio only expose ASM
+# (`join_multicast_v4` = IP_ADD_MEMBERSHIP). SSM groups (232.0.0.0/8) require
+# IP_ADD_SOURCE_MEMBERSHIP, which socket2 exposes as `join_ssm_v4`.
+socket2 = { version = "0.5", features = ["all"] }
 
 clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
