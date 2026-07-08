@@ -63,6 +63,17 @@ pub struct Args {
     #[arg(long = "mmtp-udp-iface-index")]
     pub mmtp_udp_iface_index: Option<u32>,
 
+    /// Seconds between periodic SSM membership re-reports. REQUIRED whenever a
+    /// source-specific join is in effect (--mmtp-udp-source + multicast target):
+    /// the receive fabric has no IGMP/MLD querier, so nothing prompts the host
+    /// to re-report and the switch's snooping entry ages out (~260s, = IGMP
+    /// Group Membership Interval), silently killing forwarding on a live stream.
+    /// The receiver must self-refresh below the fabric's IGMP Query Interval
+    /// (default 125s per RFC 3376) — e.g. 60. No default: an unset value with
+    /// SSM enabled is a hard error, not a silent guess. Ignored for ASM/unicast.
+    #[arg(long = "mmtp-membership-refresh-secs")]
+    pub mmtp_membership_refresh_secs: Option<u64>,
+
     /// Client-side UDP bind for the QUIC/WebTransport connection to the relay.
     #[arg(long, default_value = "[::]:0")]
     pub bind: std::net::SocketAddr,

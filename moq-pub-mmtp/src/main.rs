@@ -86,17 +86,28 @@ async fn main() -> Result<()> {
         .await
         .context("failed to create MoQ Transport publisher")?;
 
-    // Subscription-driven multicast re-join: `announce` forwards each inbound
-    // subscribe's track name here, and run_udp_loop refreshes the SSM
-    // membership on each — re-arming the switch's snooping entry (whose
-    // forwarding ages out without an IGMP querier) on subscriber demand rather
-    // than a timer. Unbounded so announce never blocks on the loop.
+    // Subscription-gated multicast membership: `announce` forwards each inbound
+    // subscribe's start/end here so run_udp_loop JOINS the SSM (S,G) on the
+    // first subscriber (0→1) and LEAVES when the last one drops (1→0). While the
+    // membership is held it is re-reported on a periodic timer
+    // (--mmtp-membership-refresh-secs) to re-arm the switch's snooping entry,
+    // which ages out without an IGMP querier — subscribe events don't recur for
+    // a stable viewer, so demand only gates; the timer maintains. Unbounded so
+    // announce never blocks on the loop.
     let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<(bool, String)>();
+
+    let udp_cfg = UdpRecvConfig {
+        bind: args.mmtp_udp_bind,
+        source: args.mmtp_udp_source,
+        iface: args.mmtp_udp_iface,
+        iface_index: args.mmtp_udp_iface_index,
+        membership_refresh_secs: args.mmtp_membership_refresh_secs,
+    };
 
     tokio::select! {
         res = session.run() => res.context("session error")?,
         res = publisher.announce(tracks_reader, Some(sub_tx)) => res.context("publisher error")?,
-        res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, args.mmtp_udp_source, args.mmtp_udp_iface, args.mmtp_udp_iface_index, router, tracks_writer, sub_rx) => res.context("publisher loop error")?,
+        res = run_publisher(args.mmtp_input, udp_cfg, router, tracks_writer, sub_rx) => res.context("publisher loop error")?,
     }
 
     Ok(())
@@ -411,6 +422,17 @@ fn build_datagram_state(
     Ok(DatagramState::new(track.name.clone(), 0, subgroups))
 }
 
+/// UDP receive-side configuration for the `--mmtp-input=udp` path. Groups the
+/// bind target, the SSM source/interface selectors, and the membership-refresh
+/// cadence so the publisher dispatcher stays a thin, few-argument function.
+struct UdpRecvConfig {
+    bind: std::net::SocketAddr,
+    source: Option<std::net::IpAddr>,
+    iface: Option<std::net::Ipv4Addr>,
+    iface_index: Option<u32>,
+    membership_refresh_secs: Option<u64>,
+}
+
 /// Drive the publisher loop until the input ends.
 ///
 /// `tracks_writer` is held here only to keep the broadcast alive — once
@@ -418,19 +440,44 @@ fn build_datagram_state(
 /// and close the session early.
 async fn run_publisher(
     input: MmtpInput,
-    udp_bind: std::net::SocketAddr,
-    udp_source: Option<std::net::IpAddr>,
-    udp_iface: Option<std::net::Ipv4Addr>,
-    udp_iface_index: Option<u32>,
+    udp: UdpRecvConfig,
     mut router: Router,
     _tracks_writer: TracksWriter,
     sub_rx: tokio::sync::mpsc::UnboundedReceiver<(bool, String)>,
 ) -> Result<()> {
     match input {
         MmtpInput::Stdin => run_stdin_loop(&mut router).await,
-        MmtpInput::Udp => {
-            run_udp_loop(udp_bind, udp_source, udp_iface, udp_iface_index, &mut router, sub_rx).await
+        MmtpInput::Udp => run_udp_loop(udp, &mut router, sub_rx).await,
+    }
+}
+
+/// Resolve the periodic SSM membership-refresh interval.
+///
+/// SSM (a `Some` membership) REQUIRES an explicit interval: the receive fabric
+/// has no IGMP/MLD querier, so the receiver must self-report below the fabric's
+/// query interval or the switch's snooping entry ages out (~260s) and silently
+/// stops forwarding. No default — an unset value with SSM enabled is a hard
+/// error, not a guess. ASM/unicast (`None` membership) never refreshes.
+fn membership_refresh_period(
+    membership: Option<udp::SsmMembership>,
+    refresh_secs: Option<u64>,
+) -> Result<Option<std::time::Duration>> {
+    match membership {
+        Some(_) => {
+            let secs = refresh_secs.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--mmtp-membership-refresh-secs is required for an SSM (source-specific) \
+                     join: with no IGMP querier on the receive fabric the host must periodically \
+                     re-report membership below the IGMP Query Interval (default 125s), else the \
+                     switch snooping entry ages out (~260s) and forwarding stops mid-stream"
+                )
+            })?;
+            if secs == 0 {
+                bail!("--mmtp-membership-refresh-secs must be > 0");
+            }
+            Ok(Some(std::time::Duration::from_secs(secs)))
         }
+        None => Ok(None),
     }
 }
 
@@ -438,21 +485,39 @@ async fn run_publisher(
 /// Per T4: the datagram boundary IS the framing — no length prefix. The
 /// `Router` interprets each datagram per the catalog's packaging.
 async fn run_udp_loop(
-    bind: std::net::SocketAddr,
-    source: Option<std::net::IpAddr>,
-    iface: Option<std::net::Ipv4Addr>,
-    iface_index: Option<u32>,
+    udp: UdpRecvConfig,
     router: &mut Router,
     mut sub_rx: tokio::sync::mpsc::UnboundedReceiver<(bool, String)>,
 ) -> Result<()> {
-    // For an SSM (source-specific) group the membership is DEMAND-DRIVEN:
-    // open_udp_socket binds but does NOT join. We join on the first subscribe,
-    // refresh (leave+join) on each subsequent one to re-arm the switch's IGMP
-    // snooping entry (which ages out without a querier), and leave when the
-    // last subscriber drops. Non-SSM (loopback tests / unicast) joins at open.
+    let UdpRecvConfig {
+        bind,
+        source,
+        iface,
+        iface_index,
+        membership_refresh_secs,
+    } = udp;
+    // For an SSM (source-specific) group the membership is DEMAND-GATED but
+    // TIMER-MAINTAINED: open_udp_socket binds without joining. We JOIN on the
+    // first subscriber (0→1) and LEAVE when the last one drops (1→0). While the
+    // membership is held a periodic timer re-reports it — subscribe events do
+    // NOT recur for a stable viewer (the relay forwards one upstream subscribe
+    // per track and fans out the rest), so only the timer re-arms the switch's
+    // snooping entry, which ages out without an IGMP querier. Non-SSM
+    // (loopback tests / unicast) joins at open and never refreshes.
     let membership = udp::ssm_membership(bind, source, iface, iface_index)?;
     let socket = udp::open_udp_socket(bind, membership.is_some(), iface).await?;
     tracing::info!(addr = %socket.local_addr()?, "listening for datagrams");
+
+    // Required-when-SSM: errors here rather than silently running without a
+    // refresh cadence (which would reproduce the age-out bug).
+    let refresh_period = membership_refresh_period(membership, membership_refresh_secs)?;
+    let mut refresh_timer = refresh_period.map(|period| {
+        let mut iv = tokio::time::interval(period);
+        // If the recv arm monopolises the loop, coalesce missed ticks instead
+        // of firing a burst of catch-up refreshes.
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        iv
+    });
 
     let mut active_subs: u32 = 0;
     let mut joined = false;
@@ -472,6 +537,22 @@ async fn run_udp_loop(
                     tracing::debug!(packet_count, "UDP packets dispatched");
                 }
             }
+            // Periodic membership re-report while the group is held. The arm is
+            // inert (never resolves) when there is no timer (ASM/unicast).
+            _ = async {
+                match refresh_timer.as_mut() {
+                    Some(iv) => { iv.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if joined {
+                    if let Some(m) = membership {
+                        udp::refresh_ssm(&socket, &m)
+                            .context("periodic SSM membership refresh")?;
+                        tracing::debug!(active_subs, "periodic SSM membership re-report");
+                    }
+                }
+            }
             ev = sub_rx.recv() => {
                 let Some((started, track)) = ev else {
                     // Hook gone (session ending): stop managing membership but
@@ -481,12 +562,17 @@ async fn run_udp_loop(
                 let Some(m) = membership else { continue };
                 if started {
                     active_subs += 1;
-                    // Join on the first subscriber; refresh (leave+join) on each
-                    // subsequent one so the IGMP report is re-sent.
-                    udp::refresh_ssm(&socket, &m)
-                        .with_context(|| format!("refresh SSM on subscribe to '{track}'"))?;
-                    joined = true;
-                    tracing::info!(track, active_subs, "subscribe → SSM (re)join");
+                    // Join only on the 0→1 transition; additional subscribers
+                    // fan out from the existing membership. The timer, not the
+                    // subscribe event, keeps it alive thereafter.
+                    if !joined {
+                        udp::refresh_ssm(&socket, &m)
+                            .with_context(|| format!("SSM join on first subscribe to '{track}'"))?;
+                        joined = true;
+                        tracing::info!(track, active_subs, "first subscribe → SSM join");
+                    } else {
+                        tracing::debug!(track, active_subs, "additional subscribe (membership held)");
+                    }
                 } else {
                     active_subs = active_subs.saturating_sub(1);
                     if active_subs == 0 && joined {
@@ -902,6 +988,50 @@ mod tests {
             err.to_string().contains("namespace"),
             "expected namespace mismatch err, got: {err}"
         );
+    }
+
+    #[test]
+    fn membership_refresh_period_requires_secs_for_ssm() {
+        // SSM membership present but no interval → hard error (age-out bug guard).
+        let m = Some(udp::SsmMembership::V4 {
+            source: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            group: std::net::Ipv4Addr::new(232, 0, 0, 1),
+            iface: std::net::Ipv4Addr::UNSPECIFIED,
+        });
+        let err = membership_refresh_period(m, None).unwrap_err();
+        assert!(
+            err.to_string().contains("mmtp-membership-refresh-secs is required"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn membership_refresh_period_rejects_zero() {
+        let m = Some(udp::SsmMembership::V4 {
+            source: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            group: std::net::Ipv4Addr::new(232, 0, 0, 1),
+            iface: std::net::Ipv4Addr::UNSPECIFIED,
+        });
+        let err = membership_refresh_period(m, Some(0)).unwrap_err();
+        assert!(err.to_string().contains("must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn membership_refresh_period_ssm_returns_duration() {
+        let m = Some(udp::SsmMembership::V4 {
+            source: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            group: std::net::Ipv4Addr::new(232, 0, 0, 1),
+            iface: std::net::Ipv4Addr::UNSPECIFIED,
+        });
+        let p = membership_refresh_period(m, Some(60)).unwrap();
+        assert_eq!(p, Some(std::time::Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn membership_refresh_period_non_ssm_never_refreshes() {
+        // No membership → None regardless of the flag (which is ignored for ASM/unicast).
+        assert_eq!(membership_refresh_period(None, None).unwrap(), None);
+        assert_eq!(membership_refresh_period(None, Some(60)).unwrap(), None);
     }
 
     #[test]
