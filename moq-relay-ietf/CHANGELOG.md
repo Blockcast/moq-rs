@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.21](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.20...moq-relay-ietf-v0.7.21) - 2026-07-08
+
+### Added
+
+- *(moq-relay-ietf)* expose relay session config
+
+### Other
+
+- *(moq-relay-ietf)* remove redundant session config binding
+- *(moq-relay-ietf)* remove manual changelog entry
+
 ## [0.7.20](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.19...moq-relay-ietf-v0.7.20) - 2026-07-08
 
 ### Other
