@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
     tokio::select! {
         res = session.run() => res.context("session error")?,
         res = publisher.announce(tracks_reader) => res.context("publisher error")?,
-        res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, router, tracks_writer) => res.context("publisher loop error")?,
+        res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, args.mmtp_udp_source, args.mmtp_udp_iface, router, tracks_writer) => res.context("publisher loop error")?,
     }
 
     Ok(())
@@ -412,23 +412,32 @@ fn build_datagram_state(
 async fn run_publisher(
     input: MmtpInput,
     udp_bind: std::net::SocketAddr,
+    udp_source: Option<std::net::Ipv4Addr>,
+    udp_iface: Option<std::net::Ipv4Addr>,
     mut router: Router,
     _tracks_writer: TracksWriter,
 ) -> Result<()> {
     match input {
         MmtpInput::Stdin => run_stdin_loop(&mut router).await,
-        MmtpInput::Udp => run_udp_loop(udp_bind, &mut router).await,
+        MmtpInput::Udp => run_udp_loop(udp_bind, udp_source, udp_iface, &mut router).await,
     }
 }
 
 /// Drive the publisher loop reading one packet/datagram per UDP datagram.
 /// Per T4: the datagram boundary IS the framing — no length prefix. The
 /// `Router` interprets each datagram per the catalog's packaging.
-async fn run_udp_loop(bind: std::net::SocketAddr, router: &mut Router) -> Result<()> {
+async fn run_udp_loop(
+    bind: std::net::SocketAddr,
+    source: Option<std::net::Ipv4Addr>,
+    iface: Option<std::net::Ipv4Addr>,
+    router: &mut Router,
+) -> Result<()> {
     // open_udp_socket binds + (for multicast targets) joins the group
     // and enables loopback so cast/ffmpeg's multicast emission via
-    // `moqenc_mmt` lands here without a separate flag.
-    let socket = udp::open_udp_socket(bind).await?;
+    // `moqenc_mmt` lands here without a separate flag. `source` selects a
+    // source-specific (S,G) join for SSM groups (232.0.0.0/8); `iface`
+    // (or a matching route) pins the join to the multicast-bearing NIC.
+    let socket = udp::open_udp_socket(bind, source, iface).await?;
     tracing::info!(addr = %socket.local_addr()?, "listening for datagrams");
     // 65536 covers any IPv4/IPv6 MTU; oversized datagrams get truncated.
     let mut buf = vec![0u8; 65_536];

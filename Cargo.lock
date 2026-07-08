@@ -1470,6 +1470,7 @@ dependencies = [
  "moq-native-ietf",
  "moq-transport",
  "serde_json",
+ "socket2 0.5.7",
  "tokio",
  "tracing",
  "tracing-subscriber",
