@@ -41,7 +41,7 @@ impl Producer {
 
     /// Announce new tracks to the remote server.
     pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        self.publisher.announce(tracks).await
+        self.publisher.announce(tracks, None).await
     }
 
     /// Run the producer to serve subscribe requests.

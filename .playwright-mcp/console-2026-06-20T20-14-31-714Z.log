@@ -1,0 +1,41 @@
+[    1128ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ https://moq.moq-youtube.public-st.cdn.blockcast.net/favicon.ico:0
+[    1141ms] [LOG] [libmmt-wasm] Initialized with SIMD128 support @ https://moq.moq-youtube.public-st.cdn.blockcast.net/vendor/fec/mmt_wasm.js:1311
+[    3103ms] [LOG] [multicast-bridge] Polling for IWA bridge via mDNS/AutoTLS/loopback:33446... @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:1855
+[    3114ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[    3117ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[    3120ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[    3122ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[    3125ms] [ERROR] WebSocket connection to 'ws://localhost:33446/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:785
+[    3136ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:33446/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:785
+[   12315ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[   12317ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[   12320ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[   12322ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[   12324ms] [ERROR] WebSocket connection to 'ws://localhost:33446/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:785
+[   12334ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:33446/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:785
+[   25088ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[   25090ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[   25092ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[   25094ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[   25095ms] [ERROR] WebSocket connection to 'ws://localhost:33446/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:785
+[   25106ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:33446/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:785
+[   46092ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[   46095ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[   46098ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[   46100ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[   46104ms] [ERROR] WebSocket connection to 'ws://localhost:33446/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:785
+[   46119ms] [ERROR] WebSocket connection to 'ws://127.0.0.1:33446/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:785
+[   78087ms] [ERROR] Access to fetch at 'http://localhost:33446/health' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   78087ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://localhost:33446/health:0
+[   78092ms] [ERROR] Access to fetch at 'http://127.0.0.1:33446/health' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   78092ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:33446/health:0
+[   78095ms] [ERROR] Access to fetch at 'http://localhost:33446/certificate.sha256' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   78095ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://localhost:33446/certificate.sha256:0
+[   78100ms] [ERROR] Access to fetch at 'http://127.0.0.1:33446/certificate.sha256' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   78101ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:33446/certificate.sha256:0
+[   78153ms] [ERROR] Failed to load resource: net::ERR_SSL_PROTOCOL_ERROR @ https://localhost:33446/health:0
+[   78155ms] [ERROR] Access to fetch at 'http://localhost:33446/health' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   78156ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://localhost:33446/health:0
+[   78156ms] [LOG] [multicast-bridge] Bridge discovered via WebSocket probe on localhost:33446 @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:823
+[   78158ms] [WARNING] [multicast-bridge] Bridge connect failed: No WebTransport candidates (need a fingerprint, AutoTLS gateway, or DNS host) @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:1846
+[   78158ms] [LOG] [multicast-bridge] Polling for IWA bridge via mDNS/AutoTLS/loopback:33446... @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js:1855

@@ -94,7 +94,19 @@ impl Publisher {
 
     /// Announce a namespace and serve tracks using the provided [serve::TracksReader].
     /// The caller uses [serve::TracksWriter] for static tracks and [serve::TracksRequest] for dynamic tracks.
-    pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+    ///
+    /// Subscribe lifecycle is forwarded on `on_subscribe` (if set) as
+    /// `(started, track_name)`: `true` when a subscribe begins (before serving),
+    /// `false` when it ends (subscriber dropped). A publisher bridging an
+    /// external source can use this to hold source-side state only while there
+    /// is demand — e.g. join an IGMP membership on the first subscribe, refresh
+    /// it on each subsequent one, and leave it when the last subscriber drops —
+    /// instead of a timer.
+    pub async fn announce(
+        &mut self,
+        tracks: TracksReader,
+        on_subscribe: Option<tokio::sync::mpsc::UnboundedSender<(bool, String)>>,
+    ) -> Result<(), SessionError> {
         // Check if annouce for this namespace already exists or not, and if not, then create a new Announce
         let announce = match self
             .announces
@@ -134,6 +146,13 @@ impl Publisher {
                 res = announce.subscribed(), if !subscribe_done => {
                     match res? {
                         Some(subscribed) => {
+                            let track_name = subscribed.info.track_name.clone();
+                            // Notify the caller a subscribe began (best-effort;
+                            // a dropped receiver just disables the hook).
+                            if let Some(tx) = &on_subscribe {
+                                let _ = tx.send((true, track_name.clone()));
+                            }
+
                             let tracks = tracks.clone();
 
                             subscribe_tasks.push(async move {
@@ -141,6 +160,9 @@ impl Publisher {
                                 if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
                                     tracing::warn!("failed serving subscribe: {:?}, error: {}", info, err)
                                 }
+                                // Returned so the loop can emit the subscribe-end
+                                // event with the track name once serving stops.
+                                track_name
                             });
                         },
                         None => subscribe_done = true,
@@ -162,7 +184,12 @@ impl Publisher {
                         None => status_done = true,
                     }
                 },
-                Some(res) = subscribe_tasks.next() => res,
+                Some(track_name) = subscribe_tasks.next() => {
+                    // A subscribe finished serving (subscriber dropped) — emit end.
+                    if let Some(tx) = &on_subscribe {
+                        let _ = tx.send((false, track_name));
+                    }
+                },
                 Some(res) = status_tasks.next() => res,
                 else => return Ok(())
             }

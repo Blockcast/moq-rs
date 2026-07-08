@@ -42,22 +42,26 @@ pub struct Args {
     #[arg(long = "mmtp-udp-bind", default_value = "0.0.0.0:0")]
     pub mmtp_udp_bind: std::net::SocketAddr,
 
-    /// Source-Specific Multicast (SSM) source address. When set AND the
-    /// --mmtp-udp-bind target is multicast, the receiver issues a
-    /// source-specific (S,G) join (IP_ADD_SOURCE_MEMBERSHIP) instead of an
-    /// any-source (*,G) join. REQUIRED for SSM groups (232.0.0.0/8): the
-    /// multicast fabric only forwards SSM traffic to receivers that name the
-    /// source, so a plain (*,G) join receives nothing. Omit for ASM groups
+    /// Source-Specific Multicast (SSM) source address (IPv4 or IPv6). When set
+    /// AND the --mmtp-udp-bind target is multicast of the same family, the
+    /// receiver issues a source-specific (S,G) join instead of an any-source
+    /// (*,G) join. REQUIRED for SSM groups (232.0.0.0/8, ff3x::/... source-
+    /// specific): the fabric only forwards SSM traffic to receivers that name
+    /// the source, so a plain (*,G) join receives nothing. Omit for ASM groups
     /// or loopback smoke tests.
     #[arg(long = "mmtp-udp-source")]
-    pub mmtp_udp_source: Option<std::net::Ipv4Addr>,
+    pub mmtp_udp_source: Option<std::net::IpAddr>,
 
-    /// Local interface IPv4 address to join the multicast group on
-    /// (imr_interface). Omit to let the kernel pick via the route to the
-    /// group — pair that with a `ip route … dev <iface>` route so the join
-    /// lands on the multicast-bearing interface (e.g. a Multus secondary).
+    /// Local interface IPv4 address (imr_interface) for an IPv4 SSM join. Omit
+    /// to let the route to the group pick the NIC. IPv6 uses
+    /// --mmtp-udp-iface-index instead.
     #[arg(long = "mmtp-udp-iface")]
     pub mmtp_udp_iface: Option<std::net::Ipv4Addr>,
+
+    /// Local interface index for an IPv6 SSM join (0 = pick via route). IPv4
+    /// uses --mmtp-udp-iface instead.
+    #[arg(long = "mmtp-udp-iface-index")]
+    pub mmtp_udp_iface_index: Option<u32>,
 
     /// Client-side UDP bind for the QUIC/WebTransport connection to the relay.
     #[arg(long, default_value = "[::]:0")]

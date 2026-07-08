@@ -86,10 +86,17 @@ async fn main() -> Result<()> {
         .await
         .context("failed to create MoQ Transport publisher")?;
 
+    // Subscription-driven multicast re-join: `announce` forwards each inbound
+    // subscribe's track name here, and run_udp_loop refreshes the SSM
+    // membership on each — re-arming the switch's snooping entry (whose
+    // forwarding ages out without an IGMP querier) on subscriber demand rather
+    // than a timer. Unbounded so announce never blocks on the loop.
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<(bool, String)>();
+
     tokio::select! {
         res = session.run() => res.context("session error")?,
-        res = publisher.announce(tracks_reader) => res.context("publisher error")?,
-        res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, args.mmtp_udp_source, args.mmtp_udp_iface, router, tracks_writer) => res.context("publisher loop error")?,
+        res = publisher.announce(tracks_reader, Some(sub_tx)) => res.context("publisher error")?,
+        res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, args.mmtp_udp_source, args.mmtp_udp_iface, args.mmtp_udp_iface_index, router, tracks_writer, sub_rx) => res.context("publisher loop error")?,
     }
 
     Ok(())
@@ -412,14 +419,18 @@ fn build_datagram_state(
 async fn run_publisher(
     input: MmtpInput,
     udp_bind: std::net::SocketAddr,
-    udp_source: Option<std::net::Ipv4Addr>,
+    udp_source: Option<std::net::IpAddr>,
     udp_iface: Option<std::net::Ipv4Addr>,
+    udp_iface_index: Option<u32>,
     mut router: Router,
     _tracks_writer: TracksWriter,
+    sub_rx: tokio::sync::mpsc::UnboundedReceiver<(bool, String)>,
 ) -> Result<()> {
     match input {
         MmtpInput::Stdin => run_stdin_loop(&mut router).await,
-        MmtpInput::Udp => run_udp_loop(udp_bind, udp_source, udp_iface, &mut router).await,
+        MmtpInput::Udp => {
+            run_udp_loop(udp_bind, udp_source, udp_iface, udp_iface_index, &mut router, sub_rx).await
+        }
     }
 }
 
@@ -428,29 +439,63 @@ async fn run_publisher(
 /// `Router` interprets each datagram per the catalog's packaging.
 async fn run_udp_loop(
     bind: std::net::SocketAddr,
-    source: Option<std::net::Ipv4Addr>,
+    source: Option<std::net::IpAddr>,
     iface: Option<std::net::Ipv4Addr>,
+    iface_index: Option<u32>,
     router: &mut Router,
+    mut sub_rx: tokio::sync::mpsc::UnboundedReceiver<(bool, String)>,
 ) -> Result<()> {
-    // open_udp_socket binds + (for multicast targets) joins the group
-    // and enables loopback so cast/ffmpeg's multicast emission via
-    // `moqenc_mmt` lands here without a separate flag. `source` selects a
-    // source-specific (S,G) join for SSM groups (232.0.0.0/8); `iface`
-    // (or a matching route) pins the join to the multicast-bearing NIC.
-    let socket = udp::open_udp_socket(bind, source, iface).await?;
+    // For an SSM (source-specific) group the membership is DEMAND-DRIVEN:
+    // open_udp_socket binds but does NOT join. We join on the first subscribe,
+    // refresh (leave+join) on each subsequent one to re-arm the switch's IGMP
+    // snooping entry (which ages out without a querier), and leave when the
+    // last subscriber drops. Non-SSM (loopback tests / unicast) joins at open.
+    let membership = udp::ssm_membership(bind, source, iface, iface_index)?;
+    let socket = udp::open_udp_socket(bind, membership.is_some(), iface).await?;
     tracing::info!(addr = %socket.local_addr()?, "listening for datagrams");
+
+    let mut active_subs: u32 = 0;
+    let mut joined = false;
+
     // 65536 covers any IPv4/IPv6 MTU; oversized datagrams get truncated.
     let mut buf = vec![0u8; 65_536];
     let mut packet_count: u64 = 0;
     loop {
-        recv_one_udp_packet(&socket, router, &mut buf).await?;
-        packet_count = packet_count.wrapping_add(1);
-        // `% == 0` is kept over `u64::is_multiple_of` (stable only since Rust
-        // 1.87) to honor the repo's documented 1.70+ MSRV — same rationale as
-        // moq-catalog's group-duration exactness check.
-        #[allow(clippy::manual_is_multiple_of)]
-        if packet_count % 1000 == 0 {
-            tracing::debug!(packet_count, "UDP packets dispatched");
+        tokio::select! {
+            res = recv_one_udp_packet(&socket, router, &mut buf) => {
+                res?;
+                packet_count = packet_count.wrapping_add(1);
+                // `% == 0` is kept over `u64::is_multiple_of` (stable only since
+                // Rust 1.87) to honor the repo's documented 1.70+ MSRV.
+                #[allow(clippy::manual_is_multiple_of)]
+                if packet_count % 1000 == 0 {
+                    tracing::debug!(packet_count, "UDP packets dispatched");
+                }
+            }
+            ev = sub_rx.recv() => {
+                let Some((started, track)) = ev else {
+                    // Hook gone (session ending): stop managing membership but
+                    // keep draining any in-flight datagrams until the loop exits.
+                    continue;
+                };
+                let Some(m) = membership else { continue };
+                if started {
+                    active_subs += 1;
+                    // Join on the first subscriber; refresh (leave+join) on each
+                    // subsequent one so the IGMP report is re-sent.
+                    udp::refresh_ssm(&socket, &m)
+                        .with_context(|| format!("refresh SSM on subscribe to '{track}'"))?;
+                    joined = true;
+                    tracing::info!(track, active_subs, "subscribe → SSM (re)join");
+                } else {
+                    active_subs = active_subs.saturating_sub(1);
+                    if active_subs == 0 && joined {
+                        udp::leave_ssm(&socket, &m);
+                        joined = false;
+                        tracing::info!(track, "last unsubscribe → SSM leave");
+                    }
+                }
+            }
         }
     }
 }

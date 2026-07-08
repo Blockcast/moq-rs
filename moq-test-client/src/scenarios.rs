@@ -107,7 +107,7 @@ pub async fn test_announce_only(args: &Args) -> Result<TestConnectionIds> {
         // We accept this limitation since (b) would indicate a broken relay anyway.
         // TODO: For stricter verification, use lower-level Announce::ok() method directly.
         let announce_result = tokio::select! {
-            res = publisher.announce(reader) => res,
+            res = publisher.announce(reader, None) => res,
             res = session.run() => {
                 res.context("session error")?;
                 anyhow::bail!("session ended before announce completed");
@@ -251,7 +251,7 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
         // (either SUBSCRIBE_OK or error) within the timeout.
         tokio::select! {
             // Publisher announces and waits for subscriptions
-            res = publisher.announce(pub_reader) => {
+            res = publisher.announce(pub_reader, None) => {
                 res.context("publisher announce failed")?;
                 tracing::info!("Publisher announce completed");
             }
@@ -308,7 +308,7 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
         // Run announce and wait for OK, then explicitly drop to send PUBLISH_NAMESPACE_DONE.
         // See note in test_announce_only about timeout-based verification.
         let result = tokio::select! {
-            res = publisher.announce(reader) => res,
+            res = publisher.announce(reader, None) => res,
             res = session.run() => {
                 res.context("session error")?;
                 anyhow::bail!("session ended before announce completed");
@@ -397,7 +397,7 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
 
         // Run publisher announce
         tokio::select! {
-            res = publisher.announce(pub_reader) => {
+            res = publisher.announce(pub_reader, None) => {
                 res.context("publisher announce failed")?;
             }
             res = pub_session.run() => {

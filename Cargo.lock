@@ -1465,6 +1465,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "libc",
  "mmt-core",
  "moq-catalog",
  "moq-native-ietf",

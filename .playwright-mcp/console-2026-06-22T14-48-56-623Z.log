@@ -1,0 +1,43 @@
+[     568ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ https://moq.moq-youtube.public-st.cdn.blockcast.net/favicon.ico:0
+[     766ms] [LOG] [libmmt-wasm] Initialized with SIMD128 support @ https://moq.moq-youtube.public-st.cdn.blockcast.net/vendor/fec/mmt_wasm.js:1478
+[    2504ms] [LOG] [multicast-bridge] Polling for IWA bridge via mDNS/AutoTLS/loopback:33446... @ https://moq.moq-youtube.public-st.cdn.blockcast.net/js/multicast-bridge.js?v=c46f8a11ab4e:2180
+[    2532ms] [ERROR] Access to fetch at 'http://localhost:33446/health' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[    2534ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://localhost:33446/health:0
+[    2543ms] [ERROR] Access to fetch at 'http://127.0.0.1:33446/health' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[    2544ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:33446/health:0
+[    2546ms] [ERROR] Access to fetch at 'http://localhost:33446/certificate.sha256' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[    2546ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://localhost:33446/certificate.sha256:0
+[    2548ms] [ERROR] Access to fetch at 'http://127.0.0.1:33446/certificate.sha256' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[    2548ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:33446/certificate.sha256:0
+[   10201ms] [ERROR] Access to fetch at 'http://localhost:33446/health' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   10201ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://localhost:33446/health:0
+[   10215ms] [ERROR] Access to fetch at 'http://127.0.0.1:33446/health' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   10216ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:33446/health:0
+[   10231ms] [ERROR] Access to fetch at 'http://localhost:33446/certificate.sha256' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   10232ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://localhost:33446/certificate.sha256:0
+[   10242ms] [ERROR] Access to fetch at 'http://127.0.0.1:33446/certificate.sha256' from origin 'https://moq.moq-youtube.public-st.cdn.blockcast.net' has been blocked by CORS policy: Permission was denied for this request to access the `loopback` address space. @ https://moq.moq-youtube.public-st.cdn.blockcast.net/players/solana-shreds.html:0
+[   10243ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:33446/certificate.sha256:0
+[   22268ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[   22271ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[   22273ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[   22274ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[   41543ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[   41546ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[   41548ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[   41550ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[   69783ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[   69785ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[   69786ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[   69788ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[  129493ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[  129495ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[  129497ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[  129500ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[  184303ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[  184305ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[  184307ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[  184309ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0
+[  246903ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/health:0
+[  246906ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/health:0
+[  246908ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:33446/certificate.sha256:0
+[  246910ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:33446/certificate.sha256:0

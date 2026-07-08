@@ -32,6 +32,9 @@ tokio = { version = "1", features = ["full"] }
 # (`join_multicast_v4` = IP_ADD_MEMBERSHIP). SSM groups (232.0.0.0/8) require
 # IP_ADD_SOURCE_MEMBERSHIP, which socket2 exposes as `join_ssm_v4`.
 socket2 = { version = "0.5", features = ["all"] }
+# IPv6 source-specific join: socket2 exposes only the v4 SSM helpers, so the
+# v6 (S,G) join/leave uses libc MCAST_JOIN/LEAVE_SOURCE_GROUP directly.
+libc = "0.2"
 
 clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
