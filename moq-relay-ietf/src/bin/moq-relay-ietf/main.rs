@@ -12,7 +12,7 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, Web, WebConfig};
+use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -31,6 +31,10 @@ pub struct Cli {
     /// Directory to write mlog files (one per connection)
     #[arg(long)]
     pub mlog_dir: Option<PathBuf>,
+
+    /// Maximum request ID plus one advertised in MoQT setup.
+    #[arg(long, default_value_t = 100)]
+    pub max_request_id: u64,
 
     /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
     /// If not provided, the relay accepts every unique namespace publish.
@@ -190,6 +194,9 @@ async fn main() -> anyhow::Result<()> {
         node: cli.node,
         announce: cli.announce,
         coordinator,
+        session: SessionConfig {
+            max_request_id: cli.max_request_id,
+        },
     })?;
 
     if cli.dev {
@@ -208,4 +215,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     relay.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_request_id_flag_overrides_default() {
+        let cli = Cli::try_parse_from(["moq-relay-ietf", "--max-request-id", "7"]).unwrap();
+
+        assert_eq!(cli.max_request_id, 7);
+    }
 }
