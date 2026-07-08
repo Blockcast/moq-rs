@@ -9,6 +9,7 @@ use std::sync::{Arc, Weak};
 use moq_native_ietf::quic;
 use moq_transport::coding::{TrackName, TrackNamespace};
 use moq_transport::serve::{Track, TrackReader};
+use moq_transport::session::SessionConfig;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -33,15 +34,76 @@ type TrackSlot = Arc<Mutex<Option<TrackReader>>>;
 pub struct RemoteManager {
     coordinator: Arc<dyn Coordinator>,
     clients: Vec<quic::Client>,
+    session_config: SessionConfig,
     remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopCoordinator;
+
+    #[async_trait::async_trait]
+    impl Coordinator for NoopCoordinator {
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<crate::NamespaceRegistration> {
+            Ok(crate::NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+            Err(crate::CoordinatorError::NamespaceNotFound)
+        }
+    }
+
+    #[test]
+    fn new_uses_default_session_config() {
+        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
+
+        assert_eq!(manager.session_config, SessionConfig::default());
+    }
+
+    #[test]
+    fn new_with_session_config_stores_custom_config() {
+        let config = SessionConfig { max_request_id: 7 };
+        let manager =
+            RemoteManager::new_with_session_config(Arc::new(NoopCoordinator), vec![], config);
+
+        assert_eq!(manager.session_config, config);
+    }
 }
 
 impl RemoteManager {
     /// Create a new RemoteManager.
     pub fn new(coordinator: Arc<dyn Coordinator>, clients: Vec<quic::Client>) -> Self {
+        Self::new_with_session_config(coordinator, clients, SessionConfig::default())
+    }
+
+    /// Create a new RemoteManager with explicit MoQT session configuration.
+    pub fn new_with_session_config(
+        coordinator: Arc<dyn Coordinator>,
+        clients: Vec<quic::Client>,
+        session_config: SessionConfig,
+    ) -> Self {
         Self {
             coordinator,
             clients,
+            session_config,
             remotes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -142,6 +204,7 @@ impl RemoteManager {
                 cache_key.0.clone(),
                 cache_key.1,
                 client,
+                self.session_config,
                 Arc::downgrade(&self.remotes),
                 cache_key.clone(),
                 Arc::downgrade(&slot),
@@ -251,6 +314,7 @@ impl Remote {
         url: Url,
         addr: Option<SocketAddr>,
         client: &quic::Client,
+        session_config: SessionConfig,
         remotes: Weak<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
         cache_key: RemoteCacheKey,
         cache_slot: Weak<Mutex<Option<Remote>>>,
@@ -265,15 +329,20 @@ impl Remote {
             }
         };
 
-        let (session, subscriber) =
-            match moq_transport::session::Subscriber::connect(session, transport).await {
-                Ok(session) => session,
-                Err(err) => {
-                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
-                        .increment(1);
-                    return Err(err.into());
-                }
-            };
+        let (session, subscriber) = match moq_transport::session::Subscriber::connect_with_config(
+            session,
+            transport,
+            session_config,
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                    .increment(1);
+                return Err(err.into());
+            }
+        };
 
         let connected = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();

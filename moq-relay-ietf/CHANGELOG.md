@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Expose relay session configuration for embedders and the relay binary.
+
 ## [0.7.20](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.19...moq-relay-ietf-v0.7.20) - 2026-07-08
 
 ### Other
