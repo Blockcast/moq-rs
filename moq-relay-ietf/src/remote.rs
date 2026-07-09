@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
+use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, RelayInfo, SessionContext};
 
 /// Cache key for upstream relay-to-relay connections.
 ///
@@ -85,6 +85,20 @@ mod tests {
             RemoteManager::new_with_session_config(Arc::new(NoopCoordinator), vec![], config);
 
         assert_eq!(manager.session_config, config);
+    }
+
+    #[test]
+    fn remote_endpoint_context_is_internal() {
+        let url = Url::parse("https://relay.example.com/live").unwrap();
+        let addr = "127.0.0.1:4433".parse().unwrap();
+
+        let context = Remote::context_for_endpoint(url.clone(), Some(addr));
+
+        assert_eq!(context.interface, crate::SessionInterface::Internal);
+        assert!(context.scope().is_none());
+        let peer = context.peer.unwrap();
+        assert_eq!(peer.url, url);
+        assert_eq!(peer.addr, Some(addr));
     }
 }
 
@@ -307,6 +321,7 @@ async fn remove_empty_track_slot(
 #[derive(Clone)]
 struct Remote {
     url: Url,
+    context: SessionContext,
     subscriber: moq_transport::session::Subscriber,
     /// Track subscriptions keyed by full track name.
     tracks: Arc<Mutex<HashMap<TrackCacheKey, TrackSlot>>>,
@@ -355,6 +370,7 @@ impl Remote {
         let connected = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
         let upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
+        let context = Self::context_for_endpoint(url.clone(), addr);
 
         let session_url = url.clone();
         let session_connected = connected.clone();
@@ -398,6 +414,7 @@ impl Remote {
 
         Ok(Self {
             url,
+            context,
             subscriber,
             tracks: Arc::new(Mutex::new(HashMap::new())),
             connected,
@@ -412,6 +429,30 @@ impl Remote {
 
     fn is_same_connection(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.connected, &other.connected)
+    }
+
+    /// Build the [`SessionContext`] for an outbound connection dialed by the
+    /// [`RemoteManager`].
+    ///
+    /// Every connection originated here targets a relay-mesh peer resolved via
+    /// the coordinator for relay-to-relay routing, so it is always tagged
+    /// [`SessionContext::internal`]. Inbound classification (public vs internal)
+    /// is handled separately in `relay.rs` via the connection tagger.
+    ///
+    /// This label is local to this relay and is **not** sent over the wire: the
+    /// relay on the accepting end sees only the raw connection and classifies it
+    /// independently with its own [`ConnectionTagger`]. To have the peer treat
+    /// this link as internal, dial it on an address/SNI/path its tagger
+    /// recognizes.
+    ///
+    /// [`ConnectionTagger`]: crate::ConnectionTagger
+    fn context_for_endpoint(url: Url, addr: Option<SocketAddr>) -> SessionContext {
+        let endpoint = match addr {
+            Some(addr) => RelayInfo::with_addr(url, addr),
+            None => RelayInfo::new(url),
+        };
+
+        SessionContext::internal(None, Some(endpoint))
     }
 
     /// Shutdown the remote connection.
@@ -539,6 +580,7 @@ impl std::fmt::Debug for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Remote")
             .field("url", &self.url.to_string())
+            .field("interface", &self.context.interface)
             .field("connected", &self.is_connected())
             .finish()
     }

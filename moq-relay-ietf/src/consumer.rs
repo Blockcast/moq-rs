@@ -12,7 +12,7 @@ use moq_transport::{
 };
 use tokio::sync::Semaphore;
 
-use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
+use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer, SessionContext};
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
 
@@ -23,10 +23,8 @@ pub struct Consumer {
     locals: Locals,
     coordinator: Arc<dyn Coordinator>,
     forward: Option<Producer>, // Forward all announcements to this subscriber
-    /// The resolved scope identity for this session, if any.
-    /// Produced by `Coordinator::resolve_scope()` from the connection path.
-    /// Passed to coordinator register/lookup calls to isolate namespaces.
-    scope: Option<String>,
+    /// Relay-level context for this MoQT session.
+    context: SessionContext,
     publish_track_permits: Arc<Semaphore>,
 }
 
@@ -36,14 +34,14 @@ impl Consumer {
         locals: Locals,
         coordinator: Arc<dyn Coordinator>,
         forward: Option<Producer>,
-        scope: Option<String>,
+        context: SessionContext,
     ) -> Self {
         Self {
             subscriber,
             locals,
             coordinator,
             forward,
-            scope,
+            context,
             publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
         }
     }
@@ -113,7 +111,7 @@ impl Consumer {
         tracing::debug!(namespace = %ns, "registering namespace route source in locals");
         let (_register, mut requests) = match self
             .locals
-            .register_namespace(self.scope.as_deref(), published_ns.namespace.clone())
+            .register_namespace(self.context.scope(), published_ns.namespace.clone())
             .await
         {
             Ok(reg) => reg,
@@ -129,7 +127,7 @@ impl Consumer {
         tracing::debug!(namespace = %ns, "registering namespace with coordinator");
         let _namespace_registration = match self
             .coordinator
-            .register_namespace(self.scope.as_deref(), &published_ns.namespace)
+            .register_namespace(self.context.scope(), &published_ns.namespace)
             .await
         {
             Ok(reg) => reg,
@@ -239,7 +237,7 @@ impl Consumer {
 
         let _registration = match self
             .locals
-            .register_track(self.scope.as_deref(), reader)
+            .register_track(self.context.scope(), reader)
             .await
         {
             Ok(registration) => registration,
@@ -260,7 +258,7 @@ impl Consumer {
         let track_string = track_name.to_string();
         let _track_registration = match self
             .coordinator
-            .register_track(self.scope.as_deref(), &namespace, &track_string)
+            .register_track(self.context.scope(), &namespace, &track_string)
             .await
         {
             Ok(registration) => registration,

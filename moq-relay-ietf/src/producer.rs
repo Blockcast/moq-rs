@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
-    Coordinator, Locals, NamespaceChange, RemoteManager, TrackChange,
+    Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -25,10 +25,8 @@ pub struct Producer {
     locals: Locals,
     remotes: RemoteManager,
     coordinator: Arc<dyn Coordinator>,
-    /// The resolved scope identity for this session, if any.
-    /// Produced by `Coordinator::resolve_scope()` from the connection path.
-    /// Passed to locals/remotes to isolate namespace lookups.
-    scope: Option<String>,
+    /// Relay-level context for this MoQT session.
+    context: SessionContext,
 }
 
 impl Producer {
@@ -37,14 +35,14 @@ impl Producer {
         locals: Locals,
         remotes: RemoteManager,
         coordinator: Arc<dyn Coordinator>,
-        scope: Option<String>,
+        context: SessionContext,
     ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
             coordinator,
-            scope,
+            context,
         }
     }
 
@@ -143,7 +141,7 @@ impl Producer {
         // 2. PUBLISH_NAMESPACE route source, which triggers upstream SUBSCRIBE
         let mut locals = self.locals.clone();
         if let Some(track) = locals
-            .get_or_request_track(self.scope.as_deref(), namespace.clone(), &track_name)
+            .get_or_request_track(self.context.scope(), namespace.clone(), &track_name)
             .await
         {
             let ns = namespace.to_utf8_path();
@@ -156,7 +154,7 @@ impl Producer {
         // Check remote tracks after local exact tracks and namespace route sources.
         match self
             .remotes
-            .subscribe(self.scope.as_deref(), &namespace, &track_name)
+            .subscribe(self.context.scope(), &namespace, &track_name)
             .await
         {
             Ok(track) => {
@@ -219,10 +217,7 @@ impl Producer {
         let coordinator_subscription = if wants_namespace {
             let subscription = self
                 .coordinator
-                .subscribe_namespace(
-                    self.scope.as_deref(),
-                    &subscribed_namespace.namespace_prefix,
-                )
+                .subscribe_namespace(self.context.scope(), &subscribed_namespace.namespace_prefix)
                 .await?;
 
             for info in &subscription.existing_namespaces {
@@ -317,10 +312,10 @@ impl Producer {
         subscribed_namespace: &mut SubscribedNamespace,
         known: &mut HashSet<TrackNamespace>,
     ) -> Result<(), ServeError> {
-        for namespace in self.locals.list_namespaces_matching(
-            self.scope.as_deref(),
-            &subscribed_namespace.namespace_prefix,
-        ) {
+        for namespace in self
+            .locals
+            .list_namespaces_matching(self.context.scope(), &subscribed_namespace.namespace_prefix)
+        {
             if known.insert(namespace.clone()) {
                 subscribed_namespace.namespace(&namespace)?;
             }
@@ -335,7 +330,7 @@ impl Producer {
         known: &mut HashSet<TrackNamespace>,
         change: NamespaceChange,
     ) -> Result<(), ServeError> {
-        if change.scope.as_deref() != self.scope.as_deref() {
+        if change.scope.as_deref() != self.context.scope() {
             return Ok(());
         }
 
@@ -364,10 +359,7 @@ impl Producer {
     ) -> Result<(), ServeError> {
         let current: HashSet<_> = self
             .locals
-            .list_namespaces_matching(
-                self.scope.as_deref(),
-                &subscribed_namespace.namespace_prefix,
-            )
+            .list_namespaces_matching(self.context.scope(), &subscribed_namespace.namespace_prefix)
             .into_iter()
             .collect();
 
@@ -389,10 +381,10 @@ impl Producer {
         known: &mut HashSet<FullTrackName>,
         publish_tasks: &mut FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
     ) -> Result<(), anyhow::Error> {
-        for track in self.locals.list_tracks_matching(
-            self.scope.as_deref(),
-            &subscribed_namespace.namespace_prefix,
-        ) {
+        for track in self
+            .locals
+            .list_tracks_matching(self.context.scope(), &subscribed_namespace.namespace_prefix)
+        {
             self.publish_track_for_namespace(subscribed_namespace, known, publish_tasks, track)
                 .await?;
         }
@@ -409,7 +401,7 @@ impl Producer {
     ) -> Result<(), anyhow::Error> {
         match change {
             TrackChange::Added { scope, track } => {
-                if scope.as_deref() != self.scope.as_deref()
+                if scope.as_deref() != self.context.scope()
                     || !subscribed_namespace
                         .namespace_prefix
                         .is_prefix_of(&track.namespace)
@@ -421,7 +413,7 @@ impl Producer {
                     .await
             }
             TrackChange::Removed { scope, full_name } => {
-                if scope.as_deref() == self.scope.as_deref() {
+                if scope.as_deref() == self.context.scope() {
                     known.remove(&full_name);
                 }
                 Ok(())
@@ -437,10 +429,7 @@ impl Producer {
     ) -> Result<(), anyhow::Error> {
         let tracks: Vec<_> = self
             .locals
-            .list_tracks_matching(
-                self.scope.as_deref(),
-                &subscribed_namespace.namespace_prefix,
-            )
+            .list_tracks_matching(self.context.scope(), &subscribed_namespace.namespace_prefix)
             .into_iter()
             .map(|track| (full_name_for_track(&track), track))
             .collect();
@@ -519,10 +508,7 @@ impl Producer {
         };
 
         // Check actual local tracks first.
-        if let Some(track) = self
-            .locals
-            .retrieve_track(self.scope.as_deref(), &full_name)
-        {
+        if let Some(track) = self.locals.retrieve_track(self.context.scope(), &full_name) {
             let namespace = full_name.namespace.to_utf8_path();
             let track_name = &full_name.name;
             tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving track_status from local: {:?}", track.info);

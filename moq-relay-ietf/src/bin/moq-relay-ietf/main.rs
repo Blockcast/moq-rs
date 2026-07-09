@@ -197,6 +197,10 @@ async fn main() -> anyhow::Result<()> {
         session: SessionConfig {
             max_request_id: cli.max_request_id,
         },
+        // No connection tagger: the default binary treats every inbound
+        // connection as a public client. Embedders that run relay-to-relay
+        // meshes supply a tagger to mark internal peers.
+        connection_tagger: None,
     })?;
 
     if cli.dev {
