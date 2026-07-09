@@ -6,11 +6,15 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::Tracks,
-    session::{PublishedNamespace, SessionError, Subscriber},
+    message::RequestErrorCode,
+    serve::{ServeError, Tracks},
+    session::{PublishReceived, PublishedNamespace, SessionError, Subscriber},
 };
+use tokio::sync::Semaphore;
 
 use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
+
+const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
@@ -23,6 +27,7 @@ pub struct Consumer {
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to coordinator register/lookup calls to isolate namespaces.
     scope: Option<String>,
+    publish_track_permits: Arc<Semaphore>,
 }
 
 impl Consumer {
@@ -39,16 +44,20 @@ impl Consumer {
             coordinator,
             forward,
             scope,
+            publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
         }
     }
 
-    /// Run the consumer to handle inbound PUBLISH_NAMESPACE requests.
-    pub async fn run(mut self) -> Result<(), SessionError> {
-        let mut tasks = FuturesUnordered::new();
+    /// Run the consumer to handle inbound PUBLISH_NAMESPACE and PUBLISH requests.
+    pub async fn run(self) -> Result<(), SessionError> {
+        let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
+            FuturesUnordered::new();
+        let mut namespace_subscriber = self.subscriber.clone();
+        let mut publish_subscriber = self.subscriber.clone();
 
         loop {
             tokio::select! {
-                Some(published_ns) = self.subscriber.published_namespace() => {
+                Some(published_ns) = namespace_subscriber.published_namespace() => {
                     metrics::counter!("moq_relay_publishers_total").increment(1);
 
                     let this = self.clone();
@@ -68,7 +77,21 @@ impl Consumer {
                                 "failed serving PUBLISH_NAMESPACE: {:?}", info
                             );
                         }
-                    });
+                    }.boxed());
+                },
+                Some(publish) = publish_subscriber.publish_received() => {
+                    metrics::counter!("moq_relay_published_tracks_total").increment(1);
+
+                    let this = self.clone();
+                    tasks.push(async move {
+                        let namespace = publish.namespace().to_utf8_path();
+                        let track_name = publish.name().clone();
+                        tracing::info!(namespace = %namespace, track = %track_name, "serving PUBLISH");
+
+                        if let Err(err) = this.serve_track(publish).await {
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving PUBLISH");
+                        }
+                    }.boxed());
                 },
                 _ = tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
@@ -82,16 +105,15 @@ impl Consumer {
         let _publisher_guard = GaugeGuard::new("moq_relay_active_publishers");
 
         let mut tasks = FuturesUnordered::new();
+        let ns = published_ns.namespace.to_utf8_path();
 
-        let (_, mut request, reader) = Tracks::new(published_ns.namespace.clone()).produce();
-
-        let ns = reader.namespace.to_utf8_path();
-
-        // Register the namespace locally so downstream subscribers can be served.
-        tracing::debug!(namespace = %ns, "registering namespace in locals");
-        let _register = match self
+        // Register namespace routing metadata locally. This does not register
+        // any media tracks; it only creates a request queue used when a
+        // downstream SUBSCRIBE asks for a missing track under this namespace.
+        tracing::debug!(namespace = %ns, "registering namespace route source in locals");
+        let (_register, mut requests) = match self
             .locals
-            .register(self.scope.as_deref(), reader.clone())
+            .register_namespace(self.scope.as_deref(), published_ns.namespace.clone())
             .await
         {
             Ok(reg) => reg,
@@ -101,13 +123,13 @@ impl Consumer {
                 return Err(err);
             }
         };
-        tracing::debug!(namespace = %ns, "namespace registered in locals");
+        tracing::debug!(namespace = %ns, "namespace route source registered in locals");
 
         // Register namespace with the coordinator so other relay nodes can route to us.
         tracing::debug!(namespace = %ns, "registering namespace with coordinator");
         let _namespace_registration = match self
             .coordinator
-            .register_namespace(self.scope.as_deref(), &reader.namespace)
+            .register_namespace(self.scope.as_deref(), &published_ns.namespace)
             .await
         {
             Ok(reg) => reg,
@@ -129,15 +151,20 @@ impl Consumer {
 
         // Forward the namespace upstream, if configured.
         if let Some(mut forward) = self.forward {
+            // The forwarding API still uses the moq-transport Tracks helper.
+            // This helper is not the relay-local registry; it is only an
+            // adapter for the outgoing publish_namespace API.
+            let (_, _forward_request, forward_reader) =
+                Tracks::new(published_ns.namespace.clone()).produce();
             tasks.push(
                 async move {
-                    let namespace = reader.namespace.to_utf8_path();
+                    let namespace = forward_reader.namespace.to_utf8_path();
                     tracing::info!(
                         namespace = %namespace,
-                        "forwarding PUBLISH_NAMESPACE: {:?}", reader.info
+                        "forwarding PUBLISH_NAMESPACE: {:?}", forward_reader.info
                     );
                     forward
-                        .publish_namespace(reader)
+                        .publish_namespace(forward_reader)
                         .await
                         .context("failed forwarding PUBLISH_NAMESPACE")
                 }
@@ -153,7 +180,7 @@ impl Consumer {
                     tracing::info!(namespace = %ns, "PUBLISH_NAMESPACE closed");
                     return Ok(());
                 },
-                Some(track) = request.next() => {
+                Some(track) = requests.recv() => {
                     let mut subscriber = self.subscriber.clone();
 
                     tasks.push(async move {
@@ -182,5 +209,83 @@ impl Consumer {
                 else => return Ok(()),
             }
         }
+    }
+
+    /// Serve an inbound PUBLISH for one exact track.
+    async fn serve_track(mut self, mut publish: PublishReceived) -> Result<(), anyhow::Error> {
+        let _publish_permit = match self.publish_track_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                metrics::counter!("moq_relay_publish_errors_total", "phase" => "session_limit")
+                    .increment(1);
+                publish.close(ServeError::Closed(RequestErrorCode::InternalError as u64));
+                return Err(ServeError::Cancel.into());
+            }
+        };
+
+        let namespace = publish.namespace().clone();
+        let track_name = publish.name().clone();
+
+        // Take the reader first, then follow the same order as PUBLISH_NAMESPACE:
+        // local registration → coordinator registration → PUBLISH_OK.
+        let reader = match publish.take_reader() {
+            Ok(reader) => reader,
+            Err(err) => {
+                metrics::counter!("moq_relay_publish_errors_total", "phase" => "take_reader")
+                    .increment(1);
+                return Err(err.into());
+            }
+        };
+
+        let _registration = match self
+            .locals
+            .register_track(self.scope.as_deref(), reader)
+            .await
+        {
+            Ok(registration) => registration,
+            Err(err) => {
+                metrics::counter!("moq_relay_publish_errors_total", "phase" => "local_register")
+                    .increment(1);
+                if err
+                    .downcast_ref::<ServeError>()
+                    .is_some_and(|err| matches!(err, ServeError::Duplicate))
+                {
+                    publish.close(ServeError::Duplicate);
+                    return Err(ServeError::Duplicate.into());
+                }
+                return Err(err);
+            }
+        };
+
+        let track_string = track_name.to_string();
+        let _track_registration = match self
+            .coordinator
+            .register_track(self.scope.as_deref(), &namespace, &track_string)
+            .await
+        {
+            Ok(registration) => registration,
+            Err(err) => {
+                metrics::counter!("moq_relay_publish_errors_total", "phase" => "coordinator_register")
+                    .increment(1);
+                publish.close(ServeError::Closed(RequestErrorCode::InternalError as u64));
+                return Err(err.into());
+            }
+        };
+
+        if let Err(err) = publish.accept(true) {
+            metrics::counter!("moq_relay_publish_errors_total", "phase" => "send_ok").increment(1);
+            return Err(err.into());
+        }
+
+        tracing::debug!(
+            namespace = %namespace.to_utf8_path(),
+            track = %track_name,
+            "PUBLISH registered as exact local track"
+        );
+
+        publish.closed().await?;
+        tracing::info!(namespace = %namespace.to_utf8_path(), track = %track_name, "PUBLISH closed");
+
+        Ok(())
     }
 }
