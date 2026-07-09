@@ -972,6 +972,7 @@ impl Publisher {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use crate::{

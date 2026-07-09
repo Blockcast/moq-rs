@@ -22,9 +22,9 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    PendingRequest, PendingRequests, PublishReceived, PublishReceivedRecv, PublishedNamespace,
-    PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session, SessionConfig,
-    SessionError, Subscribe, SubscribeNamespace, SubscribeRecv,
+    OpenSubscribeNamespace, PendingRequest, PendingRequests, PublishReceived, PublishReceivedRecv,
+    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session,
+    SessionConfig, SessionError, Subscribe, SubscribeNamespace, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
