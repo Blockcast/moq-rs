@@ -243,7 +243,7 @@ impl Producer {
         let mut known_tracks = HashSet::new();
         if wants_publish {
             self.send_publish_snapshot(
-                &mut subscribed_namespace,
+                &subscribed_namespace,
                 &mut known_tracks,
                 &mut publish_tasks,
             )

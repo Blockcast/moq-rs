@@ -12,7 +12,7 @@ use moq_transport::{
 };
 use tokio::sync::Semaphore;
 
-use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer, SessionContext};
+use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext};
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
 
@@ -22,6 +22,9 @@ pub struct Consumer {
     subscriber: Subscriber,
     locals: Locals,
     coordinator: Arc<dyn Coordinator>,
+    /// Relay-to-relay session pool, used to forward PUBLISH_NAMESPACE to peer
+    /// relays that the coordinator oracle reports as interested subscribers.
+    remotes: RemoteManager,
     forward: Option<Producer>, // Forward all announcements to this subscriber
     /// Relay-level context for this MoQT session.
     context: SessionContext,
@@ -33,6 +36,7 @@ impl Consumer {
         subscriber: Subscriber,
         locals: Locals,
         coordinator: Arc<dyn Coordinator>,
+        remotes: RemoteManager,
         forward: Option<Producer>,
         context: SessionContext,
     ) -> Self {
@@ -40,6 +44,7 @@ impl Consumer {
             subscriber,
             locals,
             coordinator,
+            remotes,
             forward,
             context,
             publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
@@ -170,6 +175,53 @@ impl Consumer {
                         .publish_namespace(forward_reader)
                         .await
                         .context("failed forwarding PUBLISH_NAMESPACE")
+                }
+                .boxed(),
+            );
+        }
+
+        // Fan out the PUBLISH_NAMESPACE to peer relays that the coordinator
+        // oracle reports as having matching SUBSCRIBE_NAMESPACE interest. The
+        // coordinator already excludes this relay (the caller) and the inbound
+        // source peer, so every returned relay is a distinct downstream peer and
+        // we can push to all of them without creating a forwarding loop.
+        let subscriber_relays = match self
+            .coordinator
+            .lookup_namespace_subscribers(
+                self.context.scope(),
+                &published_ns.namespace,
+                &coordinator_context,
+            )
+            .await
+        {
+            Ok(relays) => relays,
+            Err(err) => {
+                metrics::counter!("moq_relay_announce_errors_total", "phase" => "coordinator_lookup")
+                    .increment(1);
+                return Err(err.into());
+            }
+        };
+
+        for relay in subscriber_relays {
+            let remotes = self.remotes.clone();
+            // The forwarding API uses the moq-transport Tracks helper as an
+            // adapter for the outgoing publish_namespace call; it is not the
+            // relay-local registry.
+            let (_, _request, reader) = Tracks::new(published_ns.namespace.clone()).produce();
+            tasks.push(
+                async move {
+                    let namespace = reader.namespace.to_utf8_path();
+                    tracing::info!(
+                        namespace = %namespace,
+                        remote = %relay.url,
+                        "forwarding PUBLISH_NAMESPACE to peer relay"
+                    );
+                    remotes
+                        .publish_namespace(&relay, reader)
+                        .await
+                        .with_context(|| {
+                            format!("failed forwarding PUBLISH_NAMESPACE to {}", relay.url)
+                        })
                 }
                 .boxed(),
             );

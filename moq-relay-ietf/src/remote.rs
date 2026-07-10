@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_namespace_to_without_clients_errors() {
+    async fn subscribe_namespace_without_clients_errors() {
         // No QUIC clients configured, so get_or_connect() fails before any
         // network activity. This exercises the new forwarding entry point's
         // connect + error plumbing without needing a live peer.
@@ -112,7 +112,7 @@ mod tests {
         let relay = RelayInfo::new(Url::parse("https://relay.example.com/live").unwrap());
 
         let result = manager
-            .subscribe_namespace_to(
+            .subscribe_namespace(
                 &relay,
                 TrackNamespacePrefix::from_utf8_path("example.com"),
                 SubscribeOptions::Namespace,
@@ -131,14 +131,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_namespace_to_without_clients_errors() {
+    async fn publish_namespace_without_clients_errors() {
         let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
         let relay = RelayInfo::new(Url::parse("https://relay.example.com/live").unwrap());
         let (_writer, _request, reader) =
             moq_transport::serve::Tracks::new(TrackNamespace::from_utf8_path("example.com"))
                 .produce();
 
-        let result = manager.publish_namespace_to(&relay, reader).await;
+        let result = manager.publish_namespace(&relay, reader).await;
 
         let err = result.expect_err("expected connect failure with no clients");
         assert!(
@@ -224,10 +224,12 @@ impl RemoteManager {
     ///
     /// Connects to (or reuses a connection to) `relay` and opens a namespace
     /// subscription for `prefix`, returning the [`SubscribeNamespace`] handle.
-    /// The target relay is explicit (supplied by the caller from coordinator
-    /// routing hops) rather than discovered via a coordinator lookup — that is
-    /// how this differs from [`Self::subscribe`].
-    pub async fn subscribe_namespace_to(
+    ///
+    /// The target `relay` is supplied explicitly by the caller (from a
+    /// coordinator lookup result). This is the namespace-level counterpart of
+    /// [`Self::subscribe`], which instead resolves a single origin internally
+    /// via [`Coordinator::lookup_track`].
+    pub async fn subscribe_namespace(
         &self,
         relay: &RelayInfo,
         prefix: TrackNamespacePrefix,
@@ -256,11 +258,12 @@ impl RemoteManager {
     /// Forward a `PUBLISH_NAMESPACE` to a specific relay peer.
     ///
     /// Connects to (or reuses a connection to) `relay` and advertises
-    /// `tracks.namespace`, serving its tracks from `tracks`. Blocks until the
-    /// namespace is unannounced or the session errors (see
+    /// `tracks.namespace`, serving its tracks from `tracks`. The target `relay`
+    /// is supplied explicitly by the caller (from a coordinator lookup result).
+    /// Blocks until the namespace is unannounced or the session errors (see
     /// [`Remote::publish_namespace`]), so callers typically drive it from a
     /// dedicated task.
-    pub async fn publish_namespace_to(
+    pub async fn publish_namespace(
         &self,
         relay: &RelayInfo,
         tracks: TracksReader,

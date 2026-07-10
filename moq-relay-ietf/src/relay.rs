@@ -213,6 +213,7 @@ impl Relay {
                         subscriber,
                         locals.clone(),
                         forward_coordinator,
+                        remote_manager.clone(),
                         None,
                         forward_context,
                     )),
@@ -378,13 +379,13 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, coordinator.clone(), context.clone())), None)
+                                (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes.clone(), coordinator.clone(), context.clone())), None)
                             } else {
                                 (None, publisher)
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, context)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context)), None)
                             } else {
                                 (None, subscriber)
                             };

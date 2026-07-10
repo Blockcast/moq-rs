@@ -513,10 +513,18 @@ impl Coordinator for FileCoordinator {
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
+        context: &CoordinatorContext,
     ) -> CoordinatorResult<Vec<RelayInfo>> {
         let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(namespace);
         let file_path = self.file_path.clone();
+
+        // Exclude the caller (this relay) and the inbound source peer so a
+        // forwarded PUBLISH_NAMESPACE is never sent to ourselves or echoed back
+        // to the relay it just arrived from. The caller string matches the key
+        // format written by subscribe_namespace (self.relay_url.to_string()).
+        let caller = self.relay_url.to_string();
+        let source = context.source.as_ref().map(|relay| relay.url.to_string());
 
         let subscribers = tokio::task::spawn_blocking(move || -> Result<Vec<RelayInfo>> {
             let file = OpenOptions::new()
@@ -538,6 +546,9 @@ impl Coordinator for FileCoordinator {
                     }
 
                     for relay_url in relays.keys() {
+                        if relay_url == &caller || Some(relay_url) == source.as_ref() {
+                            continue;
+                        }
                         if urls.insert(relay_url.clone()) {
                             subscribers.push(RelayInfo::new(Url::parse(relay_url)?));
                         }
@@ -928,10 +939,16 @@ mod tests {
             .await
             .expect("namespace subscription should register");
 
-        let subscribers = coordinator
+        // A second relay (the origin) shares the same coordinator file and
+        // performs the lookups, so the subscribing relay is returned rather
+        // than filtered out as the caller.
+        let looker = FileCoordinator::new(&file, Url::parse("https://origin.example.com").unwrap());
+
+        let subscribers = looker
             .lookup_namespace_subscribers(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/123/camera"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("subscriber lookup should succeed");
@@ -939,10 +956,11 @@ mod tests {
         assert_eq!(subscribers.len(), 1);
         assert_eq!(subscribers[0].url, relay_url);
 
-        let no_match = coordinator
+        let no_match = looker
             .lookup_namespace_subscribers(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/456"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("subscriber lookup should succeed");
@@ -978,8 +996,17 @@ mod tests {
 
         drop(first);
 
-        let subscribers = coordinator
-            .lookup_namespace_subscribers(Some("scope-a"), &namespace)
+        // A second relay (the origin) shares the coordinator file and performs
+        // the lookups, so the subscribing relay is visible while its refcount
+        // is positive and disappears once it hits zero.
+        let looker = FileCoordinator::new(&file, Url::parse("https://origin.example.com").unwrap());
+
+        let subscribers = looker
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &namespace,
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("subscriber lookup should succeed");
         assert_eq!(subscribers.len(), 1);
@@ -987,8 +1014,12 @@ mod tests {
 
         drop(second);
 
-        let subscribers = coordinator
-            .lookup_namespace_subscribers(Some("scope-a"), &namespace)
+        let subscribers = looker
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &namespace,
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("subscriber lookup should succeed");
         assert!(subscribers.is_empty());
@@ -1036,10 +1067,16 @@ mod tests {
 
         assert_eq!(matches, vec!["/other/123", "/room/123"]);
 
-        let subscribers = coordinator
+        // A second relay (the origin) shares the coordinator file and performs
+        // the lookup, so the subscribing relay is returned rather than filtered
+        // out as the caller.
+        let looker = FileCoordinator::new(&file, Url::parse("https://origin.example.com").unwrap());
+
+        let subscribers = looker
             .lookup_namespace_subscribers(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/123/camera"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("subscriber lookup should succeed");
@@ -1115,29 +1152,124 @@ mod tests {
             .await
             .expect("scoped subscription should register");
 
-        let global = coordinator
-            .lookup_namespace_subscribers(None, &TrackNamespace::from_utf8_path("room/global/cam"))
+        // A second relay (the origin) shares the coordinator file and performs
+        // the lookups, so the subscribing relay is returned rather than filtered
+        // out as the caller.
+        let looker = FileCoordinator::new(&file, Url::parse("https://origin.example.com").unwrap());
+
+        let global = looker
+            .lookup_namespace_subscribers(
+                None,
+                &TrackNamespace::from_utf8_path("room/global/cam"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("global lookup should succeed");
         assert_eq!(global.len(), 1);
 
-        let scoped = coordinator
+        let scoped = looker
             .lookup_namespace_subscribers(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/scoped/cam"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("scoped lookup should succeed");
         assert_eq!(scoped.len(), 1);
 
-        let no_cross_scope = coordinator
+        let no_cross_scope = looker
             .lookup_namespace_subscribers(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/global/cam"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("scoped lookup should succeed");
         assert!(no_cross_scope.is_empty());
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn lookup_namespace_subscribers_excludes_caller() {
+        // A relay that subscribed and then performs the lookup itself must not
+        // be returned to itself; otherwise it would forward PUBLISH_NAMESPACE to
+        // its own endpoint and loop forever.
+        let file = temp_file_path("namespace-subscribers-exclude-caller");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url);
+
+        let _subscription = coordinator
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room/123"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .expect("namespace subscription should register");
+
+        let subscribers = coordinator
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123/camera"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .expect("subscriber lookup should succeed");
+
+        assert!(
+            subscribers.is_empty(),
+            "caller relay must be excluded from its own lookup results"
+        );
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn lookup_namespace_subscribers_excludes_source() {
+        // A PUBLISH_NAMESPACE that arrived from a peer relay must not be echoed
+        // back to that same peer.
+        let file = temp_file_path("namespace-subscribers-exclude-source");
+        let edge_url = Url::parse("https://edge.example.com").unwrap();
+        let edge = FileCoordinator::new(&file, edge_url.clone());
+        let origin = FileCoordinator::new(&file, Url::parse("https://origin.example.com").unwrap());
+
+        let _subscription = edge
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room/123"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .expect("namespace subscription should register");
+
+        // Without a source, the origin sees the edge subscriber.
+        let subscribers = origin
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123/camera"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .expect("subscriber lookup should succeed");
+        assert_eq!(subscribers.len(), 1);
+        assert_eq!(subscribers[0].url, edge_url);
+
+        // When the PUBLISH_NAMESPACE arrived *from* the edge relay, it must be
+        // excluded so it is not echoed back.
+        let from_edge = CoordinatorContext::internal(Some(RelayInfo::new(edge_url.clone())));
+        let subscribers = origin
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123/camera"),
+                &from_edge,
+            )
+            .await
+            .expect("subscriber lookup should succeed");
+        assert!(
+            subscribers.is_empty(),
+            "source relay must be excluded to avoid echoing PUBLISH_NAMESPACE back"
+        );
 
         let _ = std::fs::remove_file(file);
     }
