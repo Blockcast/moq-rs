@@ -357,7 +357,7 @@ impl Subscribed {
             object_count += 1;
         }
 
-        tracing::info!(
+        tracing::debug!(
             "[PUBLISHER] serve_subgroup: completed subgroup (group_id={}, subgroup_id={:?}, {} objects sent)",
             subgroup_reader.group_id,
             subgroup_reader.subgroup_id,
@@ -444,7 +444,7 @@ impl Subscribed {
             datagram_count += 1;
         }
 
-        tracing::info!(
+        tracing::debug!(
             "[PUBLISHER] serve_datagrams: completed ({} datagrams sent)",
             datagram_count
         );
