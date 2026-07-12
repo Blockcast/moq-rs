@@ -820,7 +820,8 @@ mod tests {
 
     // window=1 collapses the prune predicate to "keep only the newest group",
     // masking the off-by-one that a realistic multi-group window exercises
-    // (production uses the FEC block span (K-1)*interleaveDepth >= 2). With
+    // (production uses a window covering the FEC block span, interleaveDepthMs,
+    // which is >= 2 groups). With
     // window=3 and one subgroup per group 0..=3, group g is retained iff
     // newest - g < 3 — i.e. group 0 is pruned only when group 3 arrives.
     #[tokio::test]
