@@ -730,7 +730,7 @@ mod tests {
             source_symbols: 32,
             repair_symbols: 8,
             symbol_size: 1312,
-            interleave_depth: None,
+            interleave_depth_ms: None,
             repair_track: "v/fec-custom".into(),
         });
         let cat = catalog_with(

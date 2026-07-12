@@ -659,7 +659,7 @@ mod tests {
             "timescale":90000,"groupDurationMs":2000,"groupDurationTicks":180000,
             "initMode":"track","priority":3,
             "fec":{"algorithm":"raptorq","sourceSymbols":32,"repairSymbols":8,
-                   "interleaveDepth":30,"symbolSize":1312,"repairTrack":"v/repair"},
+                   "interleaveDepthMs":4000,"symbolSize":1312,"repairTrack":"v/repair"},
             "selectionParams":{"codec":"avc1.42c01e"}
         }"#;
         let t: Track = serde_json::from_str(json).unwrap();
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(fec.source_symbols, 32);
         assert_eq!(fec.repair_symbols, 8);
         assert_eq!(fec.symbol_size, 1312);
-        assert_eq!(fec.interleave_depth, Some(30));
+        assert_eq!(fec.interleave_depth_ms, Some(4000));
         assert_eq!(fec.repair_track, "v/repair");
         // Round-trips back to the camelCase wire form.
         let back = serde_json::to_string(&t).unwrap();
@@ -684,6 +684,50 @@ mod tests {
         assert!(
             back.contains(r#""repairTrack":"v/repair""#),
             "json = {back}"
+        );
+    }
+
+    // Serialization emits exactly the canonical ms key — and never the retired
+    // pre-rename key — checked as serde_json::Value map keys, not substrings.
+    #[test]
+    fn fec_serializes_canonical_interleave_depth_ms_key_only() {
+        let fec = FecDescriptor {
+            algorithm: FecAlgorithm::RaptorQ,
+            source_symbols: 32,
+            repair_symbols: 8,
+            symbol_size: 1312,
+            interleave_depth_ms: Some(4000),
+            repair_track: "v/repair".into(),
+        };
+        let v = serde_json::to_value(&fec).unwrap();
+        let obj = v.as_object().expect("fec serializes to a JSON object");
+        assert_eq!(
+            obj.get("interleaveDepthMs"),
+            Some(&serde_json::json!(4000)),
+            "canonical key present, json = {v}"
+        );
+        assert!(
+            !obj.contains_key("interleaveDepth"),
+            "retired key must not be emitted, json = {v}"
+        );
+    }
+
+    // None emits neither the canonical key nor the retired one.
+    #[test]
+    fn fec_none_interleave_depth_ms_emits_no_key() {
+        let fec = FecDescriptor {
+            algorithm: FecAlgorithm::RaptorQ,
+            source_symbols: 32,
+            repair_symbols: 8,
+            symbol_size: 1312,
+            interleave_depth_ms: None,
+            repair_track: "v/repair".into(),
+        };
+        let v = serde_json::to_value(&fec).unwrap();
+        let obj = v.as_object().expect("fec serializes to a JSON object");
+        assert!(
+            !obj.contains_key("interleaveDepthMs") && !obj.contains_key("interleaveDepth"),
+            "absent interleave depth emits no key at all, json = {v}"
         );
     }
 
@@ -1694,12 +1738,13 @@ pub struct FecDescriptor {
     #[serde(rename = "symbolSize")]
     pub symbol_size: u32,
 
-    /// AL-FEC interleave window (per group), `D × 1000/fps` — NOT the block span.
-    /// The FEC block span is `(K-1) × interleaveDepth` (the consumer derives it;
-    /// see moq-transport `serve/subgroup.rs`). OPTIONAL; absent ⇒ no interleaving
-    /// (D=1), resolved by the consumer — the catalog never materializes a `0`.
-    #[serde(rename = "interleaveDepth", skip_serializing_if = "Option::is_none")]
-    pub interleave_depth: Option<u32>,
+    /// Canonical AL-FEC interleave block span in MILLISECONDS
+    /// (draft-ramadan-moq-fec §5.1). The full FEC block spans
+    /// `interleaveDepthMs`; per-sub-block timeout = `interleaveDepthMs × K_sub / K`.
+    /// OPTIONAL; absent ⇒ no interleaving (D=1), resolved by the consumer —
+    /// the catalog never materializes a `0`.
+    #[serde(rename = "interleaveDepthMs", skip_serializing_if = "Option::is_none")]
+    pub interleave_depth_ms: Option<u32>,
 
     /// Repair track name, convention `[namespace, track_name, "repair"]`. Must
     /// reference a catalog track whose effective packaging is `fec-repair`.
