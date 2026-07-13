@@ -80,6 +80,7 @@ pub struct DatagramsReader {
     pub track: Arc<Track>,
 
     epoch: u64,
+    dropped: u64,
 }
 
 impl DatagramsReader {
@@ -88,6 +89,7 @@ impl DatagramsReader {
             state,
             track,
             epoch: 0,
+            dropped: 0,
         }
     }
 
@@ -96,6 +98,9 @@ impl DatagramsReader {
             {
                 let state = self.state.lock();
                 if self.epoch < state.epoch {
+                    self.dropped = self
+                        .dropped
+                        .saturating_add(state.epoch.saturating_sub(self.epoch).saturating_sub(1));
                     self.epoch = state.epoch;
                     return Ok(state.latest.clone());
                 }
@@ -117,6 +122,15 @@ impl DatagramsReader {
             .latest
             .as_ref()
             .map(|datagram| (datagram.group_id, datagram.object_id))
+    }
+
+    /// Number of datagrams superseded before this reader observed them.
+    ///
+    /// Datagram tracks are intentionally latest-wins: the writer retains one
+    /// payload and slow readers skip intermediate values instead of building a
+    /// queue. This counter makes that raw-lossy overflow policy observable.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// Check if the datagrams writer has been closed or dropped.
@@ -147,5 +161,39 @@ impl fmt::Debug for Datagram {
             .field("payload", &self.payload.len())
             .field("extension_headers", &self.extension_headers)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{coding::TrackNamespace, serve::Track};
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn stalled_reader_keeps_latest_and_counts_superseded_datagrams() {
+        let track = Arc::new(Track {
+            namespace: TrackNamespace::from_utf8_path("test"),
+            name: "shreds".to_string(),
+        });
+        let (mut writer, mut reader) = Datagrams { track }.produce();
+
+        // 1M production-sized shreds is >3.5 hours of input at 78 groups/sec.
+        for group_id in 0..1_000_000 {
+            writer
+                .write(Datagram {
+                    group_id,
+                    object_id: 0,
+                    priority: 0,
+                    payload: Bytes::from(vec![(group_id % 251) as u8; 1_228]),
+                    extension_headers: Default::default(),
+                })
+                .unwrap();
+        }
+
+        let latest = reader.read().await.unwrap().unwrap();
+        assert_eq!(latest.group_id, 999_999);
+        assert_eq!(latest.payload.len(), 1_228);
+        assert_eq!(reader.dropped(), 999_999);
     }
 }

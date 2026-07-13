@@ -10,7 +10,7 @@ use moq_catalog::{Root, TrackPackaging};
 use moq_native_ietf::quic;
 use moq_transport::{
     coding::TrackNamespace,
-    serve::{SubgroupsWriter, Tracks, TracksWriter},
+    serve::{DatagramsWriter, SubgroupsWriter, Tracks, TracksWriter},
     session::Publisher,
 };
 use tokio::io::AsyncWriteExt;
@@ -62,7 +62,10 @@ async fn main() -> Result<()> {
     // Select the publisher router from the catalog's track packaging: MMTP
     // (per-packet_id MPU/MFU dispatch) or opaque datagram pass-through.
     let router = build_router(&mut tracks_writer, &catalog)?;
-    tracing::info!(router = router.kind(), "built publisher router from catalog");
+    tracing::info!(
+        router = router.kind(),
+        "built publisher router from catalog"
+    );
 
     // Publish the catalog JSON on the catalog tracks (canonical `catalog` per
     // draft-ietf-moq-msf-00 §5.2, plus the legacy `.catalog` alias). The
@@ -303,11 +306,10 @@ fn check_namespace_consistency(catalog: &Root, name: &str) -> Result<()> {
 ///
 /// `Mmtp` interprets MMTP MPU/MFU structure (Mapping B subgrouping + AL-FEC
 /// repair siblings, see `publish::dispatch`); `Datagram` carries each UDP
-/// datagram as one opaque MoQ object (see `datagram::DatagramState`). Both
-/// arms own the concrete `SubgroupsWriter` sink.
+/// datagram as one opaque native MoQ datagram (see `datagram::DatagramState`).
 enum Router {
     Mmtp(HashMap<u16, TrackState<SubgroupsWriter>>),
-    Datagram(DatagramState<SubgroupsWriter>),
+    Datagram(DatagramState<DatagramsWriter>),
 }
 
 impl Router {
@@ -342,7 +344,10 @@ fn build_router(tracks_writer: &mut TracksWriter, catalog: &Root) -> Result<Rout
         .iter()
         .any(|t| matches!(t.packaging, Some(TrackPackaging::Datagram)));
     if has_datagram {
-        Ok(Router::Datagram(build_datagram_state(tracks_writer, catalog)?))
+        Ok(Router::Datagram(build_datagram_state(
+            tracks_writer,
+            catalog,
+        )?))
     } else {
         Ok(Router::Mmtp(build_state_map(tracks_writer, catalog)?))
     }
@@ -353,13 +358,11 @@ fn build_router(tracks_writer: &mut TracksWriter, catalog: &Root) -> Result<Rout
 ///
 /// Errors:
 ///   - no, or more than one, datagram track (the router maps a single stream)
-///   - catalog has no `multicast` extension or no `subgroupHistoryGroups`
-///     (config-or-throw: the window bounds how many recent datagrams are kept)
 ///   - TracksWriter::create returns None (broadcast already closed)
 fn build_datagram_state(
     tracks_writer: &mut TracksWriter,
     catalog: &Root,
-) -> Result<DatagramState<SubgroupsWriter>> {
+) -> Result<DatagramState<DatagramsWriter>> {
     let mut datagram_tracks = catalog
         .tracks
         .iter()
@@ -371,37 +374,20 @@ fn build_datagram_state(
         bail!("datagram router supports exactly one packaging=datagram track");
     }
 
-    let multicast = catalog.multicast.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("catalog has no `multicast` extension — required for datagram publishing")
-    })?;
-    let history_window_raw = multicast.subgroup_history_groups.ok_or_else(|| {
-        anyhow::anyhow!(
-            "catalog multicast.subgroupHistoryGroups is required for datagram publishing \
-             (config-or-throw): it bounds how many recent datagrams are retained"
-        )
-    })?;
-    // NonZeroU64 carries the ">= 1" invariant into TrackWriter::set_history_window.
-    let history_window = NonZeroU64::new(history_window_raw).ok_or_else(|| {
-        anyhow::anyhow!("multicast.subgroupHistoryGroups must be >= 1 (got {history_window_raw})")
-    })?;
-
-    let mut track_writer = tracks_writer.create(&track.name).ok_or_else(|| {
+    let track_writer = tracks_writer.create(&track.name).ok_or_else(|| {
         anyhow::anyhow!(
             "TracksWriter::create returned None for `{}` (broadcast already closed?)",
             track.name
         )
     })?;
-    // Set on the Track BEFORE `.subgroups()` consumes it: subgroups() inherits
-    // the window for local pruning AND the session advertises it in SUBSCRIBE_OK
-    // (BLO-10339) so a downstream relay mirror bounds its own retention — matters
-    // for datagram, where one group per datagram creates many subgroups.
-    track_writer.set_history_window(history_window)?;
-    let subgroups = track_writer
-        .subgroups()
-        .with_context(|| format!("track `{}`: subgroups() failed", track.name))?;
+    // Native datagram mode is a one-payload latest-wins slot. A lagging reader
+    // skips superseded datagrams instead of retaining subgroup/stream tasks.
+    let datagrams = track_writer
+        .datagrams()
+        .with_context(|| format!("track `{}`: datagrams() failed", track.name))?;
 
     // Datagram source objects publish at priority 0, matching MMTP source tracks.
-    Ok(DatagramState::new(track.name.clone(), 0, subgroups))
+    Ok(DatagramState::new(track.name.clone(), 0, datagrams))
 }
 
 /// Drive the publisher loop until the input ends.
@@ -497,7 +483,7 @@ mod tests {
     use moq_catalog::{
         CommonTrackFields, FecAlgorithm, FecDescriptor, MmtpMode, SelectionParam, Track,
     };
-    use moq_transport::serve::Tracks;
+    use moq_transport::serve::{TrackReaderMode, Tracks};
 
     fn ns() -> TrackNamespace {
         TrackNamespace::from_utf8_path("test-broadcast")
@@ -638,6 +624,22 @@ mod tests {
             err.to_string().contains("subgroupHistoryGroups"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn datagram_router_uses_bounded_latest_wins_transport_mode() {
+        let cat = catalog_with(vec![track("shreds", Some(TrackPackaging::Datagram))], None);
+        let (mut tracks, _requests, mut readers) = Tracks::new(ns()).produce();
+
+        let _state = build_datagram_state(&mut tracks, &cat).unwrap();
+        let reader = readers
+            .get_track_reader(&ns(), "shreds")
+            .expect("datagram track registered");
+
+        assert!(matches!(
+            reader.mode().await.unwrap(),
+            TrackReaderMode::Datagrams(_)
+        ));
     }
 
     #[test]

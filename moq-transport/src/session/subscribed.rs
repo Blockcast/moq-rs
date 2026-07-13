@@ -374,7 +374,19 @@ impl Subscribed {
         tracing::debug!("[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
+        let mut reported_dropped = 0;
         while let Some(datagram) = datagrams.read().await? {
+            let dropped_total = datagrams.dropped();
+            if dropped_total > reported_dropped
+                && (reported_dropped == 0 || dropped_total - reported_dropped >= 1_000)
+            {
+                tracing::warn!(
+                    dropped_total,
+                    "datagram subscriber lagged; superseded payloads dropped (latest-wins)"
+                );
+                reported_dropped = dropped_total;
+            }
+
             // Determine datagram type based on extension headers presence
             let has_extension_headers = !datagram.extension_headers.is_empty();
             let datagram_type = if has_extension_headers {
