@@ -6,6 +6,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.15.0...moq-transport-v0.15.1) - 2026-07-09
+
+### Fixed
+
+- *(moq-transport)* treat track ended as clean completion
+- *(moq-transport)* send publish done after serve completion
+
+### Other
+
+- address PUBLISH review feedback
+- resolve clippy warnings
+- track pending request responses
+- route PUBLISH tracks by full track name
+- align PUBLISH session handling
+- add inbound PUBLISH handling
+
+## [0.15.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.14.2...moq-transport-v0.15.0) - 2026-07-08
+
+### Added
+
+- add draft-16 PUBLISH, PUBLISH_OK, and PUBLISH_DONE support for publisher-initiated track delivery
+
+### Fixed
+
+- ignore stale unsubscribe ids
+- handle request response routing
+- clean up unsubscribe state
+
+### Other
+
+- resolve clippy warnings and untrack AGENTS.md
+- use correct loglevel for logs for subgroups
+- Implement draft-16 subscription parameters and TrackName type
+- Merge remote-tracking branch 'manish/main' into mpandit/RT-469
+
 ## [0.14.2](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.14.1...moq-transport-v0.14.2) - 2026-05-20
 
 ### Fixed

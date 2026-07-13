@@ -3,7 +3,7 @@
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::{ServeError, TracksReader},
+    serve::{FullTrackName, ServeError, TracksReader},
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
@@ -39,9 +39,9 @@ impl Producer {
         }
     }
 
-    /// Announce new tracks to the remote server.
-    pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        self.publisher.announce(tracks).await
+    /// Send PUBLISH_NAMESPACE for a set of tracks to the remote peer.
+    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        self.publisher.publish_namespace(tracks).await
     }
 
     /// Run the producer to serve subscribe requests.
@@ -69,7 +69,11 @@ impl Producer {
 
                         // Serve the subscribe request
                         if let Err(err) = this.serve_subscribe(subscribed).await {
-                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving subscribe: {:?}, error: {}", info, err);
+                            if Self::is_expected_serve_shutdown(&err) {
+                                tracing::debug!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %err, "stopped serving subscribe");
+                            } else {
+                                tracing::warn!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %err, "failed serving subscribe");
+                            }
                         }
                     }.boxed())
                 },
@@ -107,21 +111,22 @@ impl Producer {
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
 
-        // Check local tracks first, and serve from local if possible
-        if let Some(mut local) = self.locals.retrieve(self.scope.as_deref(), &namespace) {
-            // Pass the full requested namespace, not the announced prefix
-            if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
-                let ns = namespace.to_utf8_path();
-                tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
-                // Update label to indicate local source, timing recorded on drop
-                timing_guard.set_label("source", "local");
-                // Track active tracks - decrements when serve completes
-                let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
-                return Ok(subscribed.serve(track).await?);
-            }
+        // Local lookup order inside Locals:
+        // 1. actual FullTrackName -> TrackReader media cache
+        // 2. PUBLISH_NAMESPACE route source, which triggers upstream SUBSCRIBE
+        let mut locals = self.locals.clone();
+        if let Some(track) = locals
+            .get_or_request_track(self.scope.as_deref(), namespace.clone(), &track_name)
+            .await
+        {
+            let ns = namespace.to_utf8_path();
+            tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
+            timing_guard.set_label("source", "local");
+            let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+            return Ok(subscribed.serve(track).await?);
         }
 
-        // Check remote tracks second, and serve from remote if possible
+        // Check remote tracks after local exact tracks and namespace route sources.
         match self
             .remotes
             .subscribe(self.scope.as_deref(), &namespace, &track_name)
@@ -169,28 +174,35 @@ impl Producer {
         Err(err.into())
     }
 
+    fn is_expected_serve_shutdown(err: &anyhow::Error) -> bool {
+        matches!(
+            err.downcast_ref::<SessionError>(),
+            Some(SessionError::Serve(ServeError::Cancel | ServeError::Done))
+        ) || matches!(
+            err.downcast_ref::<ServeError>(),
+            Some(ServeError::Cancel | ServeError::Done)
+        )
+    }
+
     /// Serve a track_status request.
     async fn serve_track_status(
         self,
         mut track_status_requested: TrackStatusRequested,
     ) -> Result<(), anyhow::Error> {
-        // Check local tracks first, and serve from local if possible
-        if let Some(mut local_tracks) = self.locals.retrieve(
-            self.scope.as_deref(),
-            &track_status_requested.request_msg.track_namespace,
-        ) {
-            if let Some(track) = local_tracks.get_track_reader(
-                &track_status_requested.request_msg.track_namespace,
-                &track_status_requested.request_msg.track_name,
-            ) {
-                let namespace = track_status_requested
-                    .request_msg
-                    .track_namespace
-                    .to_utf8_path();
-                let track_name = &track_status_requested.request_msg.track_name;
-                tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving track_status from local: {:?}", track.info);
-                return Ok(track_status_requested.respond_ok(&track)?);
-            }
+        let full_name = FullTrackName {
+            namespace: track_status_requested.request_msg.track_namespace.clone(),
+            name: track_status_requested.request_msg.track_name.clone(),
+        };
+
+        // Check actual local tracks first.
+        if let Some(track) = self
+            .locals
+            .retrieve_track(self.scope.as_deref(), &full_name)
+        {
+            let namespace = full_name.namespace.to_utf8_path();
+            let track_name = &full_name.name;
+            tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving track_status from local: {:?}", track.info);
+            return Ok(track_status_requested.respond_ok(&track)?);
         }
 
         // TODO - forward track status to remotes?
@@ -210,7 +222,10 @@ impl Producer {
             }
         }*/
 
-        track_status_requested.respond_error(4, "Track not found")?;
+        track_status_requested.respond_error(
+            moq_transport::message::RequestErrorCode::DoesNotExist as u64,
+            "track not found",
+        )?;
 
         Err(ServeError::not_found_ctx(format!(
             "track '{}/{}' not found for track_status",
@@ -218,5 +233,38 @@ impl Producer {
             track_status_requested.request_msg.track_name
         ))
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use moq_transport::{serve::ServeError, session::SessionError};
+
+    use super::Producer;
+
+    #[test]
+    fn expected_serve_shutdown_accepts_wrapped_session_errors() {
+        assert!(Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            SessionError::Serve(ServeError::Cancel)
+        )));
+        assert!(Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            SessionError::Serve(ServeError::Done)
+        )));
+        assert!(!Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            SessionError::Serve(ServeError::NotFound)
+        )));
+    }
+
+    #[test]
+    fn expected_serve_shutdown_accepts_direct_serve_errors() {
+        assert!(Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            ServeError::Cancel
+        )));
+        assert!(Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            ServeError::Done
+        )));
+        assert!(!Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            ServeError::NotFound
+        )));
     }
 }

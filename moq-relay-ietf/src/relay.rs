@@ -7,6 +7,7 @@ use anyhow::Context;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
+use moq_transport::session::SessionConfig;
 use url::Url;
 
 use crate::{metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
@@ -44,7 +45,7 @@ pub struct RelayConfig {
     /// Directory to write mlog files (one per connection)
     pub mlog_dir: Option<PathBuf>,
 
-    /// Forward all announcements to the (optional) URL.
+    /// Forward all PUBLISH_NAMESPACE messages to the (optional) upstream URL.
     pub announce: Option<Url>,
 
     /// Our hostname which we advertise to other origins.
@@ -53,36 +54,41 @@ pub struct RelayConfig {
 
     /// The coordinator for namespace/track registration and discovery.
     pub coordinator: Arc<dyn Coordinator>,
+
+    /// MoQT session configuration used for inbound and relay-to-relay sessions.
+    pub session: SessionConfig,
+}
+
+impl RelayConfig {
+    /// Build a relay from this configuration.
+    pub fn build(self) -> anyhow::Result<Relay> {
+        Relay::new(self)
+    }
 }
 
 /// MoQ Relay server.
 pub struct Relay {
-    quic_endpoints: Vec<Endpoint>,
-    announce_url: Option<Url>,
-    mlog_dir: Option<PathBuf>,
+    config: RelayConfig,
     locals: Locals,
     remotes: RemoteManager,
-    coordinator: Arc<dyn Coordinator>,
 }
 
 impl Relay {
-    pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
+    pub fn new(mut config: RelayConfig) -> anyhow::Result<Self> {
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
         }
 
-        let endpoints = if let Some(bind) = config.bind {
+        if let Some(bind) = config.bind.take() {
             let endpoint = quic::Endpoint::new(quic::Config::new(
                 bind,
                 config.qlog_dir.clone(),
                 config.tls.clone(),
             )?)?;
-            vec![endpoint]
-        } else {
-            config.endpoints
-        };
+            config.endpoints = vec![endpoint];
+        }
 
-        if endpoints.is_empty() {
+        if config.endpoints.is_empty() {
             anyhow::bail!("no endpoints available to start the server");
         }
 
@@ -100,34 +106,42 @@ impl Relay {
         let locals = Locals::new();
 
         // FIXME(itzmanish): have a generic filter to find endpoints for forward, remote etc.
-        let remote_clients = endpoints
+        let remote_clients = config
+            .endpoints
             .iter()
             .map(|endpoint| endpoint.client.clone())
             .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
-        let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients);
+        let remotes = RemoteManager::new_with_session_config(
+            config.coordinator.clone(),
+            remote_clients,
+            config.session,
+        );
 
         Ok(Self {
-            quic_endpoints: endpoints,
-            announce_url: config.announce,
-            mlog_dir: config.mlog_dir,
+            config,
             locals,
             remotes,
-            coordinator: config.coordinator,
         })
     }
 
     /// Run the relay server.
     pub async fn run(self) -> anyhow::Result<()> {
         let Self {
-            quic_endpoints,
-            announce_url,
-            mlog_dir,
+            config,
             locals,
             remotes,
-            coordinator,
         } = self;
+
+        let RelayConfig {
+            endpoints: quic_endpoints,
+            announce: announce_url,
+            mlog_dir,
+            coordinator,
+            session: session_config,
+            ..
+        } = config;
 
         let run_result = async {
             let mut tasks = FuturesUnordered::new();
@@ -137,7 +151,7 @@ impl Relay {
 
             // Start the forwarder, if any
             let forward_producer = if let Some(url) = &announce_url {
-                tracing::info!("forwarding announces to {}", url);
+                tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
 
                 // Establish a QUIC connection to the forward URL
                 let (session, _quic_client_initial_cid, transport) = quic_endpoints[0]
@@ -147,10 +161,14 @@ impl Relay {
                     .context("failed to establish forward connection")?;
 
                 // Create the MoQ session over the connection
-                let (session, publisher, subscriber) =
-                    moq_transport::session::Session::connect(session, None, transport)
-                        .await
-                        .context("failed to establish forward session")?;
+                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
+                    session,
+                    None,
+                    transport,
+                    session_config,
+                )
+                .await
+                .context("failed to establish forward session")?;
 
                 // Use the connection path already validated and stored by Session::connect().
                 // The forward session is scoped to whatever path the announce URL specifies.
@@ -255,7 +273,7 @@ impl Relay {
                             let raw_conn = conn.clone();
 
                             // Create the MoQ session over the connection (setup handshake etc)
-                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, transport).await {
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(conn, mlog_path, transport, session_config).await {
                                 Ok(session) => session,
                                 Err(err) => {
                                     tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);

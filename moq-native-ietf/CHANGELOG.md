@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.9.1...moq-native-ietf-v0.9.2) - 2026-07-09
+
+### Fixed
+
+- *(moq-transport)* send publish done after serve completion
+
+## [0.9.1](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.9.0...moq-native-ietf-v0.9.1) - 2026-07-08
+
+### Other
+
+- Merge pull request #170 from itzmanish/draft-16-rewrite
+- Update native QUIC/WebTransport helpers to use the moq-transport 0.15 draft-16 session stack.
+
+## [0.9.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.8.0...moq-native-ietf-v0.9.0) - 2026-06-10
+
+### Other
+
+- Use Box+impl Fn for socket wrapper; add passthrough test
+- Add socket_wrapper hook to quic Config
+
 ## [0.8.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.5...moq-native-ietf-v0.8.0) - 2026-04-10
 
 ### Fixed

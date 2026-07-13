@@ -84,7 +84,10 @@ pub struct Track {
     /// Exact keyframe interval in timescale ticks. Optional override used when the
     /// integer-millisecond form cannot be exact; wins over `keyframeIntervalMs`
     /// when both are present. Advisory; inheritable.
-    #[serde(rename = "keyframeIntervalTicks", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "keyframeIntervalTicks",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub keyframe_interval_ticks: Option<u64>,
 
     /// MPU metadata delivery mode (§4.5); effective default is `inline`.
@@ -763,8 +766,14 @@ mod tests {
         assert_eq!(t.keyframe_interval_ticks, Some(90000));
         assert_eq!(t.group_duration_ms, Some(33));
         let back = serde_json::to_string(&t).unwrap();
-        assert!(back.contains(r#""keyframeIntervalMs":1000"#), "json = {back}");
-        assert!(back.contains(r#""keyframeIntervalTicks":90000"#), "json = {back}");
+        assert!(
+            back.contains(r#""keyframeIntervalMs":1000"#),
+            "json = {back}"
+        );
+        assert!(
+            back.contains(r#""keyframeIntervalTicks":90000"#),
+            "json = {back}"
+        );
     }
 
     #[test]
@@ -1821,7 +1830,10 @@ pub struct CommonTrackFields {
     pub keyframe_interval_ms: Option<u32>,
 
     /// Exact keyframe-interval tick override, inheritable.
-    #[serde(rename = "keyframeIntervalTicks", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "keyframeIntervalTicks",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub keyframe_interval_ticks: Option<u64>,
 
     /// MPU metadata delivery mode, inheritable. §4.5.

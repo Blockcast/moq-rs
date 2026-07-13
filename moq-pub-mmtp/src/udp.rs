@@ -59,14 +59,18 @@ pub async fn open_udp_socket(
         (IpAddr::V4(group), Some(src)) => {
             let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
                 .context("Socket::new for SSM")?;
-            socket.set_reuse_address(true).context("set_reuse_address")?;
+            socket
+                .set_reuse_address(true)
+                .context("set_reuse_address")?;
             let wildcard = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), target.port());
             socket
                 .bind(&wildcard.into())
                 .with_context(|| format!("bind({wildcard}) for SSM"))?;
             socket
                 .join_ssm_v4(&src, &group, &imr_iface)
-                .with_context(|| format!("join_ssm_v4(source={src}, group={group}, iface={imr_iface})"))?;
+                .with_context(|| {
+                    format!("join_ssm_v4(source={src}, group={group}, iface={imr_iface})")
+                })?;
             socket
                 .set_multicast_loop_v4(true)
                 .context("set_multicast_loop_v4")?;
@@ -95,7 +99,8 @@ pub async fn open_udp_socket(
             bail!("source-specific (SSM) join is IPv4-only; --mmtp-udp-source cannot target an IPv6 group");
         }
         (IpAddr::V6(group), None) => {
-            let wildcard = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), target.port());
+            let wildcard =
+                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), target.port());
             let socket = UdpSocket::bind(wildcard)
                 .await
                 .with_context(|| format!("UdpSocket::bind({wildcard}) for multicast"))?;

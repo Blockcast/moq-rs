@@ -266,10 +266,15 @@ impl SubgroupsReader {
     // Returns the largest group/sequence
     pub fn latest(&self) -> Option<(u64, u64)> {
         let state = self.state.lock();
+        // BLO-10339: our history-window model retains subgroups in a Vec (see
+        // SubgroupsState.subgroups), so the newest is the last retained entry
+        // rather than upstream's single `latest_subgroup_reader` Option. The
+        // object-level SubgroupReader::latest() is now Option<u64> (draft-16
+        // upstream), so and_then/map to fold the missing-object case into None.
         state
             .subgroups
             .last()
-            .map(|group| (group.group_id, group.latest()))
+            .and_then(|group| group.latest().map(|object_id| (group.group_id, object_id)))
     }
 
     /// Check if the subgroups writer has been closed or dropped.
@@ -459,13 +464,9 @@ impl SubgroupReader {
         }
     }
 
-    pub fn latest(&self) -> u64 {
+    pub fn latest(&self) -> Option<u64> {
         let state = self.state.lock();
-        state
-            .objects
-            .last()
-            .map(|o| o.object_id)
-            .unwrap_or_default()
+        state.objects.last().map(|o| o.object_id)
     }
 
     pub async fn read_next(&mut self) -> Result<Option<Bytes>, ServeError> {

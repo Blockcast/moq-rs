@@ -16,8 +16,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-moq-native-ietf = { path = "../moq-native-ietf", version = "0.8" }
-moq-transport = { path = "../moq-transport", version = "0.14" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.9" }
+moq-transport = { path = "../moq-transport", version = "0.15" }
 moq-catalog = { path = "../moq-catalog", version = "0.2" }
 
 # Canonical MMTP/MPU header parsers (ISO/IEC 23008-1).

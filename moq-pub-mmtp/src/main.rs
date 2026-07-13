@@ -62,7 +62,10 @@ async fn main() -> Result<()> {
     // Select the publisher router from the catalog's track packaging: MMTP
     // (per-packet_id MPU/MFU dispatch) or opaque datagram pass-through.
     let router = build_router(&mut tracks_writer, &catalog)?;
-    tracing::info!(router = router.kind(), "built publisher router from catalog");
+    tracing::info!(
+        router = router.kind(),
+        "built publisher router from catalog"
+    );
 
     // Publish the catalog JSON on the catalog tracks (canonical `catalog` per
     // draft-ietf-moq-msf-00 §5.2, plus the legacy `.catalog` alias). The
@@ -88,7 +91,7 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         res = session.run() => res.context("session error")?,
-        res = publisher.announce(tracks_reader) => res.context("publisher error")?,
+        res = publisher.publish_namespace(tracks_reader) => res.context("publisher error")?,
         res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, args.mmtp_udp_source, args.mmtp_udp_iface, router, tracks_writer) => res.context("publisher loop error")?,
     }
 
@@ -342,7 +345,10 @@ fn build_router(tracks_writer: &mut TracksWriter, catalog: &Root) -> Result<Rout
         .iter()
         .any(|t| matches!(t.packaging, Some(TrackPackaging::Datagram)));
     if has_datagram {
-        Ok(Router::Datagram(build_datagram_state(tracks_writer, catalog)?))
+        Ok(Router::Datagram(build_datagram_state(
+            tracks_writer,
+            catalog,
+        )?))
     } else {
         Ok(Router::Mmtp(build_state_map(tracks_writer, catalog)?))
     }
@@ -669,7 +675,7 @@ mod tests {
             let reader = tr
                 .get_track_reader(&ns(), name)
                 .unwrap_or_else(|| panic!("`{name}` track is registered on the broadcast"));
-            assert_eq!(reader.name, name);
+            assert_eq!(reader.name, name.into());
             assert!(!reader.is_closed(), "`{name}` track is alive");
         }
     }
@@ -876,11 +882,11 @@ mod tests {
         let v = tr
             .get_track_reader(&ns(), "v")
             .expect("source track `v` registered");
-        assert_eq!(v.name, "v");
+        assert_eq!(v.name, "v".into());
         let v_repair = tr
             .get_track_reader(&ns(), "v/repair")
             .expect("repair track `v/repair` registered");
-        assert_eq!(v_repair.name, "v/repair");
+        assert_eq!(v_repair.name, "v/repair".into());
         assert!(!v_repair.is_closed(), "repair track is alive");
     }
 }

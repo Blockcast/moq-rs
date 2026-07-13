@@ -65,7 +65,10 @@ impl<T: TrackSubgroups> DatagramState<T> {
         // Dropping `group` here closes the subgroup: it holds exactly one
         // complete object, so the reader sees a finished object.
         self.next_group_id = self.next_group_id.checked_add(1).ok_or_else(|| {
-            anyhow!("datagram track `{}`: group_id counter overflowed u64", self.name)
+            anyhow!(
+                "datagram track `{}`: group_id counter overflowed u64",
+                self.name
+            )
         })?;
         Ok(())
     }
@@ -104,7 +107,12 @@ mod tests {
     impl TrackSubgroups for Recorder {
         type Group = RecGroup;
 
-        fn create_group(&mut self, group_id: u64, subgroup_id: u64, priority: u8) -> Result<RecGroup> {
+        fn create_group(
+            &mut self,
+            group_id: u64,
+            subgroup_id: u64,
+            priority: u8,
+        ) -> Result<RecGroup> {
             self.groups_created
                 .borrow_mut()
                 .push((group_id, subgroup_id, priority));
