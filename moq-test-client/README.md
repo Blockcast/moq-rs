@@ -45,11 +45,13 @@ moq-test-client --relay https://localhost:4443 --tls-disable-verify
 | Test | Description |
 |------|-------------|
 | `setup-only` | Connect, complete SETUP exchange, close gracefully |
-| `announce-only` | Connect, announce namespace, receive OK, close |
+| `publish-namespace-only` | Connect, send PUBLISH_NAMESPACE, receive REQUEST_OK, close |
 | `subscribe-error` | Subscribe to non-existent track, expect error |
-| `announce-subscribe` | Publisher announces, subscriber subscribes, verify handshake |
-| `subscribe-before-announce` | Subscriber subscribes before publisher announces |
-| `publish-namespace-done` | Announce namespace, send PUBLISH_NAMESPACE_DONE |
+| `publish-namespace-subscribe` | Publisher sends PUBLISH_NAMESPACE, subscriber subscribes, verify handshake |
+| `subscribe-before-publish-namespace` | Subscriber subscribes before publisher sends PUBLISH_NAMESPACE |
+| `publish-namespace-done` | Send PUBLISH_NAMESPACE, then send PUBLISH_NAMESPACE_DONE |
+| `publish-track-only` | Publisher sends direct PUBLISH, receives PUBLISH_OK, then sends PUBLISH_DONE |
+| `publish-track-subscribe` | Publisher sends direct PUBLISH, subscriber subscribes to the exact track |
 
 ## Running with moq-relay
 
@@ -78,13 +80,15 @@ MoQT Interop Test Client
 Relay: https://localhost:4443
 
 ✓ setup-only (42 ms)
-✓ announce-only (38 ms)
+✓ publish-namespace-only (38 ms)
 ✓ subscribe-error (51 ms)
-✓ announce-subscribe (127 ms)
-✓ subscribe-before-announce (89 ms)
+✓ publish-namespace-subscribe (127 ms)
+✓ subscribe-before-publish-namespace (89 ms)
 ✓ publish-namespace-done (45 ms)
+✓ publish-track-only (42 ms)
+✓ publish-track-subscribe (76 ms)
 
-Results: 6 passed, 0 failed
+Results: 8 passed, 0 failed
 
 MOQT_TEST_RESULT: SUCCESS
 ```
@@ -112,13 +116,15 @@ The test cases implemented here correspond to the specifications in [moq-interop
 | Test Case | Protocol References |
 |-----------|---------------------|
 | `setup-only` | MoQT §3.3, §9.3 |
-| `announce-only` | MoQT §6.2, §9.23-9.24 |
+| `publish-namespace-only` | MoQT §6.2, §9.23-9.24 |
 | `publish-namespace-done` | MoQT §6.2, §9.26 |
+| `publish-track-only` | MoQT §9.13-9.15 |
+| `publish-track-subscribe` | MoQT §5.1, §9.9-9.15 |
 | `subscribe-error` | MoQT §5.1, §9.7, §9.9 |
-| `announce-subscribe` | MoQT §5.1, §6.2, §9.7-9.8, §9.23-9.24 |
-| `subscribe-before-announce` | MoQT §5.1, §6.2 |
+| `publish-namespace-subscribe` | MoQT §5.1, §6.2, §9.7-9.8, §9.23-9.24 |
+| `subscribe-before-publish-namespace` | MoQT §5.1, §6.2 |
 
-Protocol references are to [draft-ietf-moq-transport-14](https://www.ietf.org/archive/id/draft-ietf-moq-transport-14.html).
+Protocol references are to [draft-ietf-moq-transport-16](https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.html).
 
 ## Design Goals
 

@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         res = session.run() => res.context("session error")?,
-        res = publisher.announce(tracks_reader) => res.context("publisher error")?,
+        res = publisher.publish_namespace(tracks_reader) => res.context("publisher error")?,
         res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, args.mmtp_udp_source, args.mmtp_udp_iface, router, tracks_writer) => res.context("publisher loop error")?,
     }
 
@@ -730,7 +730,7 @@ mod tests {
             let reader = tr
                 .get_track_reader(&ns(), name)
                 .unwrap_or_else(|| panic!("`{name}` track is registered on the broadcast"));
-            assert_eq!(reader.name, name);
+            assert_eq!(reader.name, name.into());
             assert!(!reader.is_closed(), "`{name}` track is alive");
         }
     }
@@ -937,11 +937,11 @@ mod tests {
         let v = tr
             .get_track_reader(&ns(), "v")
             .expect("source track `v` registered");
-        assert_eq!(v.name, "v");
+        assert_eq!(v.name, "v".into());
         let v_repair = tr
             .get_track_reader(&ns(), "v/repair")
             .expect("repair track `v/repair` registered");
-        assert_eq!(v_repair.name, "v/repair");
+        assert_eq!(v_repair.name, "v/repair".into());
         assert!(!v_repair.is_closed(), "repair track is alive");
     }
 }

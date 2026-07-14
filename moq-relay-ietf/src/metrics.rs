@@ -23,9 +23,9 @@
 //! | `moq_relay_connections_total` | - | Total incoming connections accepted |
 //! | `moq_relay_connections_closed_total` | - | Total connections that have closed (graceful or error) |
 //! | `moq_relay_connection_errors_total` | `stage` | Connection failures (stage: session_accept, session_run) |
-//! | `moq_relay_publishers_total` | - | Total publishers (ANNOUNCE requests) received |
-//! | `moq_relay_announce_ok_total` | - | Successful ANNOUNCE_OK responses sent |
-//! | `moq_relay_announce_errors_total` | `phase` | Announce failures (phase: coordinator_register, local_register, send_ok) |
+//! | `moq_relay_publishers_total` | - | Total publishers (PUBLISH_NAMESPACE requests) received |
+//! | `moq_relay_announce_ok_total` | - | Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE |
+//! | `moq_relay_announce_errors_total` | `phase` | PUBLISH_NAMESPACE failures (phase: coordinator_register, local_register, send_ok) |
 //! | `moq_relay_subscribers_total` | - | Total subscribers (SUBSCRIBE requests) received |
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
@@ -39,7 +39,7 @@
 //! | `moq_relay_active_publishers` | Current number of active publishers |
 //! | `moq_relay_active_subscriptions` | Current number of active subscriptions |
 //! | `moq_relay_active_tracks` | Current number of tracks being served |
-//! | `moq_relay_announced_namespaces` | Current number of registered namespaces |
+//! | `moq_relay_announced_namespaces` | Current number of namespaces registered via PUBLISH_NAMESPACE |
 //! | `moq_relay_upstream_connections` | Current number of upstream/origin connections |
 //!
 //! ## Histograms
@@ -74,15 +74,23 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_publishers_total",
-        "Total publishers (ANNOUNCE requests) received"
+        "Total publishers (PUBLISH_NAMESPACE requests) received"
+    );
+    describe_counter!(
+        "moq_relay_published_tracks_total",
+        "Total publisher-initiated PUBLISH track requests received"
+    );
+    describe_counter!(
+        "moq_relay_publish_errors_total",
+        "Publisher-initiated PUBLISH failures by phase (take_reader, local_register, coordinator_register, send_ok)"
     );
     describe_counter!(
         "moq_relay_announce_ok_total",
-        "Successful ANNOUNCE_OK responses sent"
+        "Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE"
     );
     describe_counter!(
         "moq_relay_announce_errors_total",
-        "Announce failures by phase (coordinator_register, local_register, send_ok)"
+        "PUBLISH_NAMESPACE failures by phase (coordinator_register, local_register, send_ok)"
     );
     describe_counter!(
         "moq_relay_subscribers_total",
@@ -117,6 +125,10 @@ pub fn describe_metrics() {
     describe_gauge!(
         "moq_relay_active_tracks",
         "Current number of tracks being served"
+    );
+    describe_gauge!(
+        "moq_relay_active_published_tracks",
+        "Current number of exact tracks registered from PUBLISH"
     );
     describe_gauge!(
         "moq_relay_announced_namespaces",

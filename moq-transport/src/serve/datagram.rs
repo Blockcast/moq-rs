@@ -221,7 +221,7 @@ mod tests {
     fn track() -> Arc<Track> {
         Arc::new(Track {
             namespace: TrackNamespace::from_utf8_path("test"),
-            name: "shreds".to_string(),
+            name: "shreds".to_string().into(),
         })
     }
 

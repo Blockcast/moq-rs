@@ -6,6 +6,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.22](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.21...moq-relay-ietf-v0.7.22) - 2026-07-09
+
+### Fixed
+
+- *(moq-transport)* send publish done after serve completion
+
+### Other
+
+- address PUBLISH review feedback
+- track pending request responses
+- route PUBLISH tracks by full track name
+
+## [0.7.21](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.20...moq-relay-ietf-v0.7.21) - 2026-07-08
+
+### Added
+
+- *(moq-relay-ietf)* expose relay session config
+
+### Other
+
+- *(moq-relay-ietf)* remove redundant session config binding
+- *(moq-relay-ietf)* remove manual changelog entry
+
+## [0.7.20](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.19...moq-relay-ietf-v0.7.20) - 2026-07-08
+
+### Added
+
+- route track-level PUBLISH registrations so relays can serve exact pushed tracks before falling back to namespace routing
+
+### Other
+
+- Merge pull request #170 from itzmanish/draft-16-rewrite
+- Update relay dependencies for the draft-16 transport/native stack.
+
+## [0.7.19](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.18...moq-relay-ietf-v0.7.19) - 2026-06-10
+
+### Other
+
+- updated the following local packages: moq-native-ietf
+
 ## [0.7.18](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.17...moq-relay-ietf-v0.7.18) - 2026-05-20
 
 ### Fixed

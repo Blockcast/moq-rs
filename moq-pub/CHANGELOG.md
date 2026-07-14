@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.16...moq-pub-v0.9.0) - 2026-07-09
+
+### Fixed
+
+- *(moq-transport)* send publish done after serve completion
+
+### Other
+
+- address PUBLISH review feedback
+- track pending request responses
+- route PUBLISH tracks by full track name
+
+## [0.8.16](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.15...moq-pub-v0.8.16) - 2026-07-08
+
+### Added
+
+- add `--publish` mode to push newly created tracks with PUBLISH after announcing the namespace
+
+### Other
+
+- Merge pull request #170 from itzmanish/draft-16-rewrite
+- Update publisher CLI dependencies for the draft-16 transport/native stack.
+
+## [0.8.15](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.14...moq-pub-v0.8.15) - 2026-06-10
+
+### Other
+
+- updated the following local packages: moq-native-ietf
+
 ## [0.8.14](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.13...moq-pub-v0.8.14) - 2026-05-20
 
 ### Other

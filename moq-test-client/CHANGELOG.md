@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.8...moq-test-client-v0.1.9) - 2026-07-09
+
+### Fixed
+
+- *(moq-transport)* send publish done after serve completion
+
+### Other
+
+- *(moq-test-client)* add direct publish interop scenarios
+
+### Added
+
+- Add direct PUBLISH interop scenarios for publisher-only completion and exact-track subscriber routing.
+
+## [0.1.8](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.7...moq-test-client-v0.1.8) - 2026-07-08
+
+### Other
+
+- Merge pull request #170 from itzmanish/draft-16-rewrite
+- Update the interoperability test client for the draft-16 transport/native stack.
+
+## [0.1.7](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.6...moq-test-client-v0.1.7) - 2026-06-10
+
+### Other
+
+- updated the following local packages: moq-native-ietf
+
 ## [0.1.6](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.5...moq-test-client-v0.1.6) - 2026-05-20
 
 ### Other
