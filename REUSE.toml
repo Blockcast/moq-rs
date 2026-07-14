@@ -47,3 +47,19 @@ path = [
 ]
 SPDX-FileCopyrightText = "2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# Blockcast fork additions (MMTP publisher, raw subscriber, multicast catalog,
+# vendored libmmt mmt-core, planning/graph artifacts). Annotated here rather
+# than per-file so active feature branches touching these files don't conflict.
+[[annotations]]
+path = [
+  ".markdownlintignore",
+  ".planning/**",
+  "graphify-out/**",
+  "moq-pub-mmtp/**",
+  "moq-sub-raw/**",
+  "moq-catalog/src/multicast.rs",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2025-2026 Blockcast Inc. and contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
