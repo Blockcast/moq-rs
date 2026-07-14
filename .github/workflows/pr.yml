@@ -13,7 +13,7 @@ env:
 
 jobs:
   reuse:
-    runs-on: ubuntu-latest
+    runs-on: default
     permissions:
       contents: read
     steps:
@@ -22,7 +22,7 @@ jobs:
         uses: fsfe/reuse-action@v5
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: default
 
     steps:
       - uses: actions/checkout@v3
