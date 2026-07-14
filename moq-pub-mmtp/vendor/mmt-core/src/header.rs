@@ -274,20 +274,12 @@ impl SourceFecPayloadId {
 
     /// Derive SBN for constant K: floor(SS_ID / K)
     pub fn sbn(&self, k: u32) -> u32 {
-        if k == 0 {
-            0
-        } else {
-            self.ss_id / k
-        }
+        self.ss_id.checked_div(k).unwrap_or(0)
     }
 
     /// Derive ESI for constant K: SS_ID % K
     pub fn esi(&self, k: u32) -> u32 {
-        if k == 0 {
-            0
-        } else {
-            self.ss_id % k
-        }
+        self.ss_id.checked_rem(k).unwrap_or(0)
     }
 
     /// Write to buffer
