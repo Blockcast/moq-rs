@@ -374,14 +374,36 @@ fn build_datagram_state(
         bail!("datagram router supports exactly one packaging=datagram track");
     }
 
-    let track_writer = tracks_writer.create(&track.name).ok_or_else(|| {
+    // Config-or-throw: the datagram ring retains up to subgroupHistoryGroups
+    // payloads for a lagging subscriber. There is no silent unbounded — or
+    // silently lossy — default: shred-style bursts land faster than a reader
+    // wakes, so the window must be an explicit catalog decision.
+    let multicast = catalog.multicast.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("catalog has no `multicast` extension — required for datagram publishing")
+    })?;
+    let history_window_raw = multicast.subgroup_history_groups.ok_or_else(|| {
+        anyhow::anyhow!(
+            "catalog multicast.subgroupHistoryGroups is required for datagram publishing \
+             (config-or-throw): it bounds how many recent datagrams are retained"
+        )
+    })?;
+    // NonZeroU64 carries the ">= 1" invariant into TrackWriter::set_history_window.
+    let history_window = NonZeroU64::new(history_window_raw).ok_or_else(|| {
+        anyhow::anyhow!("multicast.subgroupHistoryGroups must be >= 1 (got {history_window_raw})")
+    })?;
+
+    let mut track_writer = tracks_writer.create(&track.name).ok_or_else(|| {
         anyhow::anyhow!(
             "TracksWriter::create returned None for `{}` (broadcast already closed?)",
             track.name
         )
     })?;
-    // Native datagram mode is a one-payload latest-wins slot. A lagging reader
-    // skips superseded datagrams instead of retaining subgroup/stream tasks.
+    // Set on the Track BEFORE `.datagrams()` consumes it: datagrams() inherits
+    // the window as the bounded ring depth (publisher memory = window × payload
+    // size, raw-lossy supersession beyond it) AND the session advertises it in
+    // SUBSCRIBE_OK (BLO-10339) so a downstream relay mirror bounds its own
+    // retention.
+    track_writer.set_history_window(history_window)?;
     let datagrams = track_writer
         .datagrams()
         .with_context(|| format!("track `{}`: datagrams() failed", track.name))?;
@@ -627,19 +649,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datagram_router_uses_bounded_latest_wins_transport_mode() {
-        let cat = catalog_with(vec![track("shreds", Some(TrackPackaging::Datagram))], None);
+    async fn datagram_router_uses_bounded_ring_transport_mode() {
+        let cat = catalog_with(
+            vec![track("shreds", Some(TrackPackaging::Datagram))],
+            Some(MulticastConfig {
+                endpoints: None,
+                network_source: None,
+                subgroup_history_groups: Some(4),
+            }),
+        );
         let (mut tracks, _requests, mut readers) = Tracks::new(ns()).produce();
 
-        let _state = build_datagram_state(&mut tracks, &cat).unwrap();
+        let mut state = build_datagram_state(&mut tracks, &cat).unwrap();
         let reader = readers
             .get_track_reader(&ns(), "shreds")
             .expect("datagram track registered");
 
-        assert!(matches!(
-            reader.mode().await.unwrap(),
-            TrackReaderMode::Datagrams(_)
-        ));
+        let TrackReaderMode::Datagrams(mut datagrams) = reader.mode().await.unwrap() else {
+            panic!("datagram track must resolve to TrackReaderMode::Datagrams");
+        };
+
+        // End-to-end bound check: the catalog window (4) is the ring depth.
+        // Ten writes through the real DatagramState → a stalled reader
+        // recovers exactly the newest four, in order, and the transport
+        // reports the six superseded.
+        for value in 0..10u8 {
+            state.handle(Bytes::from(vec![value; 8])).unwrap();
+        }
+        drop(state); // close the writer so the drain below terminates
+
+        let mut got = Vec::new();
+        while let Some(datagram) = datagrams.read().await.unwrap() {
+            got.push(datagram.group_id);
+        }
+        assert_eq!(got, vec![6, 7, 8, 9], "newest `window` datagrams, in order");
+        assert_eq!(datagrams.dropped(), 6);
+    }
+
+    #[tokio::test]
+    async fn datagram_router_requires_catalog_history_window() {
+        // Config-or-throw: a datagram catalog without a multicast window is a
+        // startup error, not a silent depth-1 slot (which drops most of every
+        // burst — the F6b silent-ignore this test pins against regression).
+        let cat = catalog_with(vec![track("shreds", Some(TrackPackaging::Datagram))], None);
+        let (mut tracks, _requests, _readers) = Tracks::new(ns()).produce();
+
+        let err = match build_datagram_state(&mut tracks, &cat) {
+            Ok(_) => panic!("expected config-or-throw error for missing multicast window"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("multicast"), "got: {err}");
     }
 
     #[test]
