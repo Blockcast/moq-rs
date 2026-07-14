@@ -10,6 +10,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # ARC runners: image-baked toolchain lives on an overlay lower layer; rustup's
+  # component rename hits EXDEV (os error 18). Keep rustup state on the writable work volume.
+  RUSTUP_HOME: /home/runner/work/_rustup
 
 jobs:
   reuse:
