@@ -907,6 +907,12 @@ impl Publisher {
     pub(super) async fn send_datagram(&mut self, data: bytes::Bytes) -> Result<(), SessionError> {
         Ok(self.webtransport.send_datagram(data).await?)
     }
+
+    /// Current QUIC datagram size limit. Varies at runtime with path MTU
+    /// discovery, so callers should re-check rather than cache at startup.
+    pub(super) async fn max_datagram_size(&self) -> usize {
+        self.webtransport.max_datagram_size().await
+    }
 }
 
 #[cfg(test)]

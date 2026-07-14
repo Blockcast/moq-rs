@@ -10,10 +10,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # ARC runners: image-baked toolchain lives on an overlay lower layer; rustup's
+  # component rename hits EXDEV (os error 18). Keep rustup state on the writable work volume.
+  RUSTUP_HOME: /home/runner/work/_rustup
 
 jobs:
   reuse:
-    runs-on: ubuntu-latest
+    runs-on: default
     permissions:
       contents: read
     steps:
@@ -22,7 +25,7 @@ jobs:
         uses: fsfe/reuse-action@v5
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: default
 
     steps:
       - uses: actions/checkout@v3
@@ -37,5 +40,8 @@ jobs:
       - run: cargo clippy --no-deps
       - run: cargo fmt --check
 
-      # Check for unused dependencies
-      - uses: bnjbvr/cargo-machete@main
+      # Check for unused dependencies. bnjbvr/cargo-machete@main installs its
+      # prebuilt binary to /usr/local/bin, which is read-only on the ARC
+      # runner image — install into the writable CARGO_HOME instead.
+      - run: cargo install cargo-machete --locked
+      - run: cargo machete

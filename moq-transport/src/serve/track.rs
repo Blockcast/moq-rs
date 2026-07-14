@@ -164,11 +164,6 @@ impl TrackWriter {
     }
 
     pub fn datagrams(self) -> Result<DatagramsWriter, ServeError> {
-        let (writer, reader) = Datagrams {
-            track: self.info.clone(),
-        }
-        .produce();
-
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {
             tracing::debug!(
@@ -178,6 +173,22 @@ impl TrackWriter {
             );
             ServeError::Cancel
         })?;
+
+        // Like `subgroups()`, inherit the publisher-set history window
+        // (BLO-10339): it becomes the datagram ring depth — how many unread
+        // datagrams a slow reader can still recover before supersession —
+        // and the session advertises it via the TrackReader in SUBSCRIBE_OK
+        // so a downstream relay mirror bounds its own retention. Without a
+        // window the ring degrades to a single latest-wins slot.
+        let depth = state
+            .history_window_groups
+            .map(|groups| usize::try_from(groups.get()).unwrap_or(usize::MAX))
+            .unwrap_or(1);
+
+        let (writer, reader) = Datagrams {
+            track: self.info.clone(),
+        }
+        .produce_with_depth(depth);
 
         // Set the Stream mode to TrackReaderMode::Datagrams
         state.reader_mode = Some(reader.into());
