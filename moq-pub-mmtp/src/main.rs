@@ -10,7 +10,7 @@ use moq_catalog::{Root, TrackPackaging};
 use moq_native_ietf::quic;
 use moq_transport::{
     coding::TrackNamespace,
-    serve::{SubgroupsWriter, Tracks, TracksWriter},
+    serve::{DatagramsWriter, SubgroupsWriter, Tracks, TracksWriter},
     session::Publisher,
 };
 use tokio::io::AsyncWriteExt;
@@ -306,11 +306,10 @@ fn check_namespace_consistency(catalog: &Root, name: &str) -> Result<()> {
 ///
 /// `Mmtp` interprets MMTP MPU/MFU structure (Mapping B subgrouping + AL-FEC
 /// repair siblings, see `publish::dispatch`); `Datagram` carries each UDP
-/// datagram as one opaque MoQ object (see `datagram::DatagramState`). Both
-/// arms own the concrete `SubgroupsWriter` sink.
+/// datagram as one opaque native MoQ datagram (see `datagram::DatagramState`).
 enum Router {
     Mmtp(HashMap<u16, TrackState<SubgroupsWriter>>),
-    Datagram(DatagramState<SubgroupsWriter>),
+    Datagram(DatagramState<DatagramsWriter>),
 }
 
 impl Router {
@@ -359,13 +358,11 @@ fn build_router(tracks_writer: &mut TracksWriter, catalog: &Root) -> Result<Rout
 ///
 /// Errors:
 ///   - no, or more than one, datagram track (the router maps a single stream)
-///   - catalog has no `multicast` extension or no `subgroupHistoryGroups`
-///     (config-or-throw: the window bounds how many recent datagrams are kept)
 ///   - TracksWriter::create returns None (broadcast already closed)
 fn build_datagram_state(
     tracks_writer: &mut TracksWriter,
     catalog: &Root,
-) -> Result<DatagramState<SubgroupsWriter>> {
+) -> Result<DatagramState<DatagramsWriter>> {
     let mut datagram_tracks = catalog
         .tracks
         .iter()
@@ -377,6 +374,10 @@ fn build_datagram_state(
         bail!("datagram router supports exactly one packaging=datagram track");
     }
 
+    // Config-or-throw: the datagram ring retains up to subgroupHistoryGroups
+    // payloads for a lagging subscriber. There is no silent unbounded — or
+    // silently lossy — default: shred-style bursts land faster than a reader
+    // wakes, so the window must be an explicit catalog decision.
     let multicast = catalog.multicast.as_ref().ok_or_else(|| {
         anyhow::anyhow!("catalog has no `multicast` extension — required for datagram publishing")
     })?;
@@ -397,17 +398,18 @@ fn build_datagram_state(
             track.name
         )
     })?;
-    // Set on the Track BEFORE `.subgroups()` consumes it: subgroups() inherits
-    // the window for local pruning AND the session advertises it in SUBSCRIBE_OK
-    // (BLO-10339) so a downstream relay mirror bounds its own retention — matters
-    // for datagram, where one group per datagram creates many subgroups.
+    // Set on the Track BEFORE `.datagrams()` consumes it: datagrams() inherits
+    // the window as the bounded ring depth (publisher memory = window × payload
+    // size, raw-lossy supersession beyond it) AND the session advertises it in
+    // SUBSCRIBE_OK (BLO-10339) so a downstream relay mirror bounds its own
+    // retention.
     track_writer.set_history_window(history_window)?;
-    let subgroups = track_writer
-        .subgroups()
-        .with_context(|| format!("track `{}`: subgroups() failed", track.name))?;
+    let datagrams = track_writer
+        .datagrams()
+        .with_context(|| format!("track `{}`: datagrams() failed", track.name))?;
 
     // Datagram source objects publish at priority 0, matching MMTP source tracks.
-    Ok(DatagramState::new(track.name.clone(), 0, subgroups))
+    Ok(DatagramState::new(track.name.clone(), 0, datagrams))
 }
 
 /// Drive the publisher loop until the input ends.
@@ -503,7 +505,7 @@ mod tests {
     use moq_catalog::{
         CommonTrackFields, FecAlgorithm, FecDescriptor, MmtpMode, SelectionParam, Track,
     };
-    use moq_transport::serve::Tracks;
+    use moq_transport::serve::{TrackReaderMode, Tracks};
 
     fn ns() -> TrackNamespace {
         TrackNamespace::from_utf8_path("test-broadcast")
@@ -644,6 +646,59 @@ mod tests {
             err.to_string().contains("subgroupHistoryGroups"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn datagram_router_uses_bounded_ring_transport_mode() {
+        let cat = catalog_with(
+            vec![track("shreds", Some(TrackPackaging::Datagram))],
+            Some(MulticastConfig {
+                endpoints: None,
+                network_source: None,
+                subgroup_history_groups: Some(4),
+            }),
+        );
+        let (mut tracks, _requests, mut readers) = Tracks::new(ns()).produce();
+
+        let mut state = build_datagram_state(&mut tracks, &cat).unwrap();
+        let reader = readers
+            .get_track_reader(&ns(), "shreds")
+            .expect("datagram track registered");
+
+        let TrackReaderMode::Datagrams(mut datagrams) = reader.mode().await.unwrap() else {
+            panic!("datagram track must resolve to TrackReaderMode::Datagrams");
+        };
+
+        // End-to-end bound check: the catalog window (4) is the ring depth.
+        // Ten writes through the real DatagramState → a stalled reader
+        // recovers exactly the newest four, in order, and the transport
+        // reports the six superseded.
+        for value in 0..10u8 {
+            state.handle(Bytes::from(vec![value; 8])).unwrap();
+        }
+        drop(state); // close the writer so the drain below terminates
+
+        let mut got = Vec::new();
+        while let Some(datagram) = datagrams.read().await.unwrap() {
+            got.push(datagram.group_id);
+        }
+        assert_eq!(got, vec![6, 7, 8, 9], "newest `window` datagrams, in order");
+        assert_eq!(datagrams.dropped(), 6);
+    }
+
+    #[tokio::test]
+    async fn datagram_router_requires_catalog_history_window() {
+        // Config-or-throw: a datagram catalog without a multicast window is a
+        // startup error, not a silent depth-1 slot (which drops most of every
+        // burst — the F6b silent-ignore this test pins against regression).
+        let cat = catalog_with(vec![track("shreds", Some(TrackPackaging::Datagram))], None);
+        let (mut tracks, _requests, _readers) = Tracks::new(ns()).produce();
+
+        let err = match build_datagram_state(&mut tracks, &cat) {
+            Ok(_) => panic!("expected config-or-throw error for missing multicast window"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("multicast"), "got: {err}");
     }
 
     #[test]

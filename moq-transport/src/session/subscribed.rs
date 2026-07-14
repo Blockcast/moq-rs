@@ -374,7 +374,32 @@ impl Subscribed {
         tracing::debug!("[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
+        // Loss warnings are rate-limited by TIME, not by a fixed drop count:
+        // at bursty ingest rates (Solana shreds arrive per-FEC-set at
+        // thousands/sec) any count threshold either spams the log or hides
+        // sustained loss. One line per interval summarizes the deltas.
+        const LOSS_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut last_loss_warn: Option<std::time::Instant> = None;
+        let mut reported_dropped: u64 = 0;
+        let mut skipped_too_large: u64 = 0;
+        let mut reported_too_large: u64 = 0;
         while let Some(datagram) = datagrams.read().await? {
+            let dropped_total = datagrams.dropped();
+            let loss_grew =
+                dropped_total > reported_dropped || skipped_too_large > reported_too_large;
+            let warn_due = last_loss_warn.is_none_or(|at| at.elapsed() >= LOSS_WARN_INTERVAL);
+            if loss_grew && warn_due {
+                tracing::warn!(
+                    dropped_total,
+                    dropped_delta = dropped_total - reported_dropped,
+                    skipped_too_large,
+                    "datagram subscriber lossy: ring-superseded and/or over-MTU payloads skipped"
+                );
+                reported_dropped = dropped_total;
+                reported_too_large = skipped_too_large;
+                last_loss_warn = Some(std::time::Instant::now());
+            }
+
             // Determine datagram type based on extension headers presence
             let has_extension_headers = !datagram.extension_headers.is_empty();
             let datagram_type = if has_extension_headers {
@@ -405,6 +430,26 @@ impl Subscribed {
                 .unwrap_or(0);
             let mut buffer = bytes::BytesMut::with_capacity(payload_len + 100);
             encoded_datagram.encode(&mut buffer)?;
+
+            // A payload larger than the current QUIC datagram limit cannot be
+            // sent (quinn errors, and propagating that error would reset the
+            // whole subscription). The limit moves with path MTU discovery —
+            // ~1150 usable bytes at quinn's 1200 initial MTU, so e.g. a full
+            // 1228-byte shred + MoQ header overflows until discovery raises
+            // it, and permanently on low-MTU tunnel paths. Skip-and-count:
+            // raw-lossy tracks prefer dropping one datagram over killing the
+            // subscription.
+            let max_datagram_size = self.publisher.max_datagram_size().await;
+            if buffer.len() > max_datagram_size {
+                skipped_too_large += 1;
+                tracing::debug!(
+                    encoded_len = buffer.len(),
+                    max_datagram_size,
+                    group_id = encoded_datagram.group_id,
+                    "[PUBLISHER] serve_datagrams: datagram exceeds QUIC limit — skipped"
+                );
+                continue;
+            }
 
             tracing::debug!(
                 "[PUBLISHER] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={}, payload_len={}, extension_headers={:?}, total_encoded_len={}",
@@ -445,8 +490,9 @@ impl Subscribed {
         }
 
         tracing::info!(
-            "[PUBLISHER] serve_datagrams: completed ({} datagrams sent)",
-            datagram_count
+            "[PUBLISHER] serve_datagrams: completed ({} datagrams sent, {} skipped over-MTU)",
+            datagram_count,
+            skipped_too_large
         );
 
         Ok(())

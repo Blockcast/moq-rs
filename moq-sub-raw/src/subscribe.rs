@@ -12,12 +12,18 @@ use anyhow::{bail, Context, Result};
 use moq_transport::serve::{TrackReader, TrackReaderMode};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-/// Drain all subgroups → objects → chunks from `track` into `out`.
+/// Drain a track's payload bytes into `out`, in arrival order.
 ///
-/// Writes each MoQ object's raw payload bytes to `out` in arrival
-/// order. No separators between objects — the caller is responsible
-/// for any framing semantics (for M.1, each object is one MMTP
-/// packet so the concatenation is the raw MMTP packet stream).
+/// Handles both track modes the in-repo publishers emit:
+///   - `Subgroups` — moq-pub-mmtp's MMTP mapping (each object = one MMTP
+///     packet); subgroups → objects → chunks are concatenated verbatim.
+///   - `Datagrams` — moq-pub-mmtp's `packaging=datagram` pass-through (each
+///     datagram = one opaque payload, e.g. a Solana shred frame). The
+///     transport ring is raw-lossy: superseded datagrams are skipped by
+///     design and surface only in the reader's drop counter.
+///
+/// No separators between payloads — the caller owns any framing semantics
+/// (for M.1, concatenation IS the raw packet stream).
 ///
 /// Returns when the track's writer side closes (clean EOF) or the
 /// underlying reader is dropped.
@@ -38,10 +44,17 @@ pub async fn drain_track_to_writer<W: AsyncWrite + Unpin>(
                 }
             }
         }
-        // moq-pub-mmtp only emits subgroup-mode tracks for M.1; the
-        // other reader modes (Stream, Datagrams) are out of scope.
+        TrackReaderMode::Datagrams(mut datagrams) => {
+            while let Some(datagram) = datagrams.read().await.context("datagrams.read")? {
+                out.write_all(&datagram.payload)
+                    .await
+                    .context("out.write_all datagram")?;
+                bytes_written += datagram.payload.len() as u64;
+            }
+        }
+        // Stream mode is not emitted by any in-repo publisher.
         _ => bail!(
-            "track `{}` is not in subgroup mode (moq-pub-mmtp emits subgroup mode only)",
+            "track `{}` is not in subgroup or datagram mode (unsupported reader mode)",
             track.name
         ),
     }
@@ -218,5 +231,38 @@ mod tests {
             .expect("drain ok");
         assert_eq!(n, 0);
         assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_concatenates_datagram_payloads_in_arrival_order() {
+        // F1 (moq-rs PR #35): moq-pub-mmtp's packaging=datagram tracks are
+        // native-datagram mode; the raw consumer must drain them instead of
+        // bailing. The publisher-set history window keeps all three writes
+        // retained so this drain is deterministic.
+        let (mut track_writer, track_reader, _tw, _tr) = make_track_pair("shreds");
+        track_writer
+            .set_history_window(std::num::NonZeroU64::new(8).unwrap())
+            .expect("set window");
+        let mut datagrams = track_writer.datagrams().expect("datagrams mode");
+
+        for (group_id, payload) in [(0u64, "alpha"), (1, "beta"), (2, "gamma")] {
+            datagrams
+                .write(moq_transport::serve::Datagram {
+                    group_id,
+                    object_id: 0,
+                    priority: 0,
+                    payload: Bytes::from_static(payload.as_bytes()),
+                    extension_headers: Default::default(),
+                })
+                .expect("write datagram");
+        }
+        drop(datagrams);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let n = drain_track_to_writer(track_reader, &mut buf)
+            .await
+            .expect("drain ok");
+        assert_eq!(n, b"alphabetagamma".len() as u64);
+        assert_eq!(buf, b"alphabetagamma");
     }
 }
