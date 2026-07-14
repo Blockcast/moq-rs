@@ -177,7 +177,7 @@ mod tests {
         let plain = synth_mmtp_packet(7, PacketType::Mpu, false, 0, Some(1));
         assert!(!route(&plain).unwrap().aggregation, "non-aggregated MPU");
 
-        let mut hdr = MmtpHeader::new(7, PacketType::Mpu);
+        let hdr = MmtpHeader::new(7, PacketType::Mpu);
         let mut buf = bytes::BytesMut::with_capacity(64);
         hdr.write_to(&mut buf).unwrap();
         let mut mpu = MpuHeader::new(FragmentType::Mfu, 2);
