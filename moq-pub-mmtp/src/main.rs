@@ -238,10 +238,18 @@ fn build_state_map(
 ///     `.catalog`). The dot-prefix is reserved at the *namespace* level by
 ///     moq-transport §3.2.1, so it is not idiomatic for a media track name; it
 ///     is kept only so non-MSF consumers still resolve the catalog.
+///   - `catalog.json` — a hang-lineage alias. The Blockcast dual-stack-relay
+///     probes upstream catalog track names in the order
+///     `["catalog.json", "catalog", ".catalog"]` and advances only on a
+///     SUBSCRIBE_ERROR (BLO-15946). moq-transport treats a subscribe to a
+///     not-yet-existent track as valid and answers neither OK nor ERROR, so a
+///     publisher that omits `catalog.json` leaves the relay's first candidate
+///     parked forever and the catalog never ingests. Serving it here makes the
+///     relay's first probe resolve immediately.
 ///
-/// `catalog` is listed first as the conformant name; drop `.catalog` once the
-/// non-MSF consumers migrate.
-const CATALOG_TRACK_NAMES: [&str; 2] = ["catalog", ".catalog"];
+/// `catalog` is listed first as the conformant name; drop the aliases once the
+/// non-MSF / relay consumers migrate.
+const CATALOG_TRACK_NAMES: [&str; 3] = ["catalog", ".catalog", "catalog.json"];
 
 /// Publish the broadcast's catalog JSON on each catalog track name.
 ///
@@ -726,7 +734,7 @@ mod tests {
         let _retained = publish_catalog_track(&mut tw, &catalog_bytes)
             .expect("publish_catalog_track returns Ok");
 
-        for name in [".catalog", "catalog"] {
+        for name in [".catalog", "catalog", "catalog.json"] {
             let reader = tr
                 .get_track_reader(&ns(), name)
                 .unwrap_or_else(|| panic!("`{name}` track is registered on the broadcast"));
