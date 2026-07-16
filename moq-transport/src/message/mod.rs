@@ -15,8 +15,8 @@
 //! ```
 //!
 //! The receiver MUST close the session with PROTOCOL_VIOLATION if the
-//! payload length does not match Message Length.  Unknown message types
-//! MUST also close the session.
+//! payload length does not match Message Length. Unknown message types are
+//! retained as opaque payloads so extensions do not terminate the session.
 
 mod fetch;
 mod fetch_cancel;
@@ -75,8 +75,14 @@ pub use track_status::*;
 pub use unsubscribe::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
-use bytes::Buf as _;
+use bytes::{Buf as _, Bytes};
 use std::fmt;
+
+#[derive(Clone)]
+pub struct Unknown {
+    pub message_type: u64,
+    pub payload: Bytes,
+}
 
 // Use a macro to generate the Message enum and its encode/decode impls.
 macro_rules! message_types {
@@ -84,7 +90,8 @@ macro_rules! message_types {
         /// All supported control message types.
         #[derive(Clone)]
         pub enum Message {
-            $($name($name)),*
+            $($name($name),)*
+            Unknown(Unknown),
         }
 
         impl Decode for Message {
@@ -99,12 +106,12 @@ macro_rules! message_types {
                 let mut payload = r.copy_to_bytes(len);
 
                 let msg = match t {
-                    $($val => {
-                        let msg = $name::decode(&mut payload)?;
-                        Ok(Self::$name(msg))
-                    })*
-                    _ => Err(DecodeError::InvalidMessage(t)),
-                }?;
+                    $($val => Self::$name($name::decode(&mut payload)?),)*
+                    _ => return Ok(Self::Unknown(Unknown {
+                        message_type: t,
+                        payload,
+                    })),
+                };
 
                 // Any bytes left in the payload slice mean the message was
                 // shorter than declared — that is a PROTOCOL_VIOLATION.
@@ -133,6 +140,16 @@ macro_rules! message_types {
                         w.put_slice(&buf);
                         Ok(())
                     },)*
+                    Self::Unknown(m) => {
+                        m.message_type.encode(w)?;
+                        if m.payload.len() > u16::MAX as usize {
+                            return Err(EncodeError::MsgBoundsExceeded);
+                        }
+                        (m.payload.len() as u16).encode(w)?;
+                        Self::encode_remaining(w, m.payload.len())?;
+                        w.put_slice(&m.payload);
+                        Ok(())
+                    }
                 }
             }
         }
@@ -141,12 +158,14 @@ macro_rules! message_types {
             pub fn id(&self) -> u64 {
                 match self {
                     $(Self::$name(_) => $val,)*
+                    Self::Unknown(m) => m.message_type,
                 }
             }
 
             pub fn name(&self) -> &'static str {
                 match self {
                     $(Self::$name(_) => stringify!($name),)*
+                    Self::Unknown(_) => "Unknown",
                 }
             }
 
@@ -179,6 +198,11 @@ macro_rules! message_types {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 match self {
                     $(Self::$name(ref m) => m.fmt(f),)*
+                    Self::Unknown(m) => f
+                        .debug_struct("Unknown")
+                        .field("message_type", &m.message_type)
+                        .field("payload_len", &m.payload.len())
+                        .finish(),
                 }
             }
         }
@@ -373,13 +397,35 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_legacy_stub_message_type() {
+    fn decode_retains_unknown_message_and_preserves_framing() {
         let mut buf = bytes::BytesMut::new();
         0x100u64.encode(&mut buf).unwrap();
-        0u16.encode(&mut buf).unwrap();
+        3u16.encode(&mut buf).unwrap();
+        buf.extend_from_slice(b"ext");
 
-        let err = Message::decode(&mut buf).unwrap_err();
-        assert!(matches!(err, DecodeError::InvalidMessage(0x100)));
+        Message::GoAway(GoAway {
+            uri: crate::coding::SessionUri("moq://next.example".into()),
+        })
+        .encode(&mut buf)
+        .unwrap();
+
+        let unknown = Message::decode(&mut buf).unwrap();
+        let mut forwarded = bytes::BytesMut::new();
+        unknown.encode(&mut forwarded).unwrap();
+        let mut expected = bytes::BytesMut::new();
+        0x100u64.encode(&mut expected).unwrap();
+        3u16.encode(&mut expected).unwrap();
+        expected.extend_from_slice(b"ext");
+        assert_eq!(forwarded, expected);
+
+        let Message::Unknown(unknown) = unknown else {
+            panic!("expected opaque unknown message");
+        };
+        assert_eq!(unknown.message_type, 0x100);
+        assert_eq!(unknown.payload, &b"ext"[..]);
+
+        assert!(matches!(Message::decode(&mut buf), Ok(Message::GoAway(_))));
+        assert!(buf.is_empty());
     }
 
     #[test]
