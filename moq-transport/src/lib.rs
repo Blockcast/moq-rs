@@ -17,3 +17,6 @@ pub mod serve;
 pub mod session;
 pub mod setup;
 pub mod watch;
+
+/// Version of the immutable draft-16 wire vectors shipped with this crate.
+pub const MOQ_WIRE_FIXTURE_VERSION: &str = "moqt-16-v1";
