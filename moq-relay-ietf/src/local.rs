@@ -3,7 +3,7 @@
 
 use std::collections::hash_map;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use moq_transport::{
     coding::{TrackNamespace, TrackNamespacePrefix},
@@ -29,6 +29,17 @@ const NAMESPACE_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 #[derive(Clone)]
 struct NamespaceSource {
     requests: mpsc::Sender<TrackWriter>,
+}
+
+struct NamespaceEntry {
+    local: Option<NamespaceSource>,
+    remote: Weak<RemoteNamespaceSource>,
+}
+
+struct RemoteNamespaceSource {
+    locals: Locals,
+    scope_key: ScopeKey,
+    namespace: TrackNamespace,
 }
 
 struct TrackEntry {
@@ -64,16 +75,17 @@ pub enum TrackChange {
 /// Relay-local registry.
 ///
 /// Actual media tracks are always stored by exact Full Track Name. Namespace
-/// entries are only routing metadata from PUBLISH_NAMESPACE: they tell the
-/// relay which upstream publisher can be asked for a missing track.
+/// entries combine discovery metadata with an optional local PUBLISH_NAMESPACE
+/// route source that can be asked for a missing track.
 #[derive(Clone)]
 pub struct Locals {
     /// Actual media tracks, indexed by (scope, full track name).
     tracks: Arc<Mutex<HashMap<ScopeKey, HashMap<FullTrackName, TrackEntry>>>>,
 
-    /// Namespace route sources from PUBLISH_NAMESPACE, indexed by (scope,
-    /// namespace) and matched by prefix.
-    namespaces: Arc<Mutex<HashMap<ScopeKey, HashMap<TrackNamespace, NamespaceSource>>>>,
+    /// Namespace sources, indexed by (scope, namespace) and matched by prefix.
+    /// Each entry can have one local PUBLISH_NAMESPACE route source and shared
+    /// ownership by any number of remote discovery registrations.
+    namespaces: Arc<Mutex<HashMap<ScopeKey, HashMap<TrackNamespace, NamespaceEntry>>>>,
 
     /// Namespace add/remove notifications for SUBSCRIBE_NAMESPACE handlers.
     namespace_changes: broadcast::Sender<NamespaceChange>,
@@ -162,17 +174,29 @@ impl Locals {
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
         let (tx, rx) = mpsc::channel(NAMESPACE_REQUEST_CHANNEL_CAPACITY);
 
-        let mut namespaces = self
-            .namespaces
-            .lock()
-            .map_err(|_| ServeError::internal_ctx("locals namespace registry lock poisoned"))?;
-        let bucket = namespaces.entry(scope_key.clone()).or_default();
-        match bucket.entry(namespace.clone()) {
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert(NamespaceSource { requests: tx });
+        let added = {
+            let mut namespaces = self
+                .namespaces
+                .lock()
+                .map_err(|_| ServeError::internal_ctx("locals namespace registry lock poisoned"))?;
+            let bucket = namespaces.entry(scope_key.clone()).or_default();
+            match bucket.entry(namespace.clone()) {
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert(NamespaceEntry {
+                        local: Some(NamespaceSource { requests: tx }),
+                        remote: Weak::new(),
+                    });
+                    true
+                }
+                hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get().local.is_some() {
+                        return Err(ServeError::Duplicate.into());
+                    }
+                    entry.get_mut().local = Some(NamespaceSource { requests: tx });
+                    false
+                }
             }
-            hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
-        }
+        };
 
         let registration = LocalNamespaceRegistration {
             locals: self.clone(),
@@ -181,13 +205,70 @@ impl Locals {
             _gauge_guard: GaugeGuard::new("moq_relay_announced_namespaces"),
         };
 
-        let _ = self.namespace_changes.send(NamespaceChange {
-            scope: scope_key_to_option(&registration.scope_key),
-            namespace,
-            added: true,
-        });
+        if added {
+            let _ = self.namespace_changes.send(NamespaceChange {
+                scope: scope_key_to_option(&registration.scope_key),
+                namespace,
+                added: true,
+            });
+        }
 
         Ok((registration, rx))
+    }
+
+    /// Register remote discovery metadata for one exact namespace.
+    pub fn register_remote_namespace(
+        &self,
+        scope: Option<&str>,
+        namespace: TrackNamespace,
+    ) -> anyhow::Result<RemoteNamespaceRegistration> {
+        let scope_key = scope.unwrap_or(UNSCOPED).to_string();
+        let (source, added) = {
+            let mut namespaces = self
+                .namespaces
+                .lock()
+                .map_err(|_| ServeError::internal_ctx("locals namespace registry lock poisoned"))?;
+            let bucket = namespaces.entry(scope_key.clone()).or_default();
+            match bucket.entry(namespace.clone()) {
+                hash_map::Entry::Vacant(entry) => {
+                    let source = Arc::new(RemoteNamespaceSource {
+                        locals: self.clone(),
+                        scope_key: scope_key.clone(),
+                        namespace: namespace.clone(),
+                    });
+                    entry.insert(NamespaceEntry {
+                        local: None,
+                        remote: Arc::downgrade(&source),
+                    });
+                    (source, true)
+                }
+                hash_map::Entry::Occupied(mut entry) => {
+                    if let Some(source) = entry.get().remote.upgrade() {
+                        (source, false)
+                    } else {
+                        let source = Arc::new(RemoteNamespaceSource {
+                            locals: self.clone(),
+                            scope_key: scope_key.clone(),
+                            namespace: namespace.clone(),
+                        });
+                        entry.get_mut().remote = Arc::downgrade(&source);
+                        (source, false)
+                    }
+                }
+            }
+        };
+
+        let registration = RemoteNamespaceRegistration { _source: source };
+
+        if added {
+            let _ = self.namespace_changes.send(NamespaceChange {
+                scope: scope_key_to_option(&scope_key),
+                namespace,
+                added: true,
+            });
+        }
+
+        Ok(registration)
     }
 
     /// Register one exact track received via PUBLISH.
@@ -292,7 +373,11 @@ impl Locals {
         let mut best_match: Option<NamespaceSource> = None;
         let mut best_len = 0;
 
-        for (registered_ns, source) in bucket.iter() {
+        for (registered_ns, entry) in bucket.iter() {
+            let Some(source) = entry.local.as_ref() else {
+                continue;
+            };
+
             if namespace.fields.len() >= registered_ns.fields.len() {
                 let is_prefix = registered_ns
                     .fields
@@ -371,7 +456,52 @@ impl Drop for LocalNamespaceRegistration {
         let mut removed = false;
         if let Ok(mut namespaces) = self.locals.namespaces.lock() {
             if let Some(bucket) = namespaces.get_mut(self.scope_key.as_str()) {
-                removed = bucket.remove(&self.namespace).is_some();
+                let remove_namespace = if let Some(entry) = bucket.get_mut(&self.namespace) {
+                    entry.local.take().is_some() && entry.remote.upgrade().is_none()
+                } else {
+                    false
+                };
+                if remove_namespace {
+                    removed = bucket.remove(&self.namespace).is_some();
+                }
+                if bucket.is_empty() {
+                    namespaces.remove(self.scope_key.as_str());
+                }
+            }
+        }
+
+        if removed {
+            let _ = self.locals.namespace_changes.send(NamespaceChange {
+                scope: scope_key_to_option(&self.scope_key),
+                namespace: self.namespace.clone(),
+                added: false,
+            });
+        }
+    }
+}
+
+pub struct RemoteNamespaceRegistration {
+    _source: Arc<RemoteNamespaceSource>,
+}
+
+impl Drop for RemoteNamespaceSource {
+    fn drop(&mut self) {
+        let mut removed = false;
+        if let Ok(mut namespaces) = self.locals.namespaces.lock() {
+            if let Some(bucket) = namespaces.get_mut(self.scope_key.as_str()) {
+                let remove_namespace = if let Some(entry) = bucket.get_mut(&self.namespace) {
+                    if std::ptr::eq(entry.remote.as_ptr(), self) {
+                        entry.remote = Weak::new();
+                        entry.local.is_none()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if remove_namespace {
+                    removed = bucket.remove(&self.namespace).is_some();
+                }
                 if bucket.is_empty() {
                     namespaces.remove(self.scope_key.as_str());
                 }
@@ -447,6 +577,164 @@ mod tests {
             namespace: namespace.clone(),
             name: TrackName::from(name),
         }
+    }
+
+    async fn assert_no_namespace_change(changes: &mut broadcast::Receiver<NamespaceChange>) {
+        let change =
+            tokio::time::timeout(std::time::Duration::from_millis(50), changes.recv()).await;
+        assert!(change.is_err(), "unexpected namespace change: {change:?}");
+    }
+
+    #[tokio::test]
+    async fn remote_namespace_is_visible_but_not_a_track_route() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/remote");
+        let registration = locals
+            .register_remote_namespace(Some("scope-a"), namespace.clone())
+            .expect("remote namespace should register");
+
+        assert_eq!(
+            locals.list_namespaces_matching(
+                Some("scope-a"),
+                &TrackNamespacePrefix::from_utf8_path("room"),
+            ),
+            vec![namespace.clone()]
+        );
+        assert!(locals
+            .get_or_request_track(Some("scope-a"), namespace, "video")
+            .await
+            .is_none());
+
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn local_then_remote_emits_only_union_transitions() {
+        let mut locals = Locals::new();
+        let mut changes = locals.subscribe_namespace_changes();
+        let namespace = ns("room/shared");
+        let (local, _requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("local namespace should register");
+        assert!(changes.recv().await.expect("local add").added);
+
+        let remote = locals
+            .register_remote_namespace(None, namespace.clone())
+            .expect("remote namespace should coexist");
+        assert_no_namespace_change(&mut changes).await;
+
+        drop(local);
+        assert_no_namespace_change(&mut changes).await;
+        assert_eq!(
+            locals.list_namespaces_matching(
+                None,
+                &TrackNamespacePrefix::from_utf8_path("room/shared"),
+            ),
+            vec![namespace.clone()]
+        );
+
+        drop(remote);
+        let removed = changes.recv().await.expect("last-source removal");
+        assert_eq!(removed.namespace, namespace);
+        assert!(!removed.added);
+    }
+
+    #[tokio::test]
+    async fn remote_then_local_keeps_local_route_until_last_drop() {
+        let mut locals = Locals::new();
+        let mut changes = locals.subscribe_namespace_changes();
+        let namespace = ns("room/shared");
+        let remote = locals
+            .register_remote_namespace(None, namespace.clone())
+            .expect("remote namespace should register");
+        assert!(changes.recv().await.expect("remote add").added);
+
+        let (local, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("local namespace should coexist");
+        assert_no_namespace_change(&mut changes).await;
+
+        drop(remote);
+        assert_no_namespace_change(&mut changes).await;
+        let requested = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("local route should remain usable");
+        drop(requested);
+        assert!(requests.recv().await.is_some());
+
+        drop(local);
+        let removed = changes.recv().await.expect("local removal");
+        assert_eq!(removed.namespace, namespace);
+        assert!(!removed.added);
+    }
+
+    #[tokio::test]
+    async fn multiple_remote_sources_remove_on_last_drop() {
+        let locals = Locals::new();
+        let mut changes = locals.subscribe_namespace_changes();
+        let namespace = ns("room/remote");
+        let first = locals
+            .register_remote_namespace(None, namespace.clone())
+            .expect("first remote should register");
+        assert!(changes.recv().await.expect("first add").added);
+
+        let second = locals
+            .register_remote_namespace(None, namespace.clone())
+            .expect("second remote should register");
+        assert_no_namespace_change(&mut changes).await;
+
+        drop(first);
+        assert_no_namespace_change(&mut changes).await;
+        drop(second);
+
+        let removed = changes.recv().await.expect("last remote removal");
+        assert_eq!(removed.namespace, namespace);
+        assert!(!removed.added);
+    }
+
+    #[tokio::test]
+    async fn remote_source_does_not_allow_duplicate_local_registration() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/shared");
+        let _remote = locals
+            .register_remote_namespace(None, namespace.clone())
+            .expect("remote namespace should register");
+        let (_local, _requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("first local namespace should register");
+
+        let duplicate = locals.register_namespace(None, namespace).await;
+        assert!(duplicate.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_namespace_scopes_stay_isolated() {
+        let locals = Locals::new();
+        let _a = locals
+            .register_remote_namespace(Some("scope-a"), ns("room/a"))
+            .expect("scope-a remote should register");
+        let _b = locals
+            .register_remote_namespace(Some("scope-b"), ns("room/b"))
+            .expect("scope-b remote should register");
+
+        assert_eq!(
+            locals.list_namespaces_matching(
+                Some("scope-a"),
+                &TrackNamespacePrefix::from_utf8_path("room"),
+            ),
+            vec![ns("room/a")]
+        );
+        assert_eq!(
+            locals.list_namespaces_matching(
+                Some("scope-b"),
+                &TrackNamespacePrefix::from_utf8_path("room"),
+            ),
+            vec![ns("room/b")]
+        );
     }
 
     #[tokio::test]
