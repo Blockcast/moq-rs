@@ -21,6 +21,13 @@ use crate::{
 
 use super::{Reader, SessionError, Subscriber, Writer};
 
+/// Safety bound on the number of distinct namespaces tracked for a single
+/// SUBSCRIBE_NAMESPACE response stream. A misbehaving upstream could otherwise
+/// send unbounded NAMESPACE additions and exhaust memory; exceeding it closes the
+/// stream with a protocol violation. Chosen high enough not to affect legitimate
+/// broad-prefix discovery.
+const MAX_KNOWN_NAMESPACE_SUFFIXES: usize = 1 << 20;
+
 #[derive(Debug, Clone)]
 pub struct SubscribeNamespaceInfo {
     pub request_id: u64,
@@ -82,6 +89,7 @@ impl SubscribeNamespace {
             namespace_prefix: info.namespace_prefix.clone(),
             responded: false,
             known_suffixes: HashSet::default(),
+            max_known_suffixes: MAX_KNOWN_NAMESPACE_SUFFIXES,
             subscriber,
             force_reset: Some(recv_force_reset),
         };
@@ -187,6 +195,7 @@ pub(super) struct SubscribeNamespaceRecv {
     namespace_prefix: TrackNamespacePrefix,
     responded: bool,
     known_suffixes: HashSet<TrackNamespacePrefix>,
+    max_known_suffixes: usize,
     subscriber: Subscriber,
     force_reset: Option<oneshot::Receiver<u32>>,
 }
@@ -326,6 +335,15 @@ impl SubscribeNamespaceRecv {
                 ))
             })?;
 
+        if !self.known_suffixes.contains(&msg.track_namespace_suffix)
+            && self.known_suffixes.len() >= self.max_known_suffixes
+        {
+            return Err(SessionError::ProtocolViolation(format!(
+                "SUBSCRIBE_NAMESPACE response exceeded {} active namespaces",
+                self.max_known_suffixes
+            )));
+        }
+
         self.known_suffixes.insert(msg.track_namespace_suffix);
         let Some(mut state) = self.state.lock_mut() else {
             return Ok(false);
@@ -431,6 +449,7 @@ mod tests {
             namespace_prefix: info.namespace_prefix,
             responded: false,
             known_suffixes: HashSet::default(),
+            max_known_suffixes: MAX_KNOWN_NAMESPACE_SUFFIXES,
             subscriber: subscriber(),
             force_reset: None,
         }
@@ -460,6 +479,7 @@ mod tests {
                 namespace_prefix: info.namespace_prefix,
                 responded: false,
                 known_suffixes: HashSet::default(),
+                max_known_suffixes: MAX_KNOWN_NAMESPACE_SUFFIXES,
                 subscriber,
                 force_reset: Some(recv_force_reset),
             },
@@ -583,5 +603,39 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, SessionError::ProtocolViolation(_)));
+    }
+
+    #[test]
+    fn namespace_additions_are_capped() {
+        let mut recv = recv("example.com");
+        recv.max_known_suffixes = 2;
+        recv.recv_message(Message::RequestOk(RequestOk {
+            id: 0,
+            params: Default::default(),
+        }))
+        .unwrap();
+
+        for i in 0..recv.max_known_suffixes {
+            recv.recv_message(Message::Namespace(message::Namespace {
+                track_namespace_suffix: TrackNamespacePrefix::from_utf8_path(&format!(
+                    "meeting={i}"
+                )),
+            }))
+            .expect("additions up to the cap are accepted");
+        }
+
+        // A new distinct suffix beyond the cap is rejected as a protocol violation.
+        let err = recv
+            .recv_message(Message::Namespace(message::Namespace {
+                track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("meeting=overflow"),
+            }))
+            .unwrap_err();
+        assert!(matches!(err, SessionError::ProtocolViolation(_)));
+
+        // Re-adding an already-tracked suffix does not grow the set, so it is allowed.
+        recv.recv_message(Message::Namespace(message::Namespace {
+            track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("meeting=0"),
+        }))
+        .expect("re-adding a tracked suffix stays within the cap");
     }
 }

@@ -83,6 +83,16 @@ pub enum Transport {
 
 const DEFAULT_MAX_REQUEST_ID: u64 = 100;
 
+/// Maximum number of concurrently accepted inbound SUBSCRIBE_NAMESPACE request
+/// streams. Backpressures `accept_bi()` so a peer cannot exhaust memory by opening
+/// unbounded bidirectional streams (draft-16 §3.3/§9.25).
+const MAX_CONCURRENT_SUBSCRIBE_NAMESPACE_STREAMS: usize = 256;
+
+/// Maximum time to wait for the SUBSCRIBE_NAMESPACE header on a freshly accepted
+/// bidirectional stream before treating the peer as misbehaving. Prevents idle or
+/// malicious streams from occupying an accept slot indefinitely.
+const SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Session-level protocol limits advertised during setup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SessionConfig {
@@ -847,7 +857,9 @@ impl Session {
 
         loop {
             tokio::select! {
-                stream = webtransport.accept_bi() => {
+                // Only accept a new stream while below the concurrency cap; otherwise
+                // apply backpressure until an in-flight stream completes (#1).
+                stream = webtransport.accept_bi(), if tasks.len() < MAX_CONCURRENT_SUBSCRIBE_NAMESPACE_STREAMS => {
                     let (send, recv) = stream?;
                     let publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
                     let request_id = request_id.clone();
@@ -867,7 +879,19 @@ impl Session {
     ) -> Result<(), SessionError> {
         let writer = Writer::new(send);
         let mut reader = Reader::new(recv);
-        let msg = reader.decode::<Message>().await?;
+        // Bound the wait for the stream's opening SUBSCRIBE_NAMESPACE header so an
+        // idle or malicious peer cannot hold an accept slot open forever (#2).
+        let msg = tokio::time::timeout(
+            SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT,
+            reader.decode::<Message>(),
+        )
+        .await
+        .map_err(|_| {
+            SessionError::ProtocolViolation(
+                "timed out waiting for SUBSCRIBE_NAMESPACE header on bidirectional stream"
+                    .to_string(),
+            )
+        })??;
 
         let subscribe_namespace = match msg {
             Message::SubscribeNamespace(msg) => msg,
