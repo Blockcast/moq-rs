@@ -25,7 +25,9 @@ mod udp;
 use cli::{Args, MmtpInput};
 use datagram::DatagramState;
 use mmtp_parse::route;
-use publish::{dispatch, RepairSink, TrackState};
+use publish::{
+    dispatch, RepairSink, SharedPresentationEpoch, TrackState, CONTROL_PRIORITY, SOURCE_PRIORITY,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -123,6 +125,7 @@ fn build_state_map(
         .ok_or_else(|| anyhow::anyhow!("catalog.multicast.endpoints is missing"))?;
 
     let mut map: HashMap<u16, TrackState<SubgroupsWriter>> = HashMap::new();
+    let presentation_epoch: SharedPresentationEpoch = Default::default();
     for endpoint in endpoints {
         for track_ref in &endpoint.tracks {
             if map.contains_key(&track_ref.packet_id) {
@@ -150,6 +153,38 @@ fn build_state_map(
                 );
                 continue;
             }
+            let timescale = catalog_track
+                .timescale
+                .or(catalog.common_track_fields.timescale)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "catalog track `{}` has no effective timescale",
+                        track_ref.name
+                    )
+                })?;
+            let group_duration_ms = catalog_track
+                .group_duration_ms
+                .or(catalog.common_track_fields.group_duration_ms);
+            let group_duration_ticks = catalog_track
+                .group_duration_ticks
+                .or(catalog.common_track_fields.group_duration_ticks)
+                .or_else(|| group_duration_ms.map(|ms| ms as u64 * timescale as u64 / 1000))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "catalog track `{}` has no effective group duration",
+                        track_ref.name
+                    )
+                })?;
+            let repair_group_depth = catalog_track
+                .fec
+                .as_ref()
+                .and_then(|fec| fec.interleave_depth_ms)
+                .map(|depth_ms| {
+                    let numerator = depth_ms as u128 * timescale as u128;
+                    let denominator = group_duration_ticks as u128 * 1000;
+                    ceil_div_u128(numerator, denominator).max(1) as u64
+                })
+                .unwrap_or(1);
 
             let mut track_writer = tracks_writer.create(&track_ref.name).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -209,12 +244,13 @@ fn build_state_map(
 
             map.insert(
                 track_ref.packet_id,
-                // Source tracks publish at priority 0; the old
-                // priority_for_container() indirection died with the catalog
-                // `container` field (repair siblings hardcode 7 in publish.rs).
                 TrackState::new(
                     track_ref.name.clone(),
-                    0,
+                    SOURCE_PRIORITY,
+                    timescale,
+                    group_duration_ticks,
+                    repair_group_depth,
+                    presentation_epoch.clone(),
                     subgroups,
                     Some(RepairSink {
                         sink: repair_subgroups,
@@ -226,6 +262,11 @@ fn build_state_map(
         }
     }
     Ok(map)
+}
+
+#[allow(clippy::manual_div_ceil)]
+fn ceil_div_u128(numerator: u128, denominator: u128) -> u128 {
+    (numerator + denominator - 1) / denominator
 }
 
 /// Catalog track names. The broadcast's catalog JSON is published under each.
@@ -253,9 +294,7 @@ const CATALOG_TRACK_NAMES: [&str; 3] = ["catalog", ".catalog", "catalog.json"];
 
 /// Publish the broadcast's catalog JSON on each catalog track name.
 ///
-/// The JSON body is posted as a single object on group 0. Priority 127 is the
-/// lowest non-control value — receivers fetch it eagerly on JOIN but it must
-/// not preempt media tracks.
+/// The JSON body is posted as a single object on group 0 in the control band.
 ///
 /// Returns one `SubgroupsWriter` per catalog track name so the caller can
 /// retain them for the session's lifetime; dropping one would close that
@@ -276,7 +315,7 @@ fn publish_catalog_track(
             .create(moq_transport::serve::Subgroup {
                 group_id: 0,
                 subgroup_id: 0,
-                priority: 127,
+                priority: CONTROL_PRIORITY,
             })
             .with_context(|| format!("`{name}` SubgroupsWriter::create failed"))?;
         subgroup
@@ -509,6 +548,8 @@ async fn run_stdin_loop(router: &mut Router) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mmtp_parse::{MfuIdentity, PacketRouting};
+    use mmt_core::header::{FragmentType, PacketType};
     use moq_catalog::multicast::{MulticastConfig, MulticastEndpoint, MulticastTrackRef};
     use moq_catalog::{
         CommonTrackFields, FecAlgorithm, FecDescriptor, MmtpMode, SelectionParam, Track,
@@ -529,6 +570,8 @@ mod tests {
             name: name.into(),
             packaging,
             mmtp_mode,
+            timescale: Some(65_536),
+            group_duration_ticks: Some(65_536),
             selection_params: SelectionParam::default(),
             ..Default::default()
         }
@@ -712,7 +755,7 @@ mod tests {
     #[test]
     fn publish_catalog_track_registers_both_catalog_track_names() {
         // T2: on startup, the publisher MUST post the full catalog JSON as a
-        // single object on group 0 at priority 127, under BOTH catalog track
+        // single object on group 0 at control priority 32, under all catalog track
         // names: `catalog` (canonical/REQUIRED per draft-ietf-moq-msf-00 §5.2;
         // what Shaka MSF subscribes to) and `.catalog` (legacy WARP-lineage
         // alias for non-MSF consumers: moq-pub, moq-sub, gst-moq-pub). This test
@@ -758,13 +801,13 @@ mod tests {
         assert_eq!(map.len(), 2);
         let v = map.get(&17).expect("packet_id 17 present");
         assert_eq!(v.name, "v");
-        assert_eq!(v.priority, 0);
+        assert_eq!(v.priority, SOURCE_PRIORITY);
         assert!(v.last_seen_mpu_seq.is_none());
         // T3: every source track gets an auto-created /repair sibling.
         assert!(v.repair.is_some(), "track `v` must have a repair sibling");
         let a = map.get(&18).expect("packet_id 18 present");
         assert_eq!(a.name, "a");
-        assert_eq!(a.priority, 0);
+        assert_eq!(a.priority, SOURCE_PRIORITY);
         assert!(a.repair.is_some(), "track `a` must have a repair sibling");
     }
 
@@ -881,7 +924,81 @@ mod tests {
         };
         let s = state_map.get(&1).expect("packet_id 1 present");
         assert_eq!(s.last_seen_mpu_seq, Some(42));
-        assert_eq!(s.current_group_id, Some(42));
+        assert_eq!(
+            s.current_group_id,
+            Some(0),
+            "MPU sequence 42 must not be copied into the formula-derived Group"
+        );
+    }
+
+    #[tokio::test]
+    async fn receiver_observes_formula_groups_and_per_mfu_subgroups() {
+        let cat = catalog_with(
+            vec![track("v", Some(TrackPackaging::Mmtp))],
+            Some(MulticastConfig {
+                endpoints: Some(vec![endpoint(vec![("v", 1)])]),
+                network_source: None,
+                subgroup_history_groups: Some(8),
+            }),
+        );
+        let (mut tracks, _requests, mut readers) = Tracks::new(ns()).produce();
+        let mut state_map = build_state_map(&mut tracks, &cat).unwrap();
+        let reader = readers
+            .get_track_reader(&ns(), "v")
+            .expect("source track reader");
+
+        let packet = |fragment_type, timestamp, identity| PacketRouting {
+            packet_id: 1,
+            packet_type: PacketType::Mpu,
+            fec_type: 0,
+            rap_flag: false,
+            mpu_sequence: Some(90_000),
+            fragment_type: Some(fragment_type),
+            timestamp,
+            timed: true,
+            fragmentation_indicator: 0,
+            fragment_counter: 0,
+            mfu_identity: identity,
+            aggregation: false,
+        };
+        dispatch(
+            &mut state_map,
+            &packet(FragmentType::Init, 0, None),
+            Bytes::from_static(b"init"),
+        )
+        .unwrap();
+        for sample_number in [19, 20] {
+            dispatch(
+                &mut state_map,
+                &packet(
+                    FragmentType::Mfu,
+                    65_536,
+                    Some(MfuIdentity::Timed {
+                        movie_fragment_sequence_number: 7,
+                        sample_number,
+                    }),
+                ),
+                Bytes::from_static(b"mfu"),
+            )
+            .unwrap();
+        }
+        drop(state_map);
+
+        let TrackReaderMode::Subgroups(mut subgroups) = reader.mode().await.unwrap() else {
+            panic!("source track must use subgroup mode");
+        };
+        let mut observed = Vec::new();
+        while let Some(subgroup) = subgroups.next().await.unwrap() {
+            observed.push((subgroup.group_id, subgroup.subgroup_id, subgroup.priority));
+        }
+        assert_eq!(
+            observed,
+            vec![
+                (0, 0, SOURCE_PRIORITY),
+                (1, 1, SOURCE_PRIORITY),
+                (1, 2, SOURCE_PRIORITY),
+            ]
+        );
     }
 
     fn synth_mpu_init_packet(packet_id: u16, mpu_seq: u32) -> Vec<u8> {
