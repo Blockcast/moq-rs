@@ -6,19 +6,17 @@ use std::sync::Arc;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
+    coding::{KeyValuePairs, TrackNamespace},
     message::SubscribeOptions,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
-    session::{
-        NamespaceEvent, Publisher, SessionError, Subscribed, SubscribedNamespace,
-        TrackStatusRequested,
-    },
+    session::{Publisher, SessionError, Subscribed, SubscribedNamespace, TrackStatusRequested},
 };
 use tokio::sync::broadcast;
 
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
-    Coordinator, Locals, NamespaceChange, RelayInfo, RemoteManager, SessionContext, TrackChange,
+    upstream_namespaces::UpstreamNamespaces,
+    Coordinator, Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -27,7 +25,7 @@ pub struct Producer {
     publisher: Publisher,
     locals: Locals,
     remotes: RemoteManager,
-    coordinator: Arc<dyn Coordinator>,
+    upstream_namespaces: UpstreamNamespaces,
     /// Relay-level context for this MoQT session.
     context: SessionContext,
 }
@@ -40,11 +38,24 @@ impl Producer {
         coordinator: Arc<dyn Coordinator>,
         context: SessionContext,
     ) -> Self {
+        let (upstream_namespaces, runner) =
+            UpstreamNamespaces::new(locals.clone(), remotes.clone(), coordinator);
+        tokio::spawn(runner.run());
+        Self::new_with_upstream_namespaces(publisher, locals, remotes, upstream_namespaces, context)
+    }
+
+    pub(crate) fn new_with_upstream_namespaces(
+        publisher: Publisher,
+        locals: Locals,
+        remotes: RemoteManager,
+        upstream_namespaces: UpstreamNamespaces,
+        context: SessionContext,
+    ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
-            coordinator,
+            upstream_namespaces,
             context,
         }
     }
@@ -214,68 +225,28 @@ impl Producer {
         let mut publish_tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
             FuturesUnordered::new();
 
-        subscribed_namespace.ok()?;
-
-        let mut known_namespaces = HashSet::new();
-
-        // Live upstream pull sessions for the publish-before-subscribe case.
-        // Forwarder futures each own a SubscribeNamespace handle to a peer relay
-        // and funnel NAMESPACE / NAMESPACE_DONE updates back through
-        // `upstream_events`; dropping `upstream_tasks` at end of request cancels
-        // those handles. The original sender is held for the whole request so
-        // the receiver never closes while we are still serving.
-        let (upstream_events_tx, upstream_events_rx) =
-            tokio::sync::mpsc::unbounded_channel::<NamespaceEvent>();
-        let upstream_tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
-            FuturesUnordered::new();
-
-        let coordinator_subscription = if wants_namespace {
-            // Register this SUBSCRIBE_NAMESPACE with the coordinator so that
-            // remote relays can discover us and push matching PUBLISH_NAMESPACE
-            // notifications to this relay for namespaces registered *after* we
-            // subscribe (the push path; see Consumer::serve).
-            let coordinator_context = self.context.coordinator_context();
-            let subscription = self
-                .coordinator
-                .subscribe_namespace(
-                    self.context.scope(),
-                    &subscribed_namespace.namespace_prefix,
-                    &coordinator_context,
-                )
-                .await?;
-
-            // The complementary pull path: the coordinator reports the peer
-            // relays we should pull from in `upstream_relays`, and we open an
-            // upstream SUBSCRIBE_NAMESPACE to each to receive those namespaces
-            // (plus their live updates). Every event funnels through the shared
-            // `known_namespaces` set below, so a namespace delivered by both the
-            // push and pull paths is sent to the client only once.
-            //
-            // We apply no routing/topology policy and do not interpret the
-            // session interface here: we simply pull from whatever the
-            // coordinator returns, and an empty list means no upstream
-            // connection and local serving only. All such policy lives in the
-            // coordinator. (The built-in coordinators, for instance, exclude
-            // ourselves and the inbound source and return an empty list for
-            // internal relay-to-relay sessions, so a pull opened on our behalf
-            // is served from local state alone and recursion terminates at the
-            // origin.)
-            for relay in &subscription.upstream_relays {
-                upstream_tasks.push(
-                    Self::pull_upstream_namespaces(
-                        self.remotes.clone(),
-                        relay.clone(),
-                        subscribed_namespace.namespace_prefix.clone(),
-                        upstream_events_tx.clone(),
-                    )
-                    .boxed(),
-                );
+        let _upstream_lease = if wants_namespace {
+            match self
+                .upstream_namespaces
+                .subscribe(&self.context, subscribed_namespace.namespace_prefix.clone())
+            {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    tracing::error!(
+                        prefix = %subscribed_namespace.namespace_prefix.to_utf8_path(),
+                        error = %error,
+                        "failed to acquire shared upstream namespace lease; serving local state only"
+                    );
+                    None
+                }
             }
-
-            Some(subscription)
         } else {
             None
         };
+
+        subscribed_namespace.ok()?;
+
+        let mut known_namespaces = HashSet::new();
 
         if wants_namespace {
             self.send_namespace_snapshot(&mut subscribed_namespace, &mut known_namespaces)?;
@@ -291,23 +262,17 @@ impl Producer {
             .await?;
         }
 
-        let res = self
-            .serve_subscribe_namespace_loop(
-                subscribed_namespace,
-                wants_namespace,
-                wants_publish,
-                namespace_changes,
-                track_changes,
-                publish_tasks,
-                upstream_events_rx,
-                upstream_tasks,
-                known_namespaces,
-                known_tracks,
-            )
-            .await;
-        drop(coordinator_subscription);
-        drop(upstream_events_tx);
-        res
+        self.serve_subscribe_namespace_loop(
+            subscribed_namespace,
+            wants_namespace,
+            wants_publish,
+            namespace_changes,
+            track_changes,
+            publish_tasks,
+            known_namespaces,
+            known_tracks,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -319,8 +284,6 @@ impl Producer {
         mut namespace_changes: tokio::sync::broadcast::Receiver<NamespaceChange>,
         mut track_changes: tokio::sync::broadcast::Receiver<TrackChange>,
         mut publish_tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
-        mut upstream_events: tokio::sync::mpsc::UnboundedReceiver<NamespaceEvent>,
-        mut upstream_tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
         mut known_namespaces: HashSet<TrackNamespace>,
         mut known_tracks: HashSet<FullTrackName>,
     ) -> Result<(), anyhow::Error> {
@@ -342,11 +305,6 @@ impl Producer {
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
                 }
-                event = upstream_events.recv(), if wants_namespace => {
-                    if let Some(event) = event {
-                        self.apply_upstream_namespace_event(&mut subscribed_namespace, &mut known_namespaces, event)?;
-                    }
-                }
                 change = track_changes.recv(), if wants_publish => {
                     match change {
                         Ok(change) => {
@@ -359,7 +317,6 @@ impl Producer {
                     }
                 }
                 _ = publish_tasks.next(), if !publish_tasks.is_empty() => {},
-                _ = upstream_tasks.next(), if !upstream_tasks.is_empty() => {},
             }
         }
     }
@@ -407,78 +364,6 @@ impl Producer {
         }
 
         Ok(())
-    }
-
-    /// Apply one NAMESPACE / NAMESPACE_DONE update pulled from an upstream
-    /// relay, deduplicating against the same `known` set used by the local
-    /// [`apply_namespace_change`] path so a namespace announced by both the
-    /// push and pull paths reaches the client exactly once.
-    ///
-    /// [`apply_namespace_change`]: Self::apply_namespace_change
-    fn apply_upstream_namespace_event(
-        &self,
-        subscribed_namespace: &mut SubscribedNamespace,
-        known: &mut HashSet<TrackNamespace>,
-        event: NamespaceEvent,
-    ) -> Result<(), ServeError> {
-        match plan_upstream_namespace_event(&subscribed_namespace.namespace_prefix, known, event) {
-            Some(NamespaceEvent::Added(namespace)) => subscribed_namespace.namespace(&namespace)?,
-            Some(NamespaceEvent::Removed(namespace)) => {
-                subscribed_namespace.namespace_done(&namespace)?
-            }
-            None => {}
-        }
-
-        Ok(())
-    }
-
-    /// Drive one upstream SUBSCRIBE_NAMESPACE pull session, forwarding each
-    /// NAMESPACE / NAMESPACE_DONE update to the subscriber loop via `events`.
-    ///
-    /// Owns the [`SubscribeNamespace`] handle for the session's lifetime; when
-    /// this future is dropped (the request ends) the handle drops and cancels
-    /// the upstream subscription. Connection and stream errors are logged and
-    /// end this pull only — they never tear down the downstream subscriber,
-    /// which continues to be served from local state and any other upstreams.
-    ///
-    /// [`SubscribeNamespace`]: moq_transport::session::SubscribeNamespace
-    async fn pull_upstream_namespaces(
-        remotes: RemoteManager,
-        relay: RelayInfo,
-        prefix: TrackNamespacePrefix,
-        events: tokio::sync::mpsc::UnboundedSender<NamespaceEvent>,
-    ) {
-        let handle = match remotes
-            .subscribe_namespace(&relay, prefix, SubscribeOptions::Namespace)
-            .await
-        {
-            Ok(handle) => handle,
-            Err(err) => {
-                tracing::warn!(upstream = %relay.url, error = %err, "failed to open upstream SUBSCRIBE_NAMESPACE");
-                return;
-            }
-        };
-
-        if let Err(err) = handle.ok().await {
-            tracing::debug!(upstream = %relay.url, error = %err, "upstream SUBSCRIBE_NAMESPACE rejected");
-            return;
-        }
-
-        loop {
-            match handle.next().await {
-                Ok(Some(event)) => {
-                    // Receiver gone means the request ended; stop pulling.
-                    if events.send(event).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    tracing::debug!(upstream = %relay.url, error = %err, "upstream SUBSCRIBE_NAMESPACE ended");
-                    break;
-                }
-            }
-        }
     }
 
     fn resync_namespaces(
@@ -675,40 +560,6 @@ impl Producer {
     }
 }
 
-/// Decide what to forward to the subscriber for a namespace update pulled from
-/// an upstream relay, updating the shared `known` set in the process.
-///
-/// `known` is the same set the local (push) path feeds through
-/// [`Producer::apply_namespace_change`], which is what makes the push and pull
-/// paths deduplicate against each other: a namespace already announced (by
-/// either path) is not announced again, and a namespace is withdrawn only when
-/// the tracked entry is actually removed.
-///
-/// Returns [`NamespaceEvent::Added`] to announce, [`NamespaceEvent::Removed`]
-/// to withdraw, or `None` when the event is a duplicate or falls outside the
-/// subscribed prefix.
-fn plan_upstream_namespace_event(
-    prefix: &TrackNamespacePrefix,
-    known: &mut HashSet<TrackNamespace>,
-    event: NamespaceEvent,
-) -> Option<NamespaceEvent> {
-    match event {
-        NamespaceEvent::Added(namespace) => {
-            // The upstream subscription is opened with our prefix, but guard
-            // anyway so a misbehaving peer can never widen the client's view.
-            if !prefix.is_prefix_of(&namespace) {
-                return None;
-            }
-            known
-                .insert(namespace.clone())
-                .then_some(NamespaceEvent::Added(namespace))
-        }
-        NamespaceEvent::Removed(namespace) => known
-            .remove(&namespace)
-            .then_some(NamespaceEvent::Removed(namespace)),
-    }
-}
-
 fn wants_namespace(options: SubscribeOptions) -> bool {
     matches!(
         options,
@@ -729,96 +580,9 @@ fn full_name_for_track(track: &TrackReader) -> FullTrackName {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use moq_transport::{serve::ServeError, session::SessionError};
 
-    use moq_transport::{
-        coding::{TrackNamespace, TrackNamespacePrefix},
-        serve::ServeError,
-        session::{NamespaceEvent, SessionError},
-    };
-
-    use super::{plan_upstream_namespace_event, Producer};
-
-    fn ns(path: &str) -> TrackNamespace {
-        TrackNamespace::from_utf8_path(path)
-    }
-
-    fn prefix(path: &str) -> TrackNamespacePrefix {
-        TrackNamespacePrefix::from_utf8_path(path)
-    }
-
-    #[test]
-    fn upstream_added_new_namespace_is_announced_and_tracked() {
-        let mut known = HashSet::new();
-        let action = plan_upstream_namespace_event(
-            &prefix("room"),
-            &mut known,
-            NamespaceEvent::Added(ns("room/alice")),
-        );
-
-        assert_eq!(action, Some(NamespaceEvent::Added(ns("room/alice"))));
-        assert!(known.contains(&ns("room/alice")));
-    }
-
-    #[test]
-    fn upstream_added_duplicate_is_suppressed() {
-        // The namespace is already tracked -- e.g. the push path (a
-        // PUBLISH_NAMESPACE routed to this relay) announced it first. The pull
-        // path must not announce it a second time.
-        let mut known = HashSet::from([ns("room/alice")]);
-        let action = plan_upstream_namespace_event(
-            &prefix("room"),
-            &mut known,
-            NamespaceEvent::Added(ns("room/alice")),
-        );
-
-        assert_eq!(action, None);
-        assert!(known.contains(&ns("room/alice")));
-    }
-
-    #[test]
-    fn upstream_added_outside_prefix_is_ignored() {
-        let mut known = HashSet::new();
-        let action = plan_upstream_namespace_event(
-            &prefix("room"),
-            &mut known,
-            NamespaceEvent::Added(ns("other/space")),
-        );
-
-        assert_eq!(action, None);
-        assert!(
-            known.is_empty(),
-            "an out-of-prefix namespace must not be tracked"
-        );
-    }
-
-    #[test]
-    fn upstream_removed_known_namespace_is_withdrawn() {
-        let mut known = HashSet::from([ns("room/alice")]);
-        let action = plan_upstream_namespace_event(
-            &prefix("room"),
-            &mut known,
-            NamespaceEvent::Removed(ns("room/alice")),
-        );
-
-        assert_eq!(action, Some(NamespaceEvent::Removed(ns("room/alice"))));
-        assert!(!known.contains(&ns("room/alice")));
-    }
-
-    #[test]
-    fn upstream_removed_unknown_namespace_is_ignored() {
-        // Never announced (or already withdrawn, or withdrawn by the push path
-        // first): the withdrawal is a no-op rather than a spurious
-        // NAMESPACE_DONE to the client.
-        let mut known = HashSet::new();
-        let action = plan_upstream_namespace_event(
-            &prefix("room"),
-            &mut known,
-            NamespaceEvent::Removed(ns("room/alice")),
-        );
-
-        assert_eq!(action, None);
-    }
+    use super::Producer;
 
     #[test]
     fn expected_serve_shutdown_accepts_wrapped_session_errors() {

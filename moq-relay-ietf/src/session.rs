@@ -19,7 +19,7 @@ pub const INTERFACE_PUBLIC: &str = "public";
 pub const INTERFACE_INTERNAL: &str = "internal";
 
 /// Identifies whether a relay session came from a public client or another relay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
 pub enum SessionInterface {
     /// A public, client-facing connection.
     ///

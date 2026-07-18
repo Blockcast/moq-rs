@@ -36,12 +36,14 @@
 mod api;
 mod consumer;
 mod coordinator;
+mod covering_prefix_set;
 mod local;
 pub mod metrics;
 mod producer;
 mod relay;
 mod remote;
 mod session;
+mod upstream_namespaces;
 mod web;
 
 pub use api::*;

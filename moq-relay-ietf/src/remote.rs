@@ -245,14 +245,10 @@ impl RemoteManager {
             }
         };
 
-        match remote.subscribe_namespace(prefix, options).await {
-            Ok(handle) => Ok(handle),
-            Err(err) => {
-                tracing::warn!(remote_url = %relay.url, error = %err, "remote subscribe_namespace failed, removing from cache");
-                self.remove_if_same_remote(&cache_key, &remote).await;
-                Err(err)
-            }
-        }
+        // A namespace request owns a dedicated bidirectional stream. Its
+        // rejection or reset must not evict the pooled session, which may still
+        // carry exact-track subscriptions and other non-overlapping requests.
+        remote.subscribe_namespace(prefix, options).await
     }
 
     /// Forward a `PUBLISH_NAMESPACE` to a specific relay peer.

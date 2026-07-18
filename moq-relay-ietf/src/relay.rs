@@ -10,6 +10,7 @@ use moq_native_ietf::quic::{self, Endpoint};
 use moq_transport::session::SessionConfig;
 use url::Url;
 
+use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
     metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
     RelayInfo, RemoteManager, Session, SessionContext,
@@ -80,6 +81,8 @@ pub struct Relay {
     config: RelayConfig,
     locals: Locals,
     remotes: RemoteManager,
+    upstream_namespaces: UpstreamNamespaces,
+    upstream_namespaces_runner: UpstreamNamespacesRunner,
 }
 
 impl Relay {
@@ -127,11 +130,15 @@ impl Relay {
             remote_clients,
             config.session,
         );
+        let (upstream_namespaces, upstream_namespaces_runner) =
+            UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 
         Ok(Self {
             config,
             locals,
             remotes,
+            upstream_namespaces,
+            upstream_namespaces_runner,
         })
     }
 
@@ -141,6 +148,8 @@ impl Relay {
             config,
             locals,
             remotes,
+            upstream_namespaces,
+            upstream_namespaces_runner,
         } = self;
 
         let RelayConfig {
@@ -155,6 +164,13 @@ impl Relay {
 
         let run_result = async {
             let mut tasks = FuturesUnordered::new();
+            tasks.push(
+                async move {
+                    upstream_namespaces_runner.run().await;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .boxed(),
+            );
 
             // Use the remote manager for routing to remote relays.
             let remote_manager = remotes.clone();
@@ -202,11 +218,11 @@ impl Relay {
                 let forward_coordinator = coordinator.clone();
                 let session = Session {
                     session,
-                    producer: Some(Producer::new(
+                    producer: Some(Producer::new_with_upstream_namespaces(
                         publisher,
                         locals.clone(),
                         remote_manager.clone(),
-                        coordinator.clone(),
+                        upstream_namespaces.clone(),
                         forward_context.clone(),
                     )),
                     consumer: Some(Consumer::new(
@@ -283,7 +299,8 @@ impl Relay {
                         let locals = locals.clone();
                         let remotes = remote_manager.clone();
                         let forward = forward_producer.clone();
-                        let coordinator = coordinator.clone();
+                            let coordinator = coordinator.clone();
+                            let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
 
                         // Spawn a new task to handle the connection
@@ -379,7 +396,7 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes.clone(), coordinator.clone(), context.clone())), None)
+                                (publisher.map(|publisher| Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone())), None)
                             } else {
                                 (None, publisher)
                             };
