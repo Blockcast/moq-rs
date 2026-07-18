@@ -59,6 +59,7 @@ path = [
   "moq-pub-mmtp/**",
   "moq-sub-raw/**",
   "moq-catalog/src/multicast.rs",
+  "moq-transport/tests/fixtures/moqt-16-v1.json",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "2025-2026 Blockcast Inc. and contributors"
