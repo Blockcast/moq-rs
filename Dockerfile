@@ -27,12 +27,14 @@ COPY moq-transport/Cargo.toml moq-transport/Cargo.toml
 RUN mkdir -p \
       moq-api/src moq-catalog/src moq-clock-ietf/src \
       moq-native-ietf/src moq-pub/src moq-pub-mmtp/src \
-      moq-pub-mmtp/vendor/mmt-core/src moq-relay-ietf/src/bin/moq-relay-ietf \
+      moq-pub-mmtp/vendor/mmt-core/src moq-pub-mmtp/vendor/mmt-core/benches \
+      moq-relay-ietf/src/bin/moq-relay-ietf \
       moq-sub/src moq-sub-raw/src moq-test-client/src moq-transport/src && \
     for crate in moq-api moq-catalog moq-native-ietf moq-pub moq-relay-ietf moq-sub moq-transport; do \
       echo "" > "$crate/src/lib.rs"; \
     done && \
     echo "" > moq-pub-mmtp/vendor/mmt-core/src/lib.rs && \
+    echo "fn main() {}" > moq-pub-mmtp/vendor/mmt-core/benches/header_bench.rs && \
     for crate in moq-api moq-clock-ietf moq-pub moq-pub-mmtp moq-sub moq-sub-raw moq-test-client; do \
       echo "fn main() {}" > "$crate/src/main.rs"; \
     done && \
