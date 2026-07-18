@@ -1,0 +1,1 @@
+{"version":1,"streamingFormat":"mmtp","streamingFormatVersion":"x","tracks":[{"name":"video","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000},{"name":"video-repair","packaging":"fec-repair"}]}

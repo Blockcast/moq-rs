@@ -31,7 +31,6 @@ use crate::mmtp_parse::{MfuIdentity, PacketRouting};
 
 pub const CONTROL_PRIORITY: u8 = 32;
 pub const SOURCE_PRIORITY: u8 = 128;
-pub const REPAIR_PRIORITY: u8 = 240;
 
 pub type SharedPresentationEpoch = Arc<Mutex<Option<u32>>>;
 
@@ -112,9 +111,11 @@ pub struct TrackState<T: TrackSubgroups> {
     repair_group_depth: u64,
     presentation_epoch: SharedPresentationEpoch,
     max_unwrapped_ntp_ticks: Option<i64>,
-    /// Sibling `<name>/repair` track for AL-FEC repair packets. Repair objects
-    /// use the D3 repair band and formula-group/interleave alignment. None means
-    /// no FEC is configured for this packet_id.
+    /// Catalog-declared repair track for AL-FEC repair packets. Per
+    /// draft-ramadan-moq-fec §6.1 repair tracks run at priority 240 and
+    /// use formula-group/interleave alignment so receivers can correlate the
+    /// symbols with the source data they protect. None means no FEC is
+    /// configured for this packet_id.
     pub repair: Option<RepairSink<T>>,
 }
 
@@ -203,6 +204,8 @@ impl<T: TrackSubgroups> TrackState<T> {
 pub struct RepairSink<T: TrackSubgroups> {
     /// Subgroup factory for the `<source>/repair` MoQ track.
     pub sink: T,
+    /// Catalog priority for repair objects. The canonical profile requires 240.
+    pub priority: u8,
     /// Currently open repair subgroup — None before first repair on
     /// this track. Replaced when source MPU advances.
     pub current_group: Option<T::Group>,
@@ -387,6 +390,7 @@ pub fn dispatch<T: TrackSubgroups>(
             }
         }
         PacketType::Repair => {
+            // Route AL-FEC repair to the catalog-declared track and priority.
             // D consecutive formula groups share one repair group, preserving
             // the SBN=floor(Group/D) alignment.
             let source_group_id = state.current_group_id.ok_or_else(|| {
@@ -409,7 +413,7 @@ pub fn dispatch<T: TrackSubgroups>(
             if repair.current_group_id != Some(repair_group_id) {
                 let group = repair
                     .sink
-                    .create_group(repair_group_id, 0, REPAIR_PRIORITY)?;
+                    .create_group(repair_group_id, 0, repair.priority)?;
                 repair.current_group = Some(group);
                 repair.current_group_id = Some(repair_group_id);
             }
@@ -483,6 +487,7 @@ mod tests {
         let repair = if with_repair {
             Some(RepairSink {
                 sink: MockSubgroups::default(),
+                priority: 240,
                 current_group: None,
                 current_group_id: None,
             })
@@ -782,7 +787,8 @@ mod tests {
 
     #[test]
     fn repair_packet_routes_to_repair_sink_at_priority_240() {
-        // Repair packets land on the repair sibling in the D3 repair band.
+        // Repair packets MUST land on the repair sibling sink (not the
+        // source sink), with the canonical repair priority 240.
         let mut map = make_state_map_with_repair(1, 5, true);
         // Open source MPU 10 first.
         dispatch(
@@ -796,12 +802,12 @@ mod tests {
         let state = map.get(&1).unwrap();
         // Source sink: 1 create_group at priority 5.
         assert_eq!(state.sink.groups_created, vec![(10, 0, 5)]);
-        // Repair sink: one aligned group in the repair priority band.
+        // Repair sink aligns with the source formula group at priority 240.
         let r = state.repair.as_ref().expect("repair sibling exists");
         assert_eq!(
             r.sink.groups_created,
-            vec![(10, 0, REPAIR_PRIORITY)],
-            "repair group aligns with source; priority is in the repair band"
+            vec![(10, 0, 240)],
+            "repair group aligns with source; priority is 240"
         );
         // The repair payload landed on the repair group, not the source.
         let rg = r.current_group.as_ref().expect("repair group open");
@@ -830,7 +836,7 @@ mod tests {
         let r = map.get(&1).unwrap().repair.as_ref().unwrap();
         assert_eq!(
             r.sink.groups_created,
-            vec![(10, 0, REPAIR_PRIORITY), (11, 0, REPAIR_PRIORITY)],
+            vec![(10, 0, 240), (11, 0, 240)],
             "repair opens a new group each time source MPU advances"
         );
         assert_eq!(r.current_group_id, Some(11));
@@ -1029,7 +1035,7 @@ mod tests {
                 .unwrap()
                 .sink
                 .groups_created,
-            vec![(5, 0, REPAIR_PRIORITY), (6, 0, REPAIR_PRIORITY)]
+            vec![(5, 0, 240), (6, 0, 240)]
         );
     }
 

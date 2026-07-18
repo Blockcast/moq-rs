@@ -73,7 +73,7 @@ pub struct Config {
 
     /// Request the catalog track (to get other track names)
     ///
-    /// First download the track named ".catalog" to find out the
+    /// First download the canonical track named "catalog" to find out the
     /// track names to subscribe to.  Other parameters like video
     /// dimension are extracted from the tracks themselves.  Default:
     /// "0.mp4" for the init track, "{track_id}.m4s" for the rest.

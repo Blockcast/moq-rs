@@ -1,0 +1,8 @@
+{
+  "version":1,"streamingFormat":"mmtp","streamingFormatVersion":"draft-ramadan-moq-mmt-00",
+  "tracks":[
+    {"name":"video","packaging":"mmtp","codec":"avc1.640028","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"fec":{"algorithm":"raptorq","sourceSymbols":768,"repairSymbols":384,"symbolSize":1312,"repairTrack":"video-repair","mode":"interleaved"}},
+    {"name":"video-repair","packaging":"fec-repair","priority":240}
+  ],
+  "multicast":{"endpoints":[{"sourceAddress":"192.0.2.10","groupAddress":"232.1.1.1","port":5000,"tracks":[{"name":"video","packetId":1},{"name":"video-repair","packetId":2}]}],"networkSource":[{"type":"amt","discovery":"driad"},{"type":"atsc3","frequency":587000000,"plpId":0,"serviceId":101,"slsUri":"https://example.test/atsc3/service/101/sls.xml"}]}
+}
