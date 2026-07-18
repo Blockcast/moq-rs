@@ -2,10 +2,46 @@
 # SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-FROM rust:bookworm as builder
+# Rust 1.96.0 (2026-05-28). Keep this aligned with the parent repository's
+# other Rust image pins instead of silently advancing on every build.
+FROM rust:1.96-bookworm AS builder
 
-# Create a build directory and copy over all of the files
 WORKDIR /build
+
+# Copy only manifests first so application source changes retain the compiled
+# dependency layer. Dummy targets make every workspace package buildable.
+COPY Cargo.toml Cargo.lock ./
+COPY moq-api/Cargo.toml moq-api/Cargo.toml
+COPY moq-catalog/Cargo.toml moq-catalog/Cargo.toml
+COPY moq-clock-ietf/Cargo.toml moq-clock-ietf/Cargo.toml
+COPY moq-native-ietf/Cargo.toml moq-native-ietf/Cargo.toml
+COPY moq-pub/Cargo.toml moq-pub/Cargo.toml
+COPY moq-pub-mmtp/Cargo.toml moq-pub-mmtp/Cargo.toml
+COPY moq-pub-mmtp/vendor/mmt-core/Cargo.toml moq-pub-mmtp/vendor/mmt-core/Cargo.toml
+COPY moq-relay-ietf/Cargo.toml moq-relay-ietf/Cargo.toml
+COPY moq-sub/Cargo.toml moq-sub/Cargo.toml
+COPY moq-sub-raw/Cargo.toml moq-sub-raw/Cargo.toml
+COPY moq-test-client/Cargo.toml moq-test-client/Cargo.toml
+COPY moq-transport/Cargo.toml moq-transport/Cargo.toml
+
+RUN mkdir -p \
+      moq-api/src moq-catalog/src moq-clock-ietf/src \
+      moq-native-ietf/src moq-pub/src moq-pub-mmtp/src \
+      moq-pub-mmtp/vendor/mmt-core/src moq-relay-ietf/src/bin/moq-relay-ietf \
+      moq-sub/src moq-sub-raw/src moq-test-client/src moq-transport/src && \
+    for crate in moq-api moq-catalog moq-native-ietf moq-pub moq-relay-ietf moq-sub moq-transport; do \
+      echo "" > "$crate/src/lib.rs"; \
+    done && \
+    echo "" > moq-pub-mmtp/vendor/mmt-core/src/lib.rs && \
+    for crate in moq-api moq-clock-ietf moq-pub moq-pub-mmtp moq-sub moq-sub-raw moq-test-client; do \
+      echo "fn main() {}" > "$crate/src/main.rs"; \
+    done && \
+    echo "fn main() {}" > moq-relay-ietf/src/bin/moq-relay-ietf/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release
+
 COPY . ./
 
 # Reuse a cache between builds.
@@ -13,8 +49,9 @@ COPY . ./
 # There's also issues with the cache mount since it builds into /usr/local/cargo/bin
 # We can't mount that without clobbering cargo itself.
 # We instead we build the binaries and copy them to the cargo bin directory.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    find . -path '*/src/*.rs' -o -path '*/src/**/*.rs' | xargs touch && \
     cargo build --release && cp /build/target/release/moq-* /usr/local/cargo/bin
 
 # Create a pub image that also contains ffmpeg and a helper script
