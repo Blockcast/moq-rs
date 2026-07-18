@@ -151,14 +151,20 @@ impl Locals {
             return Vec::new();
         };
 
-        bucket.retain(|_, entry| !entry.reader.is_closed());
-        bucket
-            .iter()
-            .filter(|(full_name, entry)| {
-                entry.source == TrackSource::Published && prefix.is_prefix_of(&full_name.namespace)
-            })
-            .map(|(_, entry)| entry.reader.clone())
-            .collect()
+        // Prune closed tracks and collect matching readers in a single pass so the
+        // `tracks` lock (contended with register/retrieve/drop) is held as briefly
+        // as possible.
+        let mut matches = Vec::new();
+        bucket.retain(|full_name, entry| {
+            if entry.reader.is_closed() {
+                return false;
+            }
+            if entry.source == TrackSource::Published && prefix.is_prefix_of(&full_name.namespace) {
+                matches.push(entry.reader.clone());
+            }
+            true
+        });
+        matches
     }
 
     /// Register namespace routing metadata from PUBLISH_NAMESPACE.
