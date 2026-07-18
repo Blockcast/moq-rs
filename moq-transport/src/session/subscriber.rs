@@ -94,6 +94,15 @@ pub struct Subscriber {
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
 
+/// RAII guard that rolls back a SUBSCRIBE_NAMESPACE prefix reservation on failure.
+///
+/// `subscribe_namespace()` inserts the request's prefix into the shared
+/// `subscribe_namespaces` map up front (used for §5.1 overlap detection) before the
+/// dedicated stream is opened. If the open then fails, dropping this guard removes
+/// that reservation so a failed request does not permanently block overlapping
+/// subscriptions. On success the guard is [`disarm`](Self::disarm)ed, transferring
+/// cleanup ownership to the returned `SubscribeNamespace` handle, whose
+/// `SubscribeNamespaceRecv::drop` performs the eventual removal.
 struct SubscribeNamespaceCleanup {
     subscriber: Subscriber,
     request_id: u64,
@@ -109,6 +118,10 @@ impl SubscribeNamespaceCleanup {
         }
     }
 
+    /// Cancel the rollback once the request has succeeded and ownership of the
+    /// reservation has passed to the returned `SubscribeNamespace` handle. Without
+    /// this, the guard's `Drop` would immediately remove the just-registered prefix
+    /// on the success path, tearing down the live subscription's state.
     fn disarm(mut self) {
         self.active = false;
     }
