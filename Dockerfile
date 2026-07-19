@@ -17,6 +17,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release && cp /build/target/release/moq-* /usr/local/cargo/bin
 
+# Optional: overwrite moq-pub-mmtp with a profiling-enabled build (feature
+# `profiling` = on-demand pprof endpoint, itself inert unless MOQ_PUB_PROFILE_ADDR
+# is set at runtime). `--build-arg PROFILING=1` swaps in the profiling binary;
+# unset (the default) makes this a no-op and the default binary is unchanged.
+ARG PROFILING=""
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    if [ -n "$PROFILING" ]; then \
+      cargo build --release -p moq-pub-mmtp --features profiling && \
+      cp /build/target/release/moq-pub-mmtp /usr/local/cargo/bin/moq-pub-mmtp; \
+    fi
+
 # Create a pub image that also contains ffmpeg and a helper script
 FROM debian:bookworm-slim as moq-pub
 
