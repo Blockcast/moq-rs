@@ -12,16 +12,14 @@
   "expected": {
     "packet_id": 1,
     "source_priority": 5,
-    "repair_priority": 7,
+    "repair_priority": 240,
     "source_groups_created": [
       [0, 0, 5],
       [0, 1, 5],
-      [1, 0, 5],
-      [1, 1, 5]
+      [0, 2, 5]
     ],
     "repair_groups_created": [
-      [0, 0, 7],
-      [1, 0, 7]
+      [0, 0, 240]
     ],
     "source_trailers_hex": [
       "10000000",

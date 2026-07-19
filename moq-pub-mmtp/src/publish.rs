@@ -21,12 +21,33 @@
 //        `multicast.endpoints[].tracks[]` map; unknown ids hard-error.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use mmt_core::header::{FragmentType, PacketType};
 
-use crate::mmtp_parse::PacketRouting;
+use crate::mmtp_parse::{MfuIdentity, PacketRouting};
+
+pub const CONTROL_PRIORITY: u8 = 32;
+pub const SOURCE_PRIORITY: u8 = 128;
+pub const REPAIR_PRIORITY: u8 = 240;
+
+pub type SharedPresentationEpoch = Arc<Mutex<Option<u32>>>;
+
+#[derive(Clone, Copy)]
+struct ActiveMfu {
+    identity: MfuIdentity,
+    last_fragment_counter: u8,
+}
+
+pub fn group_id_for_ticks(ticks: i64, group_duration_ticks: u64) -> u64 {
+    if ticks < 0 {
+        0
+    } else {
+        ticks as u64 / group_duration_ticks
+    }
+}
 
 /// Object-level writer for one MoQ subgroup (≈ one MPU group).
 ///
@@ -67,8 +88,7 @@ pub struct TrackState<T: TrackSubgroups> {
     pub priority: u8,
     /// Subgroup factory wired to one moq-transport TrackWriter::subgroups().
     pub sink: T,
-    /// MPU sequence backing the currently open group = the MoQ group_id.
-    /// None until the first MPU. Also the group the repair sibling mirrors.
+    /// Formula-derived currently open MoQ group.
     pub current_group_id: Option<u64>,
     /// Last MPU sequence seen on this track; used for the A2
     /// monotonicity check.
@@ -77,33 +97,40 @@ pub struct TrackState<T: TrackSubgroups> {
     /// per draft-ramadan-moq-mmt §4.3. Opened lazily when the Init packet of
     /// the current group arrives. Reset on group advance.
     init_group: Option<T::Group>,
-    /// MFU subgroups of the current group, keyed by the per-sample MMTP
-    /// timestamp (Mapping B). The `moq_mmt` muxer sets the timestamp once per
-    /// sample and reuses it for every fragment of that MFU, so it is present on
-    /// every packet — unlike the MFU DU header (`sample_number`), which is
-    /// written only on the first fragment. Keying off the timestamp therefore
-    /// survives first-fragment loss. Reset on group advance.
-    ///
-    /// The key is the 32-bit MMTP timestamp (NTP short format). Two distinct MFUs
-    /// would only collide if their timestamps were equal, which cannot happen
-    /// within a single MPU group: one MPU spans a narrow timestamp range far short
-    /// of the 2^32 wrap, and the map is cleared on every group advance.
-    mfu_groups: HashMap<u32, T::Group>,
+    /// MFU subgroups keyed by normative DU-header identity (§5.2.2).
+    mfu_groups: HashMap<MfuIdentity, T::Group>,
+    /// Fragment chains whose continuation packets omit the DU header. Timestamp
+    /// is only a lookup for one active chain; collisions and counter gaps fail
+    /// closed instead of guessing identity.
+    active_mfus: HashMap<u32, ActiveMfu>,
     /// Next MFU subgroup_id to assign within the current group. Starts at 1
     /// (subgroup 0 is reserved for Init) and increments as new MFU timestamps
     /// are seen. Reset on group advance.
     next_mfu_subgroup_id: u64,
-    /// Sibling `<name>/repair` track for AL-FEC repair packets. Per
-    /// draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1 repair tracks run at priority 7 and
-    /// inherit the source track's group_id so the receiver can
-    /// correlate source/repair by MPU sequence. None means no FEC is
-    /// configured for this packet_id (subscriber gets no recovery).
+    timescale: u32,
+    group_duration_ticks: u64,
+    repair_group_depth: u64,
+    presentation_epoch: SharedPresentationEpoch,
+    max_unwrapped_ntp_ticks: Option<i64>,
+    /// Sibling `<name>/repair` track for AL-FEC repair packets. Repair objects
+    /// use the D3 repair band and formula-group/interleave alignment. None means
+    /// no FEC is configured for this packet_id.
     pub repair: Option<RepairSink<T>>,
 }
 
 impl<T: TrackSubgroups> TrackState<T> {
     /// Create per-track state with no group open yet.
-    pub fn new(name: String, priority: u8, sink: T, repair: Option<RepairSink<T>>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        priority: u8,
+        timescale: u32,
+        group_duration_ticks: u64,
+        repair_group_depth: u64,
+        presentation_epoch: SharedPresentationEpoch,
+        sink: T,
+        repair: Option<RepairSink<T>>,
+    ) -> Self {
         Self {
             name,
             priority,
@@ -112,27 +139,67 @@ impl<T: TrackSubgroups> TrackState<T> {
             last_seen_mpu_seq: None,
             init_group: None,
             mfu_groups: HashMap::new(),
+            active_mfus: HashMap::new(),
             next_mfu_subgroup_id: 1,
+            timescale,
+            group_duration_ticks,
+            repair_group_depth,
+            presentation_epoch,
+            max_unwrapped_ntp_ticks: None,
             repair,
         }
     }
 
-    /// Advance to a new MPU group: reset all per-group subgroup state. Dropping
+    fn formula_group_id(&mut self, timestamp: u32) -> Result<u64> {
+        let mut epoch = self
+            .presentation_epoch
+            .lock()
+            .map_err(|_| anyhow!("shared presentation epoch lock poisoned"))?;
+        let start = *epoch.get_or_insert(timestamp);
+        drop(epoch);
+
+        const NTP_SHORT_MODULUS: i64 = 1_i64 << 32;
+        let base = timestamp.wrapping_sub(start) as i64;
+        let unwrapped = if let Some(reference) = self.max_unwrapped_ntp_ticks {
+            let era = reference.div_euclid(NTP_SHORT_MODULUS);
+            [era - 1, era, era + 1]
+                .into_iter()
+                .map(|candidate_era| base + candidate_era * NTP_SHORT_MODULUS)
+                .min_by_key(|candidate| candidate.abs_diff(reference))
+                .expect("three NTP-short unwrap candidates")
+        } else {
+            timestamp.wrapping_sub(start) as i32 as i64
+        };
+        self.max_unwrapped_ntp_ticks = Some(
+            self.max_unwrapped_ntp_ticks
+                .map_or(unwrapped, |current| current.max(unwrapped)),
+        );
+        let presentation_ticks = if unwrapped < 0 {
+            0
+        } else {
+            ((unwrapped as u128 * self.timescale as u128) / 65_536) as i64
+        };
+        Ok(group_id_for_ticks(
+            presentation_ticks,
+            self.group_duration_ticks,
+        ))
+    }
+
+    /// Advance to a new formula group: reset all per-group subgroup state. Dropping
     /// the old subgroup writers closes those subgroups (they are complete).
-    fn advance_to_group(&mut self, mpu_seq: u32) {
-        self.current_group_id = Some(mpu_seq as u64);
-        self.last_seen_mpu_seq = Some(mpu_seq);
+    fn advance_to_group(&mut self, group_id: u64) {
+        self.current_group_id = Some(group_id);
         self.init_group = None;
         self.mfu_groups.clear();
+        self.active_mfus.clear();
         self.next_mfu_subgroup_id = 1;
     }
 }
 
 /// Repair sibling state for one source packet_id.
 ///
-/// For M.1 we tie repair group_id to the source MPU group_id so the
-/// receiver can match repair symbols to source data. Per-FEC-block
-/// grouping (parsing FEC Payload ID for SBN) is M.1b.
+/// Repair groups align with the source formula group and interleave depth D:
+/// repair_group = floor(source_group / D).
 pub struct RepairSink<T: TrackSubgroups> {
     /// Subgroup factory for the `<source>/repair` MoQ track.
     pub sink: T,
@@ -190,10 +257,8 @@ pub fn dispatch<T: TrackSubgroups>(
                 );
             }
 
-            // Group boundaries come from the MPU sequence (A2 monotonicity),
-            // not from FragmentType::Init. Init may be lost on the multicast leg
-            // (it also rides the reliable catalog), so — unlike the old flat
-            // mapping — we do NOT require Init to be the first packet of a group.
+            // MPU sequence remains an independent monotonicity invariant. It is
+            // explicitly forbidden as the MoQ Group number (§4.3).
             match state.last_seen_mpu_seq {
                 Some(last) if mpu_seq < last => {
                     bail!(
@@ -204,18 +269,33 @@ pub fn dispatch<T: TrackSubgroups>(
                         last
                     );
                 }
-                Some(last) if mpu_seq == last => { /* same group: keep open subgroups */ }
-                _ => state.advance_to_group(mpu_seq),
+                _ => state.last_seen_mpu_seq = Some(mpu_seq),
+            }
+
+            let formula_group_id = state.formula_group_id(routing.timestamp)?;
+            if state
+                .current_group_id
+                .is_some_and(|current| formula_group_id < current)
+            {
+                tracing::warn!(
+                    packet_id = routing.packet_id,
+                    formula_group_id,
+                    current_group_id = state.current_group_id,
+                    "dropping stale packet from a prior formula group"
+                );
+                return Ok(());
+            }
+            if state.current_group_id != Some(formula_group_id) {
+                state.advance_to_group(formula_group_id);
             }
 
             let group_id = state
                 .current_group_id
                 .expect("advance_to_group sets current_group_id for every MPU group");
 
-            // Mapping B (draft-ramadan-moq-mmt §4.3): subgroup 0 = MPU metadata
-            // (Init), subgroups 1..M = one MFU each, keyed by the per-sample MMTP
-            // timestamp. The publisher routes by (packet_id, MPU sequence, MFU
-            // key) and never acts on the Fragmentation Indicator (§5.1).
+            // §5.2.2: subgroup 0 = MPU metadata; each MFU subgroup is keyed by
+            // its timed (movie_fragment_sequence_number, sample_number) or
+            // non-timed Item_ID identity from the DU header.
             match frag {
                 FragmentType::Init => {
                     if state.init_group.is_none() {
@@ -229,18 +309,70 @@ pub fn dispatch<T: TrackSubgroups>(
                         .put_object(payload)?;
                 }
                 FragmentType::Mfu => {
-                    let ts = routing.timestamp;
-                    if !state.mfu_groups.contains_key(&ts) {
+                    let identity = match (routing.fragmentation_indicator, routing.mfu_identity) {
+                        (0, Some(identity)) => identity,
+                        (1, Some(identity)) => {
+                            if state.active_mfus.contains_key(&routing.timestamp) {
+                                bail!(
+                                    "packet_id {} starts overlapping MFUs at timestamp {}; DU identity would be ambiguous",
+                                    routing.packet_id,
+                                    routing.timestamp
+                                );
+                            }
+                            state.active_mfus.insert(
+                                routing.timestamp,
+                                ActiveMfu {
+                                    identity,
+                                    last_fragment_counter: routing.fragment_counter,
+                                },
+                            );
+                            identity
+                        }
+                        (2 | 3, None) => {
+                            let active = state.active_mfus.get_mut(&routing.timestamp).ok_or_else(|| {
+                                anyhow!(
+                                    "packet_id {} continuation MFU (FI={}) has no active DU-header identity for timestamp {}",
+                                    routing.packet_id,
+                                    routing.fragmentation_indicator,
+                                    routing.timestamp
+                                )
+                            })?;
+                            let expected = active.last_fragment_counter.wrapping_add(1);
+                            if routing.fragment_counter != expected {
+                                bail!(
+                                    "packet_id {} continuation MFU counter gap at timestamp {}: got {}, expected {}",
+                                    routing.packet_id,
+                                    routing.timestamp,
+                                    routing.fragment_counter,
+                                    expected
+                                );
+                            }
+                            active.last_fragment_counter = routing.fragment_counter;
+                            let identity = active.identity;
+                            if routing.fragmentation_indicator == 3 {
+                                state.active_mfus.remove(&routing.timestamp);
+                            }
+                            identity
+                        }
+                        _ => {
+                            bail!(
+                                "packet_id {} MFU has inconsistent FI={} and DU-header identity presence",
+                                routing.packet_id,
+                                routing.fragmentation_indicator
+                            );
+                        }
+                    };
+                    if !state.mfu_groups.contains_key(&identity) {
                         let subgroup_id = state.next_mfu_subgroup_id;
                         let g = state
                             .sink
                             .create_group(group_id, subgroup_id, state.priority)?;
                         state.next_mfu_subgroup_id += 1;
-                        state.mfu_groups.insert(ts, g);
+                        state.mfu_groups.insert(identity, g);
                     }
                     state
                         .mfu_groups
-                        .get_mut(&ts)
+                        .get_mut(&identity)
                         .expect("mfu subgroup just inserted")
                         .put_object(payload)?;
                 }
@@ -255,10 +387,8 @@ pub fn dispatch<T: TrackSubgroups>(
             }
         }
         PacketType::Repair => {
-            // T3: route AL-FEC repair to the `<name>/repair` sibling
-            // track at priority 7. The repair group_id mirrors the
-            // source track's current MPU group so the receiver can
-            // correlate repair symbols with the data they protect.
+            // D consecutive formula groups share one repair group, preserving
+            // the SBN=floor(Group/D) alignment.
             let source_group_id = state.current_group_id.ok_or_else(|| {
                 anyhow!(
                     "repair packet for packet_id {} arrived before any source MPU \
@@ -267,6 +397,7 @@ pub fn dispatch<T: TrackSubgroups>(
                     routing.packet_id
                 )
             })?;
+            let repair_group_id = source_group_id / state.repair_group_depth;
             let repair = state.repair.as_mut().ok_or_else(|| {
                 anyhow!(
                     "repair packet for packet_id {} but no /repair sibling track \
@@ -275,11 +406,12 @@ pub fn dispatch<T: TrackSubgroups>(
                     state.name
                 )
             })?;
-            // Advance the repair group iff the source MPU advanced.
-            if repair.current_group_id != Some(source_group_id) {
-                let group = repair.sink.create_group(source_group_id, 0, 7)?;
+            if repair.current_group_id != Some(repair_group_id) {
+                let group = repair
+                    .sink
+                    .create_group(repair_group_id, 0, REPAIR_PRIORITY)?;
                 repair.current_group = Some(group);
-                repair.current_group_id = Some(source_group_id);
+                repair.current_group_id = Some(repair_group_id);
             }
             repair
                 .current_group
@@ -363,6 +495,10 @@ mod tests {
             TrackState::new(
                 format!("track-{packet_id}"),
                 priority,
+                65_536,
+                65_536,
+                1,
+                Arc::new(Mutex::new(Some(0))),
                 MockSubgroups::default(),
                 repair,
             ),
@@ -383,7 +519,14 @@ mod tests {
             rap_flag: false,
             mpu_sequence: Some(mpu_seq),
             fragment_type: Some(frag),
-            timestamp,
+            timestamp: mpu_seq.wrapping_shl(16).wrapping_add(timestamp),
+            timed: true,
+            fragmentation_indicator: 0,
+            fragment_counter: 0,
+            mfu_identity: (frag == FragmentType::Mfu).then_some(MfuIdentity::Timed {
+                movie_fragment_sequence_number: mpu_seq,
+                sample_number: timestamp,
+            }),
             aggregation: false,
         }
     }
@@ -399,6 +542,10 @@ mod tests {
             mpu_sequence: None,
             fragment_type: None,
             timestamp: 0,
+            timed: false,
+            fragmentation_indicator: 0,
+            fragment_counter: 0,
+            mfu_identity: None,
             aggregation: false,
         }
     }
@@ -519,11 +666,19 @@ mod tests {
             vec![Bytes::from_static(b"init")]
         );
         assert_eq!(
-            state.mfu_groups[&0xA].writes,
+            state.mfu_groups[&MfuIdentity::Timed {
+                movie_fragment_sequence_number: 10,
+                sample_number: 0xA,
+            }]
+                .writes,
             vec![Bytes::from_static(b"a0"), Bytes::from_static(b"a1")]
         );
         assert_eq!(
-            state.mfu_groups[&0xB].writes,
+            state.mfu_groups[&MfuIdentity::Timed {
+                movie_fragment_sequence_number: 10,
+                sample_number: 0xB,
+            }]
+                .writes,
             vec![Bytes::from_static(b"b0")]
         );
     }
@@ -565,9 +720,15 @@ mod tests {
         );
         assert_eq!(state.current_group_id, Some(11));
         assert_eq!(state.last_seen_mpu_seq, Some(11));
-        assert!(state.mfu_groups.contains_key(&0xC));
+        assert!(state.mfu_groups.contains_key(&MfuIdentity::Timed {
+            movie_fragment_sequence_number: 11,
+            sample_number: 0xC,
+        }));
         assert!(
-            !state.mfu_groups.contains_key(&0xA),
+            !state.mfu_groups.contains_key(&MfuIdentity::Timed {
+                movie_fragment_sequence_number: 10,
+                sample_number: 0xA,
+            }),
             "group 10's MFU subgroups cleared on advance to group 11"
         );
     }
@@ -620,9 +781,8 @@ mod tests {
     }
 
     #[test]
-    fn repair_packet_routes_to_repair_sink_at_priority_7() {
-        // Repair packets MUST land on the repair sibling sink (not the
-        // source sink), with priority 7 per draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1.
+    fn repair_packet_routes_to_repair_sink_at_priority_240() {
+        // Repair packets land on the repair sibling in the D3 repair band.
         let mut map = make_state_map_with_repair(1, 5, true);
         // Open source MPU 10 first.
         dispatch(
@@ -636,12 +796,12 @@ mod tests {
         let state = map.get(&1).unwrap();
         // Source sink: 1 create_group at priority 5.
         assert_eq!(state.sink.groups_created, vec![(10, 0, 5)]);
-        // Repair sink: 1 create_group at priority 7, mirroring source group_id.
+        // Repair sink: one aligned group in the repair priority band.
         let r = state.repair.as_ref().expect("repair sibling exists");
         assert_eq!(
             r.sink.groups_created,
-            vec![(10, 0, 7)],
-            "repair group_id mirrors source MPU; priority is 7"
+            vec![(10, 0, REPAIR_PRIORITY)],
+            "repair group aligns with source; priority is in the repair band"
         );
         // The repair payload landed on the repair group, not the source.
         let rg = r.current_group.as_ref().expect("repair group open");
@@ -670,7 +830,7 @@ mod tests {
         let r = map.get(&1).unwrap().repair.as_ref().unwrap();
         assert_eq!(
             r.sink.groups_created,
-            vec![(10, 0, 7), (11, 0, 7)],
+            vec![(10, 0, REPAIR_PRIORITY), (11, 0, REPAIR_PRIORITY)],
             "repair opens a new group each time source MPU advances"
         );
         assert_eq!(r.current_group_id, Some(11));
@@ -713,7 +873,10 @@ mod tests {
             vec![(10, 0, 5), (10, 1, 5)],
             "one Init subgroup + one MFU subgroup for the fragmented frame"
         );
-        let mfu = &state.mfu_groups[&0xABCD];
+        let mfu = &state.mfu_groups[&MfuIdentity::Timed {
+            movie_fragment_sequence_number: 10,
+            sample_number: 0xABCD,
+        }];
         assert_eq!(
             mfu.writes,
             vec![
@@ -725,37 +888,15 @@ mod tests {
     }
 
     #[test]
-    fn mfu_survives_first_fragment_loss() {
-        // The load-bearing reason MFU subgroups are keyed off the per-sample MMTP
-        // timestamp (present on every fragment) rather than the MFU DU header's
-        // `sample_number` (written only on the first fragment): if fragment 1 is
-        // lost on the multicast leg, the surviving fragments 2..N — which carry
-        // only the timestamp — must still coalesce into ONE MFU subgroup, not
-        // spawn a spurious second one. No Init and no first fragment arrive here.
+    fn mfu_without_du_header_identity_fails_closed() {
+        // A continuation fragment cannot invent identity from its timestamp. If
+        // the first fragment carrying the DU header was lost, fail closed.
         let mut map = make_state_map(1, 5);
-        dispatch(
-            &mut map,
-            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
-            Bytes::from_static(b"f2"),
-        )
-        .unwrap();
-        dispatch(
-            &mut map,
-            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
-            Bytes::from_static(b"f3"),
-        )
-        .unwrap();
-        let state = map.get(&1).unwrap();
-        assert_eq!(
-            state.sink.groups_created,
-            vec![(10, 1, 5)],
-            "surviving fragments of one MFU share a single subgroup despite \
-             first-fragment loss (timestamp keying, not sample_number)"
-        );
-        assert_eq!(
-            state.mfu_groups[&0xABCD].writes,
-            vec![Bytes::from_static(b"f2"), Bytes::from_static(b"f3")]
-        );
+        let mut continuation = mpu_ts(1, 10, FragmentType::Mfu, 0xABCD);
+        continuation.fragmentation_indicator = 2;
+        continuation.mfu_identity = None;
+        let err = dispatch(&mut map, &continuation, Bytes::from_static(b"f2")).unwrap_err();
+        assert!(err.to_string().contains("no active DU-header identity"));
     }
 
     #[test]
@@ -770,6 +911,174 @@ mod tests {
         assert!(
             err.to_string().contains("aggregat"),
             "expected aggregated-MPU refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn canonical_alignment_vectors_match_libmmt() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets/align.json");
+        let raw = std::fs::read_to_string(path).expect("canonical align fixture present");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid align fixture");
+        for vector in doc["group_id"].as_array().unwrap() {
+            let actual = group_id_for_ticks(
+                vector["ticks"].as_i64().unwrap(),
+                vector["group_duration_ticks"].as_u64().unwrap(),
+            );
+            assert_eq!(
+                actual,
+                vector["expected_group_id"].as_u64().unwrap(),
+                "{}",
+                vector["name"].as_str().unwrap()
+            );
+        }
+        for vector in doc["subgroup_key"].as_array().unwrap() {
+            let actual = match vector["kind"].as_str().unwrap() {
+                "mpu-metadata" => "metadata:0".to_string(),
+                "timed" => format!(
+                    "timed:{}:{}",
+                    vector["movie_fragment_sequence_number"].as_u64().unwrap(),
+                    vector["sample_number"].as_u64().unwrap()
+                ),
+                "non-timed" => {
+                    format!("non-timed:{}", vector["item_id"].as_u64().unwrap())
+                }
+                kind => panic!("unknown subgroup vector kind {kind}"),
+            };
+            assert_eq!(
+                actual,
+                vector["expected_key"].as_str().unwrap(),
+                "{}",
+                vector["name"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_fragments_repeat_and_reuse_du_header_identity() {
+        let mut map = make_state_map(1, 5);
+        let mut first = mpu_ts(1, 10, FragmentType::Mfu, 0xABCD);
+        first.fragmentation_indicator = 1;
+        dispatch(&mut map, &first, Bytes::from_static(b"first")).unwrap();
+        let mut continuation = first;
+        continuation.fragmentation_indicator = 3;
+        continuation.fragment_counter = 1;
+        continuation.mfu_identity = None;
+        dispatch(&mut map, &continuation, Bytes::from_static(b"last")).unwrap();
+        let group = &map.get(&1).unwrap().mfu_groups[&MfuIdentity::Timed {
+            movie_fragment_sequence_number: 10,
+            sample_number: 0xABCD,
+        }];
+        assert_eq!(
+            group.writes,
+            vec![Bytes::from_static(b"first"), Bytes::from_static(b"last")]
+        );
+    }
+
+    #[test]
+    fn distinct_du_identities_do_not_alias_equal_timestamps() {
+        let mut map = make_state_map(1, 5);
+        let mut first = mpu_ts(1, 10, FragmentType::Mfu, 0xABCD);
+        first.mfu_identity = Some(MfuIdentity::Timed {
+            movie_fragment_sequence_number: 7,
+            sample_number: 19,
+        });
+        let mut second = first.clone();
+        second.mfu_identity = Some(MfuIdentity::Timed {
+            movie_fragment_sequence_number: 8,
+            sample_number: 1,
+        });
+        dispatch(&mut map, &first, Bytes::from_static(b"a")).unwrap();
+        dispatch(&mut map, &second, Bytes::from_static(b"b")).unwrap();
+        assert_eq!(map.get(&1).unwrap().sink.groups_created.len(), 2);
+    }
+
+    #[test]
+    fn overlapping_fragment_chains_at_equal_timestamp_fail_closed() {
+        let mut map = make_state_map(1, 5);
+        let mut first = mpu_ts(1, 10, FragmentType::Mfu, 0xABCD);
+        first.fragmentation_indicator = 1;
+        dispatch(&mut map, &first, Bytes::from_static(b"a-first")).unwrap();
+
+        let mut overlapping = first.clone();
+        overlapping.mfu_identity = Some(MfuIdentity::Timed {
+            movie_fragment_sequence_number: 10,
+            sample_number: 99,
+        });
+        let err = dispatch(&mut map, &overlapping, Bytes::from_static(b"b-first")).unwrap_err();
+        assert!(err.to_string().contains("overlapping MFUs"));
+    }
+
+    #[test]
+    fn repair_groups_follow_floor_group_over_depth() {
+        let mut map = make_state_map_with_repair(1, 5, true);
+        map.get_mut(&1).unwrap().repair_group_depth = 2;
+        for group in [10, 11, 12] {
+            dispatch(
+                &mut map,
+                &mpu(1, group, FragmentType::Init),
+                Bytes::from_static(b"i"),
+            )
+            .unwrap();
+            dispatch(&mut map, &repair(1), Bytes::from_static(b"r")).unwrap();
+        }
+        assert_eq!(
+            map.get(&1)
+                .unwrap()
+                .repair
+                .as_ref()
+                .unwrap()
+                .sink
+                .groups_created,
+            vec![(5, 0, REPAIR_PRIORITY), (6, 0, REPAIR_PRIORITY)]
+        );
+    }
+
+    #[test]
+    fn publisher_restart_with_high_mpu_sequence_starts_formula_at_zero() {
+        let mut map = make_state_map(1, SOURCE_PRIORITY);
+        let mut routing = mpu(1, 90_000, FragmentType::Init);
+        routing.timestamp = 0;
+        dispatch(&mut map, &routing, Bytes::from_static(b"init")).unwrap();
+        assert_eq!(
+            map.get(&1).unwrap().sink.groups_created,
+            vec![(0, 0, SOURCE_PRIORITY)],
+            "a publisher restart does not copy a retained high MPU sequence into Group"
+        );
+    }
+
+    #[test]
+    fn reordered_prior_group_packet_does_not_regress_writer_state() {
+        let mut map = make_state_map(1, SOURCE_PRIORITY);
+        let mut current = mpu_ts(1, 11, FragmentType::Mfu, 1);
+        current.timestamp = 11 << 16;
+        dispatch(&mut map, &current, Bytes::from_static(b"current")).unwrap();
+
+        let mut stale = mpu_ts(1, 11, FragmentType::Mfu, 2);
+        stale.timestamp = 10 << 16;
+        dispatch(&mut map, &stale, Bytes::from_static(b"stale")).unwrap();
+
+        let state = map.get(&1).unwrap();
+        assert_eq!(state.current_group_id, Some(11));
+        assert_eq!(state.sink.groups_created, vec![(11, 1, SOURCE_PRIORITY)]);
+    }
+
+    #[test]
+    fn ntp_short_wrap_preserves_formula_progression() {
+        let mut map = make_state_map(1, SOURCE_PRIORITY);
+        let epoch = map.get(&1).unwrap().presentation_epoch.clone();
+        *epoch.lock().unwrap() = Some(0xffff_0000);
+
+        let mut before_wrap = mpu(1, 1, FragmentType::Init);
+        before_wrap.timestamp = 0xffff_0000;
+        dispatch(&mut map, &before_wrap, Bytes::from_static(b"before")).unwrap();
+
+        let mut after_wrap = mpu_ts(1, 2, FragmentType::Mfu, 1);
+        after_wrap.timestamp = 0x0001_0000;
+        dispatch(&mut map, &after_wrap, Bytes::from_static(b"after")).unwrap();
+
+        assert_eq!(
+            map.get(&1).unwrap().sink.groups_created,
+            vec![(0, 0, SOURCE_PRIORITY), (2, 1, SOURCE_PRIORITY)]
         );
     }
 
@@ -998,7 +1307,7 @@ mod tests {
             repair.sink.groups_created,
             expected_groups(&doc, "repair_groups_created")
         );
-        assert_eq!(repair.current_group_id, Some(1));
+        assert_eq!(repair.current_group_id, Some(0));
 
         let expected_trailers: Vec<String> = doc["expected"]["source_trailers_hex"]
             .as_array()

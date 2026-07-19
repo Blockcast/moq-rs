@@ -1,0 +1,41 @@
+{
+  "$comment": [
+    "Canonical cross-language group alignment and MMTP subgroup-key vectors.",
+    "Copied from Blockcast/libmmt packages/container/test-vectors/align.json."
+  ],
+  "version": 1,
+  "group_id": [
+    {"name":"t=0 → 0","ticks":0,"group_duration_ticks":360000,"expected_group_id":0},
+    {"name":"90kHz, dur=4s: 3.9s before boundary → 0","ticks":351000,"group_duration_ticks":360000,"expected_group_id":0},
+    {"name":"90kHz, dur=4s: exact boundary at 4s → 1","ticks":360000,"group_duration_ticks":360000,"expected_group_id":1},
+    {"name":"90kHz, dur=4s: 4s + 1 tick → 1","ticks":360001,"group_duration_ticks":360000,"expected_group_id":1},
+    {"name":"90kHz, dur=4s: second boundary at 8s → 2","ticks":720000,"group_duration_ticks":360000,"expected_group_id":2},
+    {"name":"48kHz audio, dur=4s: aligned at 192000 ticks → 1","ticks":192000,"group_duration_ticks":192000,"expected_group_id":1},
+    {"name":"negative clamps to 0 (base-clamp)","ticks":-1,"group_duration_ticks":360000,"expected_group_id":0},
+    {"name":"large negative clamps to 0 (epoch skew)","ticks":-9000000,"group_duration_ticks":360000,"expected_group_id":0},
+    {"name":"1kHz, dur=2s: 10s → 5","ticks":10000,"group_duration_ticks":2000,"expected_group_id":5},
+    {"name":"1kHz, dur=2s: 10s + 1 tick → 5 (still in bucket 5)","ticks":10001,"group_duration_ticks":2000,"expected_group_id":5},
+    {"name":"1kHz, dur=2s: 12s → 6","ticks":12000,"group_duration_ticks":2000,"expected_group_id":6},
+    {"name":"prime divisor (dur=7): ticks=13 → 1","ticks":13,"group_duration_ticks":7,"expected_group_id":1},
+    {"name":"prime divisor (dur=7): ticks=14 → 2 (exact boundary)","ticks":14,"group_duration_ticks":7,"expected_group_id":2},
+    {"name":"prime divisor (dur=7): ticks=15 → 2","ticks":15,"group_duration_ticks":7,"expected_group_id":2},
+    {"name":"large-int (24h @ 90kHz): 7_776_000_000 ticks, dur=4s → 21600","ticks":7776000000,"group_duration_ticks":360000,"expected_group_id":21600},
+    {"name":"near MAX_SAFE_INTEGER (TS=2^52, dur=2): ticks=2^52 → 2^51","ticks":4503599627370496,"group_duration_ticks":2,"expected_group_id":2251799813685248}
+  ],
+  "drift": [
+    {"name":"aligned","expected":5,"actual":5,"expected_kind":"aligned","expected_delta_groups":0},
+    {"name":"ahead by 1","expected":5,"actual":6,"expected_kind":"drifted","expected_delta_groups":1},
+    {"name":"behind by 2","expected":5,"actual":3,"expected_kind":"drifted","expected_delta_groups":-2},
+    {"name":"large gap","expected":100,"actual":142,"expected_kind":"drifted","expected_delta_groups":42},
+    {"name":"zero-zero aligned (off-by-one hot spot)","expected":0,"actual":0,"expected_kind":"aligned","expected_delta_groups":0},
+    {"name":"large negative delta","expected":1000,"actual":5,"expected_kind":"drifted","expected_delta_groups":-995}
+  ],
+  "subgroup_key": [
+    {"name":"MPU metadata always uses subgroup 0","kind":"mpu-metadata","expected_subgroup":0,"expected_key":"metadata:0"},
+    {"name":"timed MFU key keeps movie fragment and sample coordinates","kind":"timed","movie_fragment_sequence_number":7,"sample_number":19,"expected_key":"timed:7:19"},
+    {"name":"timed MFU key does not alias the next movie fragment","kind":"timed","movie_fragment_sequence_number":8,"sample_number":1,"expected_key":"timed:8:1"},
+    {"name":"timed MFU preserves maximum uint32 coordinates","kind":"timed","movie_fragment_sequence_number":4294967295,"sample_number":4294967295,"expected_key":"timed:4294967295:4294967295"},
+    {"name":"non-timed MFU key is Item_ID","kind":"non-timed","item_id":42,"expected_key":"non-timed:42"},
+    {"name":"non-timed MFU preserves maximum uint32 Item_ID","kind":"non-timed","item_id":4294967295,"expected_key":"non-timed:4294967295"}
+  ]
+}

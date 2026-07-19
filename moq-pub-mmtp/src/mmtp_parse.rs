@@ -8,7 +8,22 @@
 // header decode. We do not re-implement the bit-twiddling.
 
 use anyhow::{anyhow, Context, Result};
-use mmt_core::header::{FragmentType, MmtpHeader, MpuHeader, PacketType, MMTP_HEADER_SIZE};
+use bytes::Buf;
+use mmt_core::header::{
+    FragmentType, MfuDataUnit, MmtpHeader, MpuHeader, PacketType, MMTP_HEADER_SIZE,
+};
+
+/// Stable MFU identity carried by the MPU data-unit header (§5.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MfuIdentity {
+    Timed {
+        movie_fragment_sequence_number: u32,
+        sample_number: u32,
+    },
+    NonTimed {
+        item_id: u32,
+    },
+}
 
 /// Routing key extracted from one MMTP packet's headers.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,14 +46,17 @@ pub struct PacketRouting {
     /// MUST carry FragmentType::Init (the MPU metadata box). Present
     /// only when `packet_type == PacketType::Mpu`.
     pub fragment_type: Option<FragmentType>,
-    /// MMTP timestamp (NTP short-format, 32 bits). Under Mapping B this is the
-    /// per-MFU subgroup discriminator: the `moq_mmt` muxer sets it once per
-    /// sample and reuses it for every fragment of that MFU, so it is present on
-    /// every packet — unlike the MFU DU header (`sample_number`), which the
-    /// muxer writes only on the first fragment. Keying the MFU subgroup off the
-    /// timestamp survives first-fragment loss. See the M.4 T1.7 findings /
-    /// .planning/m4-b-mig-transport-subgroups-design.md.
+    /// MMTP timestamp (NTP short-format, 32 bits). This supplies presentation
+    /// time for the §4.4.1 Group Number Formula; it is not object identity.
     pub timestamp: u32,
+    /// Timed-media bit from the MPU header.
+    pub timed: bool,
+    /// Fragmentation Indicator from the MPU header.
+    pub fragmentation_indicator: u8,
+    /// Fragment counter from the MPU header.
+    pub fragment_counter: u8,
+    /// MFU identity parsed from a complete/first fragment's DU header.
+    pub mfu_identity: Option<MfuIdentity>,
     /// MPU aggregation flag (multiple data units packed in one payload). Present
     /// (as `false`) for non-Mpu packets. The publisher refuses aggregated MPUs:
     /// Mapping B is one MFU per packet, and the muxer does not emit aggregation.
@@ -61,18 +79,53 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
     let mut cursor: &[u8] = packet;
     let hdr = MmtpHeader::read_from(&mut cursor)
         .map_err(|e| anyhow!("MMTP header decode failed: {e:?}"))?;
-    let (mpu_sequence, fragment_type, aggregation) = if hdr.packet_type == PacketType::Mpu {
+    let (
+        mpu_sequence,
+        fragment_type,
+        aggregation,
+        timed,
+        fragmentation_indicator,
+        fragment_counter,
+        mfu_identity,
+    ) = if hdr.packet_type == PacketType::Mpu {
         let mut payload: &[u8] = &packet[MMTP_HEADER_SIZE..];
         let (mpu, _payload_len) = MpuHeader::read_from(&mut payload)
             .map_err(|e| anyhow!("MPU header decode failed: {e:?}"))
             .context("MMTP packet_type=Mpu but MPU header decode failed")?;
+        let mfu_identity =
+            if mpu.fragment_type == FragmentType::Mfu && mpu.fragmentation_indicator <= 1 {
+                if mpu.timed {
+                    let mfu = MfuDataUnit::read_from(&mut payload)
+                        .map_err(|e| anyhow!("timed MFU DU header decode failed: {e:?}"))?;
+                    Some(MfuIdentity::Timed {
+                        movie_fragment_sequence_number: mfu.movie_fragment_sequence,
+                        sample_number: mfu.sample_number,
+                    })
+                } else {
+                    if payload.remaining() < 4 {
+                        return Err(anyhow!(
+                            "non-timed MFU DU header decode failed: need 4-byte Item_ID, have {}",
+                            payload.remaining()
+                        ));
+                    }
+                    Some(MfuIdentity::NonTimed {
+                        item_id: payload.get_u32(),
+                    })
+                }
+            } else {
+                None
+            };
         (
             Some(mpu.mpu_sequence),
             Some(mpu.fragment_type),
             mpu.aggregation,
+            mpu.timed,
+            mpu.fragmentation_indicator,
+            mpu.fragment_counter,
+            mfu_identity,
         )
     } else {
-        (None, None, false)
+        (None, None, false, false, 0, 0, None)
     };
     Ok(PacketRouting {
         packet_id: hdr.packet_id,
@@ -82,6 +135,10 @@ pub fn route(packet: &[u8]) -> Result<PacketRouting> {
         mpu_sequence,
         fragment_type,
         timestamp: hdr.timestamp,
+        timed,
+        fragmentation_indicator,
+        fragment_counter,
+        mfu_identity,
         aggregation,
     })
 }
@@ -142,11 +199,50 @@ mod tests {
         let mut buf = bytes::BytesMut::with_capacity(64);
         hdr.write_to(&mut buf).unwrap();
         let mut mpu = MpuHeader::new(FragmentType::Mfu, 3);
-        mpu.payload_length = 0;
+        mpu.payload_length = MfuDataUnit::size() as u16;
         mpu.write_to(&mut buf).unwrap();
+        MfuDataUnit::new(3, 9).write_to(&mut buf).unwrap();
         buf.put_slice(&[0xAA]);
         let r = route(&buf.to_vec()).unwrap();
         assert_eq!(r.timestamp, 0x0002_dddd);
+        assert_eq!(
+            r.mfu_identity,
+            Some(MfuIdentity::Timed {
+                movie_fragment_sequence_number: 3,
+                sample_number: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_non_timed_item_id_identity() {
+        let hdr = MmtpHeader::new(7, PacketType::Mpu);
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+        let mut mpu = MpuHeader::new(FragmentType::Mfu, 3);
+        mpu.timed = false;
+        mpu.payload_length = 4;
+        mpu.write_to(&mut buf).unwrap();
+        buf.put_u32(42);
+        let r = route(&buf.to_vec()).unwrap();
+        assert_eq!(r.mfu_identity, Some(MfuIdentity::NonTimed { item_id: 42 }));
+    }
+
+    #[test]
+    fn continuation_fragment_omits_du_identity() {
+        let hdr = MmtpHeader::new(7, PacketType::Mpu);
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+        let mut mpu = MpuHeader::new(FragmentType::Mfu, 3);
+        mpu.fragmentation_indicator = 2;
+        mpu.fragment_counter = 4;
+        mpu.payload_length = 1;
+        mpu.write_to(&mut buf).unwrap();
+        buf.put_u8(0xaa);
+        let r = route(&buf.to_vec()).unwrap();
+        assert_eq!(r.fragmentation_indicator, 2);
+        assert_eq!(r.fragment_counter, 4);
+        assert_eq!(r.mfu_identity, None);
     }
 
     #[test]
@@ -157,8 +253,9 @@ mod tests {
         hdr.write_to(&mut buf).unwrap();
 
         let mut mpu = MpuHeader::new(FragmentType::Mfu, 11);
-        mpu.payload_length = 4;
+        mpu.payload_length = (MfuDataUnit::size() + 4) as u16;
         mpu.write_to(&mut buf).unwrap();
+        MfuDataUnit::new(11, 1).write_to(&mut buf).unwrap();
 
         buf.put_slice(b"data");
         buf.put_slice(&0xCAFE_BABEu32.to_be_bytes());
@@ -181,9 +278,10 @@ mod tests {
         let mut buf = bytes::BytesMut::with_capacity(64);
         hdr.write_to(&mut buf).unwrap();
         let mut mpu = MpuHeader::new(FragmentType::Mfu, 2);
-        mpu.payload_length = 0;
+        mpu.payload_length = MfuDataUnit::size() as u16;
         mpu.aggregation = true;
         mpu.write_to(&mut buf).unwrap();
+        MfuDataUnit::new(2, 1).write_to(&mut buf).unwrap();
         buf.put_slice(&[0xAA]);
         assert!(
             route(&buf.to_vec()).unwrap().aggregation,
