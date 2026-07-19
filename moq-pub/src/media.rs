@@ -43,7 +43,7 @@ impl Media {
         track_tx: Option<mpsc::UnboundedSender<TrackName>>,
     ) -> anyhow::Result<Self> {
         let catalog = broadcast
-            .create(".catalog")
+            .create("catalog")
             .context("broadcast closed")?
             .subgroups()?;
         let init = broadcast
@@ -52,7 +52,7 @@ impl Media {
             .subgroups()?;
 
         if let Some(tx) = &track_tx {
-            let _ = tx.send(TrackName::from(".catalog"));
+            let _ = tx.send(TrackName::from("catalog"));
             let _ = tx.send(TrackName::from("0.mp4"));
         }
 
@@ -187,8 +187,6 @@ impl Media {
             let timescale = track_timescale(moov, id);
             let handler = (&trak.mdia.hdlr.handler_type).try_into()?;
 
-            let mut selection_params = moq_catalog::SelectionParam::default();
-
             let mut track = moq_catalog::Track {
                 init_track: Some(self.init.name.to_string()),
                 name: name.clone(),
@@ -216,9 +214,9 @@ impl Media {
                 let codec = rfc6381_codec::Codec::avc1(profile, constraints, level);
                 let codec_str = codec.to_string();
 
-                selection_params.codec = Some(codec_str);
-                selection_params.width = Some(width.into());
-                selection_params.height = Some(height.into());
+                track.codec = Some(codec_str);
+                track.width = Some(width.into());
+                track.height = Some(height.into());
             } else if let Some(_hev1) = &stsd.hev1 {
                 // TODO https://github.com/gpac/mp4box.js/blob/325741b592d910297bf609bc7c400fc76101077b/src/box-codecs.js#L106
                 anyhow::bail!("HEVC not yet supported")
@@ -234,13 +232,13 @@ impl Media {
                     desc.object_type_indication, desc.dec_specific.profile
                 );
 
-                selection_params.codec = Some(codec_str);
-                selection_params.channel_config = Some(mp4a.channelcount.to_string());
-                selection_params.samplerate = Some(mp4a.samplerate.value().into());
+                track.codec = Some(codec_str);
+                track.channel_config = Some(mp4a.channelcount.to_string());
+                track.samplerate = Some(mp4a.samplerate.value().into());
 
                 let bitrate = max(desc.max_bitrate, desc.avg_bitrate);
                 if bitrate > 0 {
-                    selection_params.bitrate = Some(bitrate);
+                    track.bitrate = Some(bitrate.into());
                 }
             } else if let Some(vp09) = &stsd.vp09 {
                 // https://github.com/gpac/mp4box.js/blob/325741b592d910297bf609bc7c400fc76101077b/src/box-codecs.js#L238
@@ -250,9 +248,9 @@ impl Media {
                     vpcc.profile, vpcc.level, vpcc.bit_depth
                 );
 
-                selection_params.codec = Some(codec_str);
-                selection_params.width = Some(vp09.width.into());
-                selection_params.height = Some(vp09.height.into());
+                track.codec = Some(codec_str);
+                track.width = Some(vp09.width.into());
+                track.height = Some(vp09.height.into());
 
                 // TODO Test if this actually works; I'm just guessing based on mp4box.js
                 anyhow::bail!("VP9 not yet supported")
@@ -260,8 +258,6 @@ impl Media {
                 // TODO add av01 support: https://github.com/gpac/mp4box.js/blob/325741b592d910297bf609bc7c400fc76101077b/src/box-codecs.js#L251
                 anyhow::bail!("unknown codec for track: {}", trak.tkhd.track_id);
             }
-
-            track.selection_params = selection_params;
 
             tracks.push(track);
 
@@ -276,10 +272,9 @@ impl Media {
 
         let catalog = moq_catalog::Root {
             version: 1,
-            streaming_format: 1,
+            streaming_format: "cmaf".to_string(),
             streaming_format_version: "0.2".to_string(),
-            streaming_delta_updates: true,
-            common_track_fields: moq_catalog::CommonTrackFields::from_tracks(&mut tracks),
+            supports_delta_updates: Some(true),
             tracks,
             multicast: None,
         };

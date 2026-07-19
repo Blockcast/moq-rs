@@ -31,6 +31,14 @@ use publish::{
     dispatch, RepairSink, SharedPresentationEpoch, TrackState, CONTROL_PRIORITY, SOURCE_PRIORITY,
 };
 
+// The canonical MSF catalog has no publisher-retention field. Keep the policy
+// explicit and bounded in the runtime until it is configurable outside the
+// wire schema.
+const PUBLISHER_HISTORY_WINDOW: NonZeroU64 = match NonZeroU64::new(32) {
+    Some(value) => value,
+    None => panic!("publisher history window must be nonzero"),
+};
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -52,7 +60,7 @@ async fn main() -> Result<()> {
     let catalog_bytes = tokio::fs::read(&args.catalog_json)
         .await
         .with_context(|| format!("reading catalog JSON {}", args.catalog_json.display()))?;
-    let mut catalog: Root = serde_json::from_slice(&catalog_bytes)
+    let catalog: Root = serde_json::from_slice(&catalog_bytes)
         .with_context(|| format!("parsing catalog JSON {}", args.catalog_json.display()))?;
 
     // T5: library-level catalog validation (defense in depth — build_state_map
@@ -61,7 +69,6 @@ async fn main() -> Result<()> {
         .validate()
         .map_err(|e| anyhow::anyhow!("catalog validation failed: {e}"))?;
     check_namespace_consistency(&catalog, &args.name)?;
-    catalog.expand_common_fields();
 
     // ---- moq-transport session ----
 
@@ -76,10 +83,9 @@ async fn main() -> Result<()> {
         "built publisher router from catalog"
     );
 
-    // Publish the catalog JSON on the catalog tracks (canonical `catalog` per
-    // draft-ietf-moq-msf-00 §5.2, plus the legacy `.catalog` alias). The
-    // returned SubgroupsWriters are bound for the session's lifetime — dropping
-    // one would surface as "catalog gone" to subscribers using that name.
+    // Publish the catalog JSON on the canonical `catalog` track. The returned
+    // writer is retained for the session lifetime so subscribers do not observe
+    // a closed catalog track.
     let _catalog_subgroups = publish_catalog_track(&mut tracks_writer, &catalog_bytes)?;
     tracing::info!(
         bytes = catalog_bytes.len(),
@@ -215,27 +221,21 @@ fn build_state_map(
                 );
                 continue;
             }
-            let timescale = catalog_track
-                .timescale
-                .or(catalog.common_track_fields.timescale)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "catalog track `{}` has no effective timescale",
-                        track_ref.name
-                    )
-                })?;
+            let timescale = catalog_track.timescale.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "catalog track `{}` has no effective timescale",
+                    track_ref.name
+                )
+            })?;
             if timescale == 0 {
                 bail!(
                     "catalog track `{}` has invalid effective timescale 0; expected > 0",
                     track_ref.name
                 );
             }
-            let group_duration_ms = catalog_track
-                .group_duration_ms
-                .or(catalog.common_track_fields.group_duration_ms);
+            let group_duration_ms = catalog_track.group_duration_ms;
             let group_duration_ticks = catalog_track
                 .group_duration_ticks
-                .or(catalog.common_track_fields.group_duration_ticks)
                 .or_else(|| group_duration_ms.map(|ms| ms as u64 * timescale as u64 / 1000))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -267,21 +267,10 @@ fn build_state_map(
                 )
             })?;
 
-            // Config-or-throw: MMTP publishing under Mapping B opens many
-            // concurrent subgroups per group (Init + one per MFU). The publisher
-            // MUST bound retained history; there is no silent unbounded default.
-            let history_window_raw = multicast.subgroup_history_groups.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "catalog multicast.subgroupHistoryGroups is required for MMTP publishing \
-                     (config-or-throw): it bounds per-track subgroup memory under Mapping B"
-                )
-            })?;
-            // NonZeroU64 carries the ">= 1" invariant into TrackWriter::set_history_window.
-            let history_window = NonZeroU64::new(history_window_raw).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "multicast.subgroupHistoryGroups must be >= 1 (got {history_window_raw})"
-                )
-            })?;
+            // Mapping B opens many concurrent subgroups per group (Init + one
+            // per MFU), so retained history must remain bounded. Retention is a
+            // fixed publisher policy because it is not part of the MSF schema.
+            let history_window = PUBLISHER_HISTORY_WINDOW;
             // Set on the Track BEFORE `.subgroups()` consumes it: `subgroups()`
             // inherits the window to bound local pruning, AND the publisher
             // session advertises it in SUBSCRIBE_OK (BLO-10339) so a downstream
@@ -291,30 +280,35 @@ fn build_state_map(
                 .subgroups()
                 .with_context(|| format!("track `{}`: subgroups() failed", track_ref.name))?;
 
-            // Auto-create the AL-FEC repair sibling. The catalog is
-            // authoritative for the repair track name when the source track
-            // declares a `fec` descriptor (draft-ramadan-moq-fec §5.1
-            // `fec.repairTrack`). Callers that run Root::validate() first — as
-            // main() does before build_state_map — have had that name checked
-            // against the catalog's tracks[] (it must resolve to a `fec-repair`
-            // track); build_state_map itself does not re-verify it. Absent a
-            // `fec` descriptor, fall back to the publisher-internal
-            // `<source>/repair` convention
-            // (draft-ramadan-moq-mmt §8.2 / draft-ramadan-moq-fec §6.1).
-            let repair_name = match &catalog_track.fec {
-                Some(fec) => fec.repair_track.clone(),
-                None => format!("{}/repair", track_ref.name),
+            let repair = if let Some(fec) = &catalog_track.fec {
+                let repair_track = catalog
+                    .tracks
+                    .iter()
+                    .find(|candidate| candidate.name == fec.repair_track)
+                    .expect("Root::validate resolved fec.repairTrack");
+                let priority = repair_track
+                    .priority
+                    .expect("Root::validate requires repair priority");
+                let mut repair_writer =
+                    tracks_writer.create(&fec.repair_track).ok_or_else(|| {
+                        anyhow::anyhow!(
+                        "TracksWriter::create returned None for `{}` (broadcast already closed?)",
+                        fec.repair_track
+                    )
+                    })?;
+                repair_writer.set_history_window(history_window)?;
+                let repair_subgroups = repair_writer
+                    .subgroups()
+                    .with_context(|| format!("track `{}`: subgroups() failed", fec.repair_track))?;
+                Some(RepairSink {
+                    sink: repair_subgroups,
+                    priority,
+                    current_group: None,
+                    current_group_id: None,
+                })
+            } else {
+                None
             };
-            let mut repair_writer = tracks_writer.create(&repair_name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "TracksWriter::create returned None for `{}` (broadcast already closed?)",
-                    repair_name
-                )
-            })?;
-            repair_writer.set_history_window(history_window)?;
-            let repair_subgroups = repair_writer
-                .subgroups()
-                .with_context(|| format!("track `{repair_name}`: subgroups() failed"))?;
 
             map.insert(
                 track_ref.packet_id,
@@ -326,11 +320,7 @@ fn build_state_map(
                     repair_group_depth,
                     presentation_epoch.clone(),
                     subgroups,
-                    Some(RepairSink {
-                        sink: repair_subgroups,
-                        current_group: None,
-                        current_group_id: None,
-                    }),
+                    repair,
                 ),
             );
         }
@@ -407,16 +397,17 @@ fn publish_catalog_track(
 /// Check that the catalog's embedded namespace (if any) matches the
 /// broadcast name from the `--name` CLI flag.
 ///
-/// Catches a class of publisher misconfigurations where the catalog's
-/// `commonTrackFields.namespace` disagrees with the broadcast name the
-/// relay is announcing. If the common namespace is `None`, the
-/// publisher is the source of truth and any name is acceptable.
+/// Catches publisher misconfiguration where a track namespace disagrees with
+/// the broadcast name announced to the relay.
 fn check_namespace_consistency(catalog: &Root, name: &str) -> Result<()> {
-    if let Some(ns) = &catalog.common_track_fields.namespace {
-        if ns != name {
+    for track in &catalog.tracks {
+        if let Some(ns) = &track.namespace {
+            if ns == name {
+                continue;
+            }
             bail!(
-                "catalog namespace `{ns}` disagrees with broadcast --name `{name}`; \
-                 either align commonTrackFields.namespace with --name or omit it from the catalog"
+                "catalog track `{}` namespace `{ns}` disagrees with broadcast --name `{name}`",
+                track.name
             );
         }
     }
@@ -495,23 +486,14 @@ fn build_datagram_state(
         bail!("datagram router supports exactly one packaging=datagram track");
     }
 
-    // Config-or-throw: the datagram ring retains up to subgroupHistoryGroups
-    // payloads for a lagging subscriber. There is no silent unbounded — or
-    // silently lossy — default: shred-style bursts land faster than a reader
-    // wakes, so the window must be an explicit catalog decision.
-    let multicast = catalog.multicast.as_ref().ok_or_else(|| {
+    // The datagram ring retains a fixed number of payloads for lagging
+    // subscribers. Shred-style bursts land faster than a reader wakes, so the
+    // runtime policy must stay explicit and bounded even though the canonical
+    // MSF catalog does not carry a retention field.
+    let _multicast = catalog.multicast.as_ref().ok_or_else(|| {
         anyhow::anyhow!("catalog has no `multicast` extension — required for datagram publishing")
     })?;
-    let history_window_raw = multicast.subgroup_history_groups.ok_or_else(|| {
-        anyhow::anyhow!(
-            "catalog multicast.subgroupHistoryGroups is required for datagram publishing \
-             (config-or-throw): it bounds how many recent datagrams are retained"
-        )
-    })?;
-    // NonZeroU64 carries the ">= 1" invariant into TrackWriter::set_history_window.
-    let history_window = NonZeroU64::new(history_window_raw).ok_or_else(|| {
-        anyhow::anyhow!("multicast.subgroupHistoryGroups must be >= 1 (got {history_window_raw})")
-    })?;
+    let history_window = PUBLISHER_HISTORY_WINDOW;
 
     let mut track_writer = tracks_writer.create(&track.name).ok_or_else(|| {
         anyhow::anyhow!(
@@ -529,7 +511,7 @@ fn build_datagram_state(
         .datagrams()
         .with_context(|| format!("track `{}`: datagrams() failed", track.name))?;
 
-    // Datagram source objects publish at priority 0, matching MMTP source tracks.
+    // Datagram source objects retain their existing priority-0 policy.
     Ok(DatagramState::new(track.name.clone(), 0, datagrams))
 }
 
@@ -625,9 +607,7 @@ mod tests {
     use crate::mmtp_parse::{MfuIdentity, PacketRouting};
     use mmt_core::header::{FragmentType, PacketType};
     use moq_catalog::multicast::{MulticastConfig, MulticastEndpoint, MulticastTrackRef};
-    use moq_catalog::{
-        CommonTrackFields, FecAlgorithm, FecDescriptor, MmtpMode, SelectionParam, Track,
-    };
+    use moq_catalog::{FecAlgorithm, FecDescriptor, MmtpMode, Track};
     use moq_transport::serve::{TrackReaderMode, Tracks};
 
     fn ns() -> TrackNamespace {
@@ -644,9 +624,8 @@ mod tests {
             name: name.into(),
             packaging,
             mmtp_mode,
-            timescale: Some(65_536),
-            group_duration_ticks: Some(65_536),
-            selection_params: SelectionParam::default(),
+            timescale: mmtp_mode.map(|_| 90_000),
+            group_duration_ms: mmtp_mode.map(|_| 1_000),
             ..Default::default()
         }
     }
@@ -654,10 +633,9 @@ mod tests {
     fn catalog_with(tracks: Vec<Track>, multicast: Option<MulticastConfig>) -> Root {
         Root {
             version: 1,
-            streaming_format: 1,
+            streaming_format: "mmtp".into(),
             streaming_format_version: "0.2".into(),
-            streaming_delta_updates: true,
-            common_track_fields: CommonTrackFields::default(),
+            supports_delta_updates: Some(true),
             tracks,
             multicast,
         }
@@ -677,7 +655,6 @@ mod tests {
                 })
                 .collect(),
             bandwidth: None,
-            network_source: None,
         }
     }
 
@@ -723,7 +700,6 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1), ("a", 1)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -741,7 +717,6 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("does-not-exist", 1)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -753,24 +728,17 @@ mod tests {
     }
 
     #[test]
-    fn build_state_map_errors_when_subgroup_history_window_absent() {
-        // config-or-throw: MMTP publishing requires multicast.subgroupHistoryGroups.
-        // Mapping B opens many subgroups per group; there is no silent unbounded
-        // default.
+    fn build_state_map_uses_fixed_runtime_history() {
         let cat = catalog_with(
             vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
-                subgroup_history_groups: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
-        let err = expect_err(build_state_map(&mut tw, &cat));
-        assert!(
-            err.to_string().contains("subgroupHistoryGroups"),
-            "got: {err}"
-        );
+        let map = build_state_map(&mut tw, &cat).expect("schema catalog uses runtime history");
+        assert!(map.contains_key(&1));
     }
 
     #[test]
@@ -782,7 +750,6 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -804,7 +771,6 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -822,7 +788,6 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: None,
                 network_source: None,
-                subgroup_history_groups: Some(4),
             }),
         );
         let (mut tracks, _requests, mut readers) = Tracks::new(ns()).produce();
@@ -836,10 +801,8 @@ mod tests {
             panic!("datagram track must resolve to TrackReaderMode::Datagrams");
         };
 
-        // End-to-end bound check: the catalog window (4) is the ring depth.
-        // Ten writes through the real DatagramState → a stalled reader
-        // recovers exactly the newest four, in order, and the transport
-        // reports the six superseded.
+        // The schema no longer carries deployment retention policy; the runtime
+        // default is large enough to retain this ten-datagram burst.
         for value in 0..10u8 {
             state.handle(Bytes::from(vec![value; 8])).unwrap();
         }
@@ -849,40 +812,36 @@ mod tests {
         while let Some(datagram) = datagrams.read().await.unwrap() {
             got.push(datagram.group_id);
         }
-        assert_eq!(got, vec![6, 7, 8, 9], "newest `window` datagrams, in order");
-        assert_eq!(datagrams.dropped(), 6);
+        assert_eq!(got, (0..10).collect::<Vec<_>>());
+        assert_eq!(datagrams.dropped(), 0);
     }
 
     #[tokio::test]
-    async fn datagram_router_requires_catalog_history_window() {
-        // Config-or-throw: a datagram catalog without a multicast window is a
-        // startup error, not a silent depth-1 slot (which drops most of every
-        // burst — the F6b silent-ignore this test pins against regression).
+    async fn datagram_router_requires_multicast_config() {
+        // Datagram publishing is only valid for a multicast catalog. The
+        // retention depth itself is fixed runtime policy, not catalog data.
         let cat = catalog_with(vec![track("shreds", Some(TrackPackaging::Datagram))], None);
         let (mut tracks, _requests, _readers) = Tracks::new(ns()).produce();
 
         let err = match build_datagram_state(&mut tracks, &cat) {
-            Ok(_) => panic!("expected config-or-throw error for missing multicast window"),
+            Ok(_) => panic!("expected startup error for missing multicast config"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("multicast"), "got: {err}");
     }
 
     #[test]
-    fn publish_catalog_track_registers_both_catalog_track_names() {
+    fn publish_catalog_track_registers_canonical_and_compatibility_names() {
         // T2: on startup, the publisher MUST post the full catalog JSON as a
         // single object on group 0 at control priority 32, under all catalog track
-        // names: `catalog` (canonical/REQUIRED per draft-ietf-moq-msf-00 §5.2;
-        // what Shaka MSF subscribes to) and `.catalog` (legacy WARP-lineage
-        // alias for non-MSF consumers: moq-pub, moq-sub, gst-moq-pub). This test
-        // pins both registrations; the byte-for-byte write contract is covered
-        // in T9 smoke.
+        // names: `catalog` is canonical, while `.catalog` serves legacy
+        // WARP-lineage consumers and `catalog.json` satisfies the relay's first
+        // catalog probe. The byte-for-byte write contract is covered in T9 smoke.
         let cat = catalog_with(
             vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let catalog_bytes = serde_json::to_vec(&cat).unwrap();
@@ -893,23 +852,24 @@ mod tests {
         let _retained = publish_catalog_track(&mut tw, &catalog_bytes)
             .expect("publish_catalog_track returns Ok");
 
-        for name in [".catalog", "catalog", "catalog.json"] {
-            let reader = tr
-                .get_track_reader(&ns(), name)
-                .unwrap_or_else(|| panic!("`{name}` track is registered on the broadcast"));
-            assert_eq!(reader.name, name.into());
-            assert!(!reader.is_closed(), "`{name}` track is alive");
-        }
+        let reader = tr
+            .get_track_reader(&ns(), "catalog")
+            .expect("canonical catalog track is registered");
+        assert!(!reader.is_closed());
+        assert!(tr.get_track_reader(&ns(), ".catalog").is_some());
+        assert!(tr.get_track_reader(&ns(), "catalog.json").is_some());
     }
 
     #[test]
     fn build_state_map_happy_path_with_two_tracks() {
         let cat = catalog_with(
-            vec![track("v", Some(TrackPackaging::Mmtp)), track("a", None)],
+            vec![
+                track("v", Some(TrackPackaging::Mmtp)),
+                track("a", Some(TrackPackaging::Mmtp)),
+            ],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17), ("a", 18)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -919,12 +879,11 @@ mod tests {
         assert_eq!(v.name, "v");
         assert_eq!(v.priority, SOURCE_PRIORITY);
         assert!(v.last_seen_mpu_seq.is_none());
-        // T3: every source track gets an auto-created /repair sibling.
-        assert!(v.repair.is_some(), "track `v` must have a repair sibling");
+        assert!(v.repair.is_none(), "tracks without fec have no repair sink");
         let a = map.get(&18).expect("packet_id 18 present");
         assert_eq!(a.name, "a");
         assert_eq!(a.priority, SOURCE_PRIORITY);
-        assert!(a.repair.is_some(), "track `a` must have a repair sibling");
+        assert!(a.repair.is_none(), "tracks without fec have no repair sink");
     }
 
     #[test]
@@ -937,7 +896,6 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17), ("v/repair", 18)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -960,13 +918,15 @@ mod tests {
             symbol_size: 1312,
             interleave_depth_ms: None,
             repair_track: "v/fec-custom".into(),
+            mode: None,
         });
+        let mut repair = track("v/fec-custom", Some(TrackPackaging::FecRepair));
+        repair.priority = Some(240);
         let cat = catalog_with(
-            vec![v],
+            vec![v, repair],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();
@@ -986,23 +946,17 @@ mod tests {
     }
 
     #[test]
-    fn build_state_map_falls_back_to_repair_convention_without_fec() {
-        // No `fec` descriptor: the repair sibling keeps the `<source>/repair`
-        // convention name (preserves existing behavior; FEC delivery unchanged).
+    fn build_state_map_does_not_invent_repair_track_without_fec() {
         let cat = catalog_with(
             vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();
         let _map = build_state_map(&mut tw, &cat).unwrap();
-        assert!(
-            tr.get_track_reader(&ns(), "v/repair").is_some(),
-            "without fec, the repair sibling uses the `<source>/repair` convention"
-        );
+        assert!(tr.get_track_reader(&ns(), "v/repair").is_none());
     }
 
     #[tokio::test]
@@ -1015,7 +969,6 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -1054,7 +1007,6 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tracks, _requests, mut readers) = Tracks::new(ns()).produce();
@@ -1133,7 +1085,7 @@ mod tests {
     fn check_namespace_consistency_passes_when_common_namespace_matches() {
         // commonTrackFields.namespace = "bbb" matches --name=bbb → OK.
         let mut cat = catalog_with(vec![track("v", Some(TrackPackaging::Mmtp))], None);
-        cat.common_track_fields.namespace = Some("bbb".into());
+        cat.tracks[0].namespace = Some("bbb".into());
         check_namespace_consistency(&cat, "bbb").expect("matching namespace is OK");
     }
 
@@ -1150,7 +1102,7 @@ mod tests {
         // Catches publisher misconfiguration where the broadcast name
         // and the embedded catalog namespace disagree.
         let mut cat = catalog_with(vec![track("v", Some(TrackPackaging::Mmtp))], None);
-        cat.common_track_fields.namespace = Some("foo".into());
+        cat.tracks[0].namespace = Some("foo".into());
         let err = match check_namespace_consistency(&cat, "bar") {
             Err(e) => e,
             Ok(()) => panic!("expected Err on mismatched namespace"),
@@ -1162,15 +1114,24 @@ mod tests {
     }
 
     #[test]
-    fn build_state_map_registers_repair_tracks_on_broadcast() {
-        // Pin the naming convention: source `v` → repair track named
-        // `v/repair`, reachable via TracksReader.get_track_reader.
+    fn build_state_map_registers_declared_repair_tracks_on_broadcast() {
+        let mut source = track("v", Some(TrackPackaging::Mmtp));
+        source.fec = Some(FecDescriptor {
+            algorithm: FecAlgorithm::RaptorQ,
+            source_symbols: 32,
+            repair_symbols: 8,
+            symbol_size: 1312,
+            interleave_depth_ms: None,
+            repair_track: "v/repair".into(),
+            mode: None,
+        });
+        let mut repair = track("v/repair", Some(TrackPackaging::FecRepair));
+        repair.priority = Some(240);
         let cat = catalog_with(
-            vec![track("v", Some(TrackPackaging::Mmtp))],
+            vec![source, repair],
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
-                subgroup_history_groups: Some(8),
             }),
         );
         let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();

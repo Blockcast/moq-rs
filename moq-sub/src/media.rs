@@ -46,13 +46,11 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let catalog = if self.request_catalog {
-            // The catalog track has no standardized name, but
-            // both moq-pub of moq-rs and gst-moq-pub uses ".catalog".
-            let buf = self.download_first_object(".catalog", "catalog").await?;
+            let buf = self.download_first_object("catalog", "catalog").await?;
             let s = std::str::from_utf8(&buf)?;
             let c: moq_catalog::Root = serde_json::from_str(s)?;
             info!("catalog: {c:#?}");
-            anyhow::ensure!(c.version == 1, "Unknown catalog version");
+            validate_catalog(&c)?;
             Some(c)
         } else {
             None
@@ -211,6 +209,16 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
     }
 }
 
+fn validate_catalog(catalog: &moq_catalog::Root) -> anyhow::Result<()> {
+    anyhow::ensure!(catalog.version == 1, "unknown catalog version");
+    if catalog.streaming_format == "mmtp" {
+        catalog
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid catalog: {error}"))?;
+    }
+    Ok(())
+}
+
 // Read a full MP4 atom into a vector.
 async fn read_atom<R: AsyncReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Vec<u8>> {
     // Read the 8 bytes for the size + type
@@ -250,4 +258,30 @@ async fn read_atom<R: AsyncReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Ve
     let _read_bytes = limit.read_to_end(&mut raw).await?;
 
     Ok(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cmaf_catalog(version: u16) -> moq_catalog::Root {
+        moq_catalog::Root {
+            version,
+            streaming_format: "cmaf".into(),
+            streaming_format_version: "1".into(),
+            supports_delta_updates: None,
+            tracks: vec![moq_catalog::Track {
+                name: "video".into(),
+                packaging: Some(moq_catalog::TrackPackaging::Cmaf),
+                ..Default::default()
+            }],
+            multicast: None,
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_version_for_non_mmtp_catalog() {
+        assert!(validate_catalog(&cmaf_catalog(2)).is_err());
+        assert!(validate_catalog(&cmaf_catalog(1)).is_ok());
+    }
 }
