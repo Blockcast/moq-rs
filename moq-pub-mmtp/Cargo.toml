@@ -15,6 +15,14 @@ license = "MIT OR Apache-2.0"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Off by default. Compiles the on-demand pprof CPU-profiling endpoint
+# (src/profiling.rs), which is ADDITIONALLY runtime-gated by the
+# MOQ_PUB_PROFILE_ADDR env var. With the feature off, `cargo build --release`
+# never compiles pprof/tiny_http and the shipped binary is byte-for-byte
+# unchanged.
+profiling = ["dep:pprof", "dep:tiny_http"]
+
 [dependencies]
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.9" }
 moq-transport = { path = "../moq-transport", version = "0.15" }
@@ -38,6 +46,15 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { version = "1", features = ["backtrace"] }
 serde_json = "1"
+
+# --- feature "profiling" only ---
+# On-demand CPU profiler: SIGPROF/ITIMER_PROF userspace sampling (no
+# CAP_SYS_ADMIN, works under baseline PodSecurity). DWARF from
+# [profile.release] debug=true symbolizes frames without frame pointers.
+pprof = { version = "0.15", features = ["flamegraph", "protobuf-codec"], optional = true }
+# Tiny blocking HTTP server on its own std thread — cannot perturb the tokio
+# hot path and answers even when the runtime is CPU-saturated.
+tiny_http = { version = "0.12", optional = true }
 
 # Run the parity-vector example test modules under `cargo test` (CI). Without
 # `test = true`, the `#[test]` fns in these examples are never compiled or run.
