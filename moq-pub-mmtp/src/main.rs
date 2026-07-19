@@ -162,6 +162,12 @@ fn build_state_map(
                         track_ref.name
                     )
                 })?;
+            if timescale == 0 {
+                bail!(
+                    "catalog track `{}` has invalid effective timescale 0; expected > 0",
+                    track_ref.name
+                );
+            }
             let group_duration_ms = catalog_track
                 .group_duration_ms
                 .or(catalog.common_track_fields.group_duration_ms);
@@ -175,6 +181,12 @@ fn build_state_map(
                         track_ref.name
                     )
                 })?;
+            if group_duration_ticks == 0 {
+                bail!(
+                    "catalog track `{}` has invalid effective group duration 0 ticks; expected > 0",
+                    track_ref.name
+                );
+            }
             let repair_group_depth = catalog_track
                 .fec
                 .as_ref()
@@ -695,6 +707,48 @@ mod tests {
         let err = expect_err(build_state_map(&mut tw, &cat));
         assert!(
             err.to_string().contains("subgroupHistoryGroups"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_state_map_rejects_zero_timescale() {
+        let mut source = track("v", Some(TrackPackaging::Mmtp));
+        source.timescale = Some(0);
+        let cat = catalog_with(
+            vec![source],
+            Some(MulticastConfig {
+                endpoints: Some(vec![endpoint(vec![("v", 1)])]),
+                network_source: None,
+                subgroup_history_groups: Some(8),
+            }),
+        );
+        let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
+        let err = expect_err(build_state_map(&mut tw, &cat));
+        assert!(
+            err.to_string().contains("effective timescale 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_state_map_rejects_zero_effective_group_duration() {
+        let mut source = track("v", Some(TrackPackaging::Mmtp));
+        source.group_duration_ticks = None;
+        source.group_duration_ms = Some(1);
+        source.timescale = Some(1);
+        let cat = catalog_with(
+            vec![source],
+            Some(MulticastConfig {
+                endpoints: Some(vec![endpoint(vec![("v", 1)])]),
+                network_source: None,
+                subgroup_history_groups: Some(8),
+            }),
+        );
+        let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
+        let err = expect_err(build_state_map(&mut tw, &cat));
+        assert!(
+            err.to_string().contains("effective group duration 0 ticks"),
             "got: {err}"
         );
     }

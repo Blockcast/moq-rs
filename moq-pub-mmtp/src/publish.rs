@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_with_high_mpu_sequence_resets_to_formula_epoch_group() {
+    fn publisher_restart_with_high_mpu_sequence_starts_formula_at_zero() {
         let mut map = make_state_map(1, SOURCE_PRIORITY);
         let mut routing = mpu(1, 90_000, FragmentType::Init);
         routing.timestamp = 0;
