@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod draft19;
 mod error;
 mod pending_requests;
 mod publish_namespace;
@@ -17,6 +18,7 @@ mod subscriber;
 mod track_status_requested;
 mod writer;
 
+pub use draft19::*;
 pub use error::*;
 pub(crate) use pending_requests::{PendingRequest, PendingRequests, PendingResponse};
 pub use publish_namespace::*;

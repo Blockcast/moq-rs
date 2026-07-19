@@ -13,6 +13,7 @@ mod string;
 mod track_namespace;
 mod tuple;
 mod varint;
+mod vi64;
 
 pub use bounded_string::*;
 pub use decode::*;
@@ -23,3 +24,4 @@ pub use location::*;
 pub use track_namespace::*;
 pub use tuple::*;
 pub use varint::*;
+pub use vi64::*;

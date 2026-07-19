@@ -89,4 +89,13 @@ impl Writer {
 
         Ok(())
     }
+
+    pub fn finish(&mut self) -> Result<(), SessionError> {
+        self.stream.finish()?;
+        Ok(())
+    }
+
+    pub fn reset(&mut self, code: u32) {
+        self.stream.reset(code);
+    }
 }
