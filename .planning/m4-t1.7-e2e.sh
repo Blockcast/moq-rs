@@ -15,12 +15,25 @@
 #   PORT         relay quic+web bind port (default 4443)
 #   CTRL_PORT    control/static server port (default 8097)
 #   UDP_PORT     publisher UDP listener port (default 5004)
+#   AUDIO_CODEC  optional audio codec (currently opus)
+#   HARNESS      Shaka page (Opus: demo/play-mmtp-load.html)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 MOQ_ROOT="$(pwd)"
 SHAKA_ROOT="${SHAKA_ROOT:-$MOQ_ROOT/../shaka-player}"
-CAPTURE="${CAPTURE:-$MOQ_ROOT/.planning/m4-t1.7-e2e/moq_mmt_capture_full.json}"
+AUDIO_CODEC="${AUDIO_CODEC:-}"
+if [[ "$AUDIO_CODEC" == "opus" ]]; then
+  DEFAULT_CAPTURE="$MOQ_ROOT/.planning/m4-t1.7-e2e/moq_mmt_capture_opus.json"
+else
+  DEFAULT_CAPTURE="$MOQ_ROOT/.planning/m4-t1.7-e2e/moq_mmt_capture_full.json"
+fi
+if [[ -n "$AUDIO_CODEC" && "$AUDIO_CODEC" != "opus" ]]; then
+  echo "unsupported AUDIO_CODEC=$AUDIO_CODEC (expected opus or empty)"
+  exit 1
+fi
+CAPTURE="${CAPTURE:-$DEFAULT_CAPTURE}"
+HARNESS="${HARNESS:-demo/observe-mmtp.html}"
 PORT="${PORT:-4443}"
 CTRL_PORT="${CTRL_PORT:-8097}"
 UDP_PORT="${UDP_PORT:-5004}"
@@ -44,15 +57,24 @@ echo "[2/8] Ensure dev cert + compute fingerprint locally (no TLS connection)...
 openssl x509 -in dev/localhost.crt -outform DER | sha256sum | awk '{print $1}' > "$FP_FILE"
 echo "      fingerprint: $(cat "$FP_FILE")"
 
-echo "[3/8] Write catalog (track v, packetId 1)..."
+echo "[3/8] Write catalog (video packetId 1${AUDIO_CODEC:+, audio packetId 2 codec $AUDIO_CODEC})..."
+if [[ -n "$AUDIO_CODEC" ]]; then
+  VIDEO_FRAMERATE=15
+  AUDIO_TRACK=', {"name": "audio", "packaging": "mmtp", "mmtpMode": "mpu", "selectionParams": {"codec": "'"$AUDIO_CODEC"'", "samplerate": 48000, "channelConfig": "2"}, "bitrate": 96000}'
+  MULTICAST_AUDIO=', {"name": "audio", "packetId": 2}'
+else
+  VIDEO_FRAMERATE=30
+  AUDIO_TRACK=''
+  MULTICAST_AUDIO=''
+fi
 cat > "$WORK/catalog.json" <<EOF
 {
   "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2", "supportsDeltaUpdates": true,
   "commonTrackFields": {"namespace": "$NAME"},
-  "tracks": [{"name": "v", "framerate": 30, "packaging": "mmtp", "selectionParams": {"codec": "avc1.synth"}}],
+  "tracks": [{"name": "v", "framerate": $VIDEO_FRAMERATE, "packaging": "mmtp", "mmtpMode": "mpu", "selectionParams": {"codec": "avc1.42c01e"}}$AUDIO_TRACK],
   "multicast": {
     "subgroupHistoryGroups": 8,
-    "endpoints": [{"groupAddress": "239.1.1.1", "port": 5000, "tracks": [{"name": "v", "packetId": 1}]}]
+    "endpoints": [{"groupAddress": "239.1.1.1", "port": 5000, "tracks": [{"name": "v", "packetId": 1}$MULTICAST_AUDIO]}]
   }
 }
 EOF
@@ -90,9 +112,18 @@ E2E_REPO_ROOT="$SHAKA_ROOT" E2E_CAPTURE="$CAPTURE" E2E_RESULT="$RESULT" \
 PIDS+=($!); sleep 1
 
 echo "[7/8] Launch headless Chrome at the harness page ..."
-google-chrome --headless=new --no-sandbox --disable-gpu --no-first-run \
+QUERY=""
+BUILD_FRAGMENT=""
+if [[ -n "$AUDIO_CODEC" ]]; then
+  QUERY="?expectedAudioCodec=$AUDIO_CODEC&requireAudioTrack=1"
+fi
+if [[ "$HARNESS" == "demo/play-mmtp-load.html" ]]; then
+  BUILD_FRAGMENT="#build=debug_compiled"
+fi
+TMPDIR=/tmp google-chrome --headless=new --no-sandbox --disable-gpu --no-first-run \
+  --webtransport-developer-mode \
   --user-data-dir="$WORK/chrome" \
-  "http://127.0.0.1:$CTRL_PORT/demo/observe-mmtp.html" \
+  "http://127.0.0.1:$CTRL_PORT/$HARNESS$QUERY$BUILD_FRAGMENT" \
   > "$WORK/chrome.log" 2>&1 &
 CHROME_PID=$!
 
@@ -126,6 +157,29 @@ python3 - "$RESULT" <<'PY'
 import json,sys
 r=json.load(open(sys.argv[1]))
 status=r.get("status"); err=r.get("error"); perr=r.get("parserError")
+expected=r.get("expectedAudioCodec")
+if expected:
+    print("  expected codec:", expected)
+    print("  active variant:", r.get("activeVariant"))
+    print("  catalog audio :", r.get("catalogAudio"))
+    print("  codec seen    :", r.get("expectedCodecSeen"))
+    print("  metadata used :", r.get("catalogAudioMetadataUsed"))
+    print("  buffered (s)  :", r.get("bufferedSeconds"))
+    print("  currentTime   :", r.get("currentTime"))
+    fails=[]
+    if status!="done": fails.append(f"status={status!r} (expected 'done')")
+    if err: fails.append("harness error present")
+    if not r.get("hasAudioTrack"): fails.append("no active audio track")
+    if not r.get("expectedCodecSeen"): fails.append(f"active audio codec is not {expected}")
+    if not r.get("catalogAudioMetadataUsed"): fails.append("active audio metadata differs from catalog")
+    if (r.get("bufferedSeconds") or 0) <= 0: fails.append("no media buffered")
+    if (r.get("currentTime") or 0) <= 0: fails.append("playback clock did not advance")
+    if fails:
+        print("\n  E2E ASSERT: FAIL")
+        for f in fails: print("    -", f)
+        sys.exit(1)
+    print("\n  E2E ASSERT: PASS — live MMTP audio playback used catalog codec/timing metadata.")
+    sys.exit(0)
 obs=r.get("observe") or {}
 seg=obs.get("segments",0); initb=obs.get("initBytes",0)
 mono=obs.get("monotonic",False); first=obs.get("firstStart")
