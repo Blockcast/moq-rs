@@ -19,6 +19,8 @@ mod cli;
 mod datagram;
 mod framing;
 mod mmtp_parse;
+#[cfg(feature = "profiling")]
+mod profiling;
 mod publish;
 mod udp;
 
@@ -35,6 +37,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
         )
         .init();
+
+    // Optional on-demand CPU profiler (feature `profiling` + MOQ_PUB_PROFILE_ADDR).
+    // No-op unless both the compile feature and the env var are set.
+    #[cfg(feature = "profiling")]
+    profiling::spawn_if_enabled();
 
     let args = Args::parse();
 
@@ -89,10 +96,65 @@ async fn main() -> Result<()> {
         .await
         .context("failed to create MoQ Transport publisher")?;
 
-    tokio::select! {
-        res = session.run() => res.context("session error")?,
-        res = publisher.publish_namespace(tracks_reader) => res.context("publisher error")?,
-        res = run_publisher(args.mmtp_input, args.mmtp_udp_bind, args.mmtp_udp_source, args.mmtp_udp_iface, router, tracks_writer) => res.context("publisher loop error")?,
+    // Run the three long-lived halves on SEPARATE tokio tasks rather than as
+    // three branches of one `select!`. A single `select!` is one future = one
+    // task, and tokio never parallelizes one task across workers — so ingest
+    // (run_publisher: recv_from -> route -> create_group/put_object) and egress
+    // (publisher.publish_namespace -> serve_subgroup: open_uni -> encode ->
+    // quinn write) serialize on ONE core (the ~0.97-core, 90%-userspace ceiling
+    // that gates the publish-latency floor; raising the CPU limit only removed
+    // CFS throttling because the work was one task, not because it needed more
+    // workers). Spawning lets the multi-thread runtime place ingest and egress
+    // on different workers. They already communicate through the Arc-backed
+    // `watch::State` behind SubgroupsWriter/SubgroupsReader, so the wire output
+    // (objects, groups, subgroups, framing, ordering) is byte-identical — the
+    // relay is unaffected. run_publisher stays a SINGLE task, so the monotonic
+    // group_id assignment (datagram.rs) remains a single ordered point.
+    //
+    // Teardown is preserved: race the three JoinHandles and propagate the first
+    // to finish (Ok or Err) exactly as the old `select!` did, so the first error
+    // still returns immediately and the external watchdog respawns us. The other
+    // tasks are aborted (the process is exiting regardless).
+    let mmtp_input = args.mmtp_input;
+    let udp_bind = args.mmtp_udp_bind;
+    let udp_source = args.mmtp_udp_source;
+    let udp_iface = args.mmtp_udp_iface;
+
+    let mut session_task =
+        tokio::spawn(async move { session.run().await.context("session error") });
+    let mut publish_namespace_task = tokio::spawn(async move {
+        publisher
+            .publish_namespace(tracks_reader)
+            .await
+            .context("publisher error")
+    });
+    let mut publish_task = tokio::spawn(async move {
+        run_publisher(
+            mmtp_input,
+            udp_bind,
+            udp_source,
+            udp_iface,
+            router,
+            tracks_writer,
+        )
+        .await
+        .context("publisher loop error")
+    });
+
+    let first = tokio::select! {
+        r = &mut session_task => r,
+        r = &mut publish_namespace_task => r,
+        r = &mut publish_task => r,
+    };
+    session_task.abort();
+    publish_namespace_task.abort();
+    publish_task.abort();
+
+    // Unwrap the JoinHandle layer: a JoinError (panic/abort of the winning task)
+    // is itself fatal and must drive respawn, same as any branch error would.
+    match first {
+        Ok(inner) => inner?,
+        Err(join_err) => bail!("publisher task terminated abnormally: {join_err}"),
     }
 
     Ok(())
