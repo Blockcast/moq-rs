@@ -45,6 +45,11 @@ struct SendState {
 struct RecvState {
     first: u64,
     low_water: u64,
+    /// Out-of-order request IDs received at or above `low_water` but not yet
+    /// contiguous with it. This is a sliding reassembly window, not an unbounded
+    /// set: `validate_incoming` rejects any `id >= our_max`, so every stored ID
+    /// lies in `[low_water, our_max)` and the set size is bounded by that window
+    /// (`our_max - low_water`, i.e. the peer's outstanding request lookahead).
     received_above_low_water: HashSet<u64>,
     our_max: u64,
 }
