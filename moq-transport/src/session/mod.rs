@@ -12,7 +12,9 @@ mod publisher;
 mod reader;
 mod request_id;
 mod subscribe;
+mod subscribe_namespace;
 mod subscribed;
+mod subscribed_namespace;
 mod subscriber;
 mod track_status_requested;
 mod writer;
@@ -28,7 +30,9 @@ pub use published_namespace::*;
 pub use publisher::*;
 pub use request_id::{RequestId, RequestIdAllocation};
 pub use subscribe::*;
+pub use subscribe_namespace::*;
 pub use subscribed::*;
+pub use subscribed_namespace::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
 
@@ -45,6 +49,18 @@ use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
+
+fn add_mlog_event<F>(mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, make_event: F)
+where
+    F: FnOnce(f64) -> mlog::Event,
+{
+    if let Some(mlog) = mlog {
+        if let Ok(mut mlog) = mlog.lock() {
+            let event = make_event(mlog.elapsed_ms());
+            let _ = mlog.add_event(event);
+        }
+    }
+}
 
 /// The transport protocol negotiated for this MoQT connection.
 ///
@@ -66,6 +82,16 @@ pub enum Transport {
 }
 
 const DEFAULT_MAX_REQUEST_ID: u64 = 100;
+
+/// Maximum number of concurrently accepted inbound SUBSCRIBE_NAMESPACE request
+/// streams. Backpressures `accept_bi()` so a peer cannot exhaust memory by opening
+/// unbounded bidirectional streams (draft-16 §3.3/§9.25).
+const MAX_CONCURRENT_SUBSCRIBE_NAMESPACE_STREAMS: usize = 256;
+
+/// Maximum time to wait for the SUBSCRIBE_NAMESPACE header on a freshly accepted
+/// bidirectional stream before treating the peer as misbehaving. Prevents idle or
+/// malicious streams from occupying an accept slot indefinitely.
+const SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Session-level protocol limits advertised during setup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -96,6 +122,9 @@ pub struct Session {
 
     /// Queue used by Publisher and Subscriber for sending Control Messages
     outgoing: Queue<Message>,
+
+    /// Queue used by Subscriber to request opening SUBSCRIBE_NAMESPACE bidi streams.
+    subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
 
     /// Session-level request ID manager.
     /// Publisher and Subscriber share one outbound request ID sequence.
@@ -462,6 +491,7 @@ impl Session {
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
         let pending_requests = PendingRequests::default();
+        let subscribe_namespace_open = Queue::default().split();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
@@ -475,6 +505,7 @@ impl Session {
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
+            subscribe_namespace_open.0,
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
@@ -487,6 +518,7 @@ impl Session {
             publisher: publisher.clone(),
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
+            subscribe_namespace_open: subscribe_namespace_open.1,
             request_id,
             pending_requests,
             mlog: mlog_shared,
@@ -710,6 +742,8 @@ impl Session {
         tokio::select! {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_open(self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_accept(self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
@@ -762,6 +796,121 @@ impl Session {
         }
 
         Ok(())
+    }
+
+    async fn run_subscribe_namespace_open(
+        webtransport: web_transport::Session,
+        mut requests: Queue<OpenSubscribeNamespace>,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
+        let mut tasks = FuturesUnordered::new();
+        let mut requests_done = false;
+
+        loop {
+            tokio::select! {
+                request = requests.pop(), if !requests_done => {
+                    match request {
+                        Some(request) => {
+                            let webtransport = webtransport.clone();
+                            tasks.push(Self::open_subscribe_namespace(webtransport, request, mlog.clone()));
+                        }
+                        None => requests_done = true,
+                    }
+                }
+                Some(res) = tasks.next(), if !tasks.is_empty() => res?,
+                else => return Ok(()),
+            }
+        }
+    }
+
+    async fn open_subscribe_namespace(
+        webtransport: web_transport::Session,
+        request: OpenSubscribeNamespace,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
+        let (send, recv) = webtransport.open_bi().await?;
+        let mut writer = Writer::new(send);
+        let reader = Reader::new(recv);
+
+        let msg = Message::SubscribeNamespace(request.message.clone());
+        Self::log_control_message(&msg, "sent");
+        add_mlog_event(&mlog, |time| {
+            mlog::events::subscribe_namespace_created(time, 0, &request.message)
+        });
+        writer.encode(&msg).await?;
+
+        let (send, recv) = SubscribeNamespace::new(request.subscriber, request.info, writer);
+        if request.reply.send(Ok(send)).is_err() {
+            return Ok(());
+        }
+
+        recv.run(reader, mlog).await
+    }
+
+    async fn run_subscribe_namespace_accept(
+        webtransport: web_transport::Session,
+        publisher: Option<Publisher>,
+        request_id: RequestId,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
+        let mut tasks = FuturesUnordered::new();
+
+        loop {
+            tokio::select! {
+                // Only accept a new stream while below the concurrency cap; otherwise
+                // apply backpressure until an in-flight stream completes (#1).
+                stream = webtransport.accept_bi(), if tasks.len() < MAX_CONCURRENT_SUBSCRIBE_NAMESPACE_STREAMS => {
+                    let (send, recv) = stream?;
+                    let publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
+                    let request_id = request_id.clone();
+                    tasks.push(Self::accept_subscribe_namespace_stream(publisher, request_id, send, recv, mlog.clone()));
+                }
+                Some(res) = tasks.next(), if !tasks.is_empty() => res?,
+            }
+        }
+    }
+
+    async fn accept_subscribe_namespace_stream(
+        mut publisher: Publisher,
+        request_id: RequestId,
+        send: web_transport::SendStream,
+        recv: web_transport::RecvStream,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
+        let writer = Writer::new(send);
+        let mut reader = Reader::new(recv);
+        // Bound the wait for the stream's opening SUBSCRIBE_NAMESPACE header so an
+        // idle or malicious peer cannot hold an accept slot open forever (#2).
+        let msg = tokio::time::timeout(
+            SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT,
+            reader.decode::<Message>(),
+        )
+        .await
+        .map_err(|_| {
+            SessionError::ProtocolViolation(
+                "timed out waiting for SUBSCRIBE_NAMESPACE header on bidirectional stream"
+                    .to_string(),
+            )
+        })??;
+
+        let subscribe_namespace = match msg {
+            Message::SubscribeNamespace(msg) => msg,
+            other => {
+                return Err(SessionError::ProtocolViolation(format!(
+                    "bidirectional stream began with {} instead of SUBSCRIBE_NAMESPACE",
+                    other.name()
+                )))
+            }
+        };
+        let log_msg = Message::SubscribeNamespace(subscribe_namespace.clone());
+        Self::log_control_message(&log_msg, "recv");
+        add_mlog_event(&mlog, |time| {
+            mlog::events::subscribe_namespace_parsed(time, 0, &subscribe_namespace)
+        });
+
+        request_id.validate_incoming(subscribe_namespace.id)?;
+        let recv = publisher.recv_subscribe_namespace(subscribe_namespace)?;
+        recv.run(writer, reader, mlog).await
     }
 
     /// Receives inbound messages from the control stream reader/receiver.  Analyzes if the message

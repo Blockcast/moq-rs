@@ -369,17 +369,36 @@ impl Endpoint {
     }
 }
 
+/// Metadata about a connection accepted by [`Server::accept`].
+///
+/// Returned alongside the [`web_transport::Session`] so the embedder can
+/// correlate logs (via [`ConnInfo::id`]) and classify the connection interface
+/// — public client vs internal relay peer — from the peer address and TLS SNI.
+#[derive(Debug, Clone)]
+pub struct ConnInfo {
+    /// Original destination connection ID (hex), used for qlog/mlog correlation.
+    pub id: String,
+
+    /// Negotiated application transport (WebTransport or raw QUIC).
+    pub transport: Transport,
+
+    /// Peer socket address.
+    pub remote_address: net::SocketAddr,
+
+    /// TLS SNI server name sent by the peer, if any.
+    pub server_name: Option<String>,
+}
+
 pub struct Server {
     quic: quinn::Endpoint,
-    accept: FuturesUnordered<
-        BoxFuture<'static, anyhow::Result<(web_transport::Session, String, Transport)>>,
-    >,
+    accept:
+        FuturesUnordered<BoxFuture<'static, anyhow::Result<(web_transport::Session, ConnInfo)>>>,
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
 }
 
 impl Server {
-    pub async fn accept(&mut self) -> Option<(web_transport::Session, String, Transport)> {
+    pub async fn accept(&mut self) -> Option<(web_transport::Session, ConnInfo)> {
         loop {
             tokio::select! {
                 res = self.quic.accept() => {
@@ -405,7 +424,7 @@ impl Server {
         conn: quinn::Incoming,
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
-    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
+    ) -> anyhow::Result<(web_transport::Session, ConnInfo)> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
         let orig_dst_cid = conn.orig_dst_cid();
@@ -465,11 +484,16 @@ impl Server {
         // Wait for the QUIC connection to be established.
         let conn = conn.await.context("failed to establish QUIC connection")?;
 
+        // Capture the peer's socket address before `conn` is moved into the
+        // WebTransport/raw-QUIC session below. The relay uses this to classify
+        // the connection interface (public client vs internal relay peer).
+        let remote_address = conn.remote_address();
+
         tracing::debug!(
             "established QUIC connection: cid={} stable_id={} ip={} alpn={} server={}",
             connection_id_hex,
             conn.stable_id(),
-            conn.remote_address(),
+            remote_address,
             alpn,
             server_name,
         );
@@ -509,7 +533,15 @@ impl Server {
             anyhow::bail!("unsupported ALPN: {}", alpn)
         };
 
-        Ok((session.into(), connection_id_hex, transport))
+        let info = ConnInfo {
+            id: connection_id_hex,
+            transport,
+            remote_address,
+            // An empty SNI means the peer sent no server name.
+            server_name: (!server_name.is_empty()).then_some(server_name),
+        };
+
+        Ok((session.into(), info))
     }
 
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {

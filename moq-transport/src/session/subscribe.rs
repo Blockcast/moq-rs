@@ -453,6 +453,7 @@ mod tests {
         let rid = crate::session::RequestId::new(0, 100, 100, 0);
         let subscriber = crate::session::Subscriber::new(
             crate::session::Queue::default(),
+            crate::session::Queue::default(),
             None,
             rid,
             crate::session::PendingRequests::default(),
@@ -470,6 +471,7 @@ mod tests {
     async fn closed_returns_error_for_non_track_ended() {
         let rid = crate::session::RequestId::new(0, 100, 100, 0);
         let subscriber = crate::session::Subscriber::new(
+            crate::session::Queue::default(),
             crate::session::Queue::default(),
             None,
             rid,

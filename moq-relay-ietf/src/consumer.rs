@@ -12,7 +12,7 @@ use moq_transport::{
 };
 use tokio::sync::Semaphore;
 
-use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
+use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext};
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
 
@@ -22,11 +22,12 @@ pub struct Consumer {
     subscriber: Subscriber,
     locals: Locals,
     coordinator: Arc<dyn Coordinator>,
+    /// Relay-to-relay session pool, used to forward PUBLISH_NAMESPACE to peer
+    /// relays that the coordinator oracle reports as interested subscribers.
+    remotes: RemoteManager,
     forward: Option<Producer>, // Forward all announcements to this subscriber
-    /// The resolved scope identity for this session, if any.
-    /// Produced by `Coordinator::resolve_scope()` from the connection path.
-    /// Passed to coordinator register/lookup calls to isolate namespaces.
-    scope: Option<String>,
+    /// Relay-level context for this MoQT session.
+    context: SessionContext,
     publish_track_permits: Arc<Semaphore>,
 }
 
@@ -35,15 +36,17 @@ impl Consumer {
         subscriber: Subscriber,
         locals: Locals,
         coordinator: Arc<dyn Coordinator>,
+        remotes: RemoteManager,
         forward: Option<Producer>,
-        scope: Option<String>,
+        context: SessionContext,
     ) -> Self {
         Self {
             subscriber,
             locals,
             coordinator,
+            remotes,
             forward,
-            scope,
+            context,
             publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
         }
     }
@@ -104,7 +107,9 @@ impl Consumer {
         // Track active publishers - decrements when this function returns.
         let _publisher_guard = GaugeGuard::new("moq_relay_active_publishers");
 
-        let mut tasks = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<
+            futures::future::BoxFuture<'static, Result<(), anyhow::Error>>,
+        > = FuturesUnordered::new();
         let ns = published_ns.namespace.to_utf8_path();
 
         // Register namespace routing metadata locally. This does not register
@@ -113,7 +118,7 @@ impl Consumer {
         tracing::debug!(namespace = %ns, "registering namespace route source in locals");
         let (_register, mut requests) = match self
             .locals
-            .register_namespace(self.scope.as_deref(), published_ns.namespace.clone())
+            .register_namespace(self.context.scope(), published_ns.namespace.clone())
             .await
         {
             Ok(reg) => reg,
@@ -127,9 +132,14 @@ impl Consumer {
 
         // Register namespace with the coordinator so other relay nodes can route to us.
         tracing::debug!(namespace = %ns, "registering namespace with coordinator");
+        let coordinator_context = self.context.coordinator_context();
         let _namespace_registration = match self
             .coordinator
-            .register_namespace(self.scope.as_deref(), &published_ns.namespace)
+            .register_namespace(
+                self.context.scope(),
+                &published_ns.namespace,
+                &coordinator_context,
+            )
             .await
         {
             Ok(reg) => reg,
@@ -163,10 +173,74 @@ impl Consumer {
                         namespace = %namespace,
                         "forwarding PUBLISH_NAMESPACE: {:?}", forward_reader.info
                     );
-                    forward
+                    // Best-effort upstream propagation: a forwarding failure must not
+                    // tear down the local PUBLISH_NAMESPACE registration for other peers.
+                    if let Err(err) = forward
                         .publish_namespace(forward_reader)
                         .await
                         .context("failed forwarding PUBLISH_NAMESPACE")
+                    {
+                        metrics::counter!("moq_relay_announce_errors_total", "phase" => "forward")
+                            .increment(1);
+                        tracing::warn!(namespace = %namespace, error = %err, "failed forwarding PUBLISH_NAMESPACE upstream");
+                    }
+                    Ok(())
+                }
+                .boxed(),
+            );
+        }
+
+        // Fan out the PUBLISH_NAMESPACE to peer relays that the coordinator
+        // oracle reports as having matching SUBSCRIBE_NAMESPACE interest. The
+        // coordinator already excludes this relay (the caller) and the inbound
+        // source peer, so every returned relay is a distinct downstream peer and
+        // we can push to all of them without creating a forwarding loop.
+        let subscriber_relays = match self
+            .coordinator
+            .lookup_namespace_subscribers(
+                self.context.scope(),
+                &published_ns.namespace,
+                &coordinator_context,
+            )
+            .await
+        {
+            Ok(relays) => relays,
+            Err(err) => {
+                metrics::counter!("moq_relay_announce_errors_total", "phase" => "coordinator_lookup")
+                    .increment(1);
+                return Err(err.into());
+            }
+        };
+
+        for relay in subscriber_relays {
+            let remotes = self.remotes.clone();
+            // The forwarding API uses the moq-transport Tracks helper as an
+            // adapter for the outgoing publish_namespace call; it is not the
+            // relay-local registry.
+            let (_, _request, reader) = Tracks::new(published_ns.namespace.clone()).produce();
+            tasks.push(
+                async move {
+                    let namespace = reader.namespace.to_utf8_path();
+                    tracing::info!(
+                        namespace = %namespace,
+                        remote = %relay.url,
+                        "forwarding PUBLISH_NAMESPACE to peer relay"
+                    );
+                    // Best-effort fan-out: one downstream relay failing must not tear
+                    // down the PUBLISH_NAMESPACE registration for the publisher or the
+                    // other peer relays.
+                    if let Err(err) = remotes
+                        .publish_namespace(&relay, reader)
+                        .await
+                        .with_context(|| {
+                            format!("failed forwarding PUBLISH_NAMESPACE to {}", relay.url)
+                        })
+                    {
+                        metrics::counter!("moq_relay_announce_errors_total", "phase" => "peer_fanout")
+                            .increment(1);
+                        tracing::warn!(namespace = %namespace, remote = %relay.url, error = %err, "failed forwarding PUBLISH_NAMESPACE to peer relay");
+                    }
+                    Ok(())
                 }
                 .boxed(),
             );
@@ -239,7 +313,7 @@ impl Consumer {
 
         let _registration = match self
             .locals
-            .register_track(self.scope.as_deref(), reader)
+            .register_track(self.context.scope(), reader)
             .await
         {
             Ok(registration) => registration,
@@ -260,7 +334,7 @@ impl Consumer {
         let track_string = track_name.to_string();
         let _track_registration = match self
             .coordinator
-            .register_track(self.scope.as_deref(), &namespace, &track_string)
+            .register_track(self.context.scope(), &namespace, &track_string)
             .await
         {
             Ok(registration) => registration,

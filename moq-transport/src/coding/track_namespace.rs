@@ -221,6 +221,9 @@ pub enum TrackNamespaceError {
     #[error("too few fields: full track namespace requires at least 1 field")]
     TooFewFields,
 
+    #[error("namespace too large: {0} bytes exceeds maximum of {1}")]
+    NamespaceTooLarge(usize, usize),
+
     #[error("field too large: {0} bytes exceeds maximum of {1}")]
     FieldTooLarge(usize, usize),
 
@@ -272,6 +275,17 @@ impl TrackNamespace {
     /// Sum of all field lengths. Used for full-track-name limit calculation.
     pub fn namespace_byte_len(&self) -> usize {
         namespace_fields_byte_len(&self.fields)
+    }
+
+    /// Return the namespace suffix after removing `prefix`, if it matches.
+    pub fn strip_prefix(&self, prefix: &TrackNamespacePrefix) -> Option<TrackNamespacePrefix> {
+        if !prefix.is_prefix_of(self) {
+            return None;
+        }
+
+        Some(TrackNamespacePrefix {
+            fields: self.fields[prefix.fields.len()..].to_vec(),
+        })
     }
 
     fn validate_namespace_byte_len(&self) -> Result<(), DecodeError> {
@@ -327,6 +341,13 @@ impl TryFrom<Vec<TupleField>> for TrackNamespace {
 
     fn try_from(fields: Vec<TupleField>) -> Result<Self, Self::Error> {
         validate_track_namespace_fields(&fields, 1, Self::MAX_FIELDS)?;
+        let namespace_len = namespace_fields_byte_len(&fields);
+        if namespace_len > MAX_FULL_TRACK_NAME_LEN {
+            return Err(TrackNamespaceError::NamespaceTooLarge(
+                namespace_len,
+                MAX_FULL_TRACK_NAME_LEN,
+            ));
+        }
         Ok(Self { fields })
     }
 }
@@ -398,6 +419,35 @@ impl TrackNamespacePrefix {
 
     pub fn to_utf8_path(&self) -> String {
         namespace_path(&self.fields)
+    }
+
+    /// Return true when this prefix matches the beginning of `namespace`.
+    pub fn is_prefix_of(&self, namespace: &TrackNamespace) -> bool {
+        self.fields.len() <= namespace.fields.len()
+            && self
+                .fields
+                .iter()
+                .zip(namespace.fields.iter())
+                .all(|(prefix, field)| prefix == field)
+    }
+
+    /// Return true when two prefixes overlap, meaning one is a prefix of the other.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.fields
+            .iter()
+            .zip(other.fields.iter())
+            .all(|(left, right)| left == right)
+    }
+
+    /// Build a full namespace from this prefix and a suffix received in NAMESPACE.
+    pub fn join_suffix(
+        &self,
+        suffix: &TrackNamespacePrefix,
+    ) -> Result<TrackNamespace, TrackNamespaceError> {
+        let mut fields = Vec::with_capacity(self.fields.len() + suffix.fields.len());
+        fields.extend(self.fields.iter().cloned());
+        fields.extend(suffix.fields.iter().cloned());
+        TrackNamespace::try_from(fields)
     }
 }
 
@@ -718,6 +768,126 @@ mod tests {
         assert!(matches!(
             prefix.encode(&mut buf).unwrap_err(),
             EncodeError::EmptyNamespaceField
+        ));
+    }
+
+    #[test]
+    fn prefix_matches_namespace_start() {
+        let namespace = TrackNamespace::from_utf8_path("example.com/meeting=123/participant=100");
+
+        assert!(TrackNamespacePrefix::new().is_prefix_of(&namespace));
+        assert!(
+            TrackNamespacePrefix::from_utf8_path("example.com/meeting=123")
+                .is_prefix_of(&namespace)
+        );
+        assert!(
+            TrackNamespacePrefix::from_utf8_path("example.com/meeting=123/participant=100")
+                .is_prefix_of(&namespace)
+        );
+        assert!(
+            !TrackNamespacePrefix::from_utf8_path("example.com/meeting=456")
+                .is_prefix_of(&namespace)
+        );
+        assert!(!TrackNamespacePrefix::from_utf8_path(
+            "example.com/meeting=123/participant=100/video"
+        )
+        .is_prefix_of(&namespace));
+    }
+
+    #[test]
+    fn strip_prefix_returns_namespace_suffix() {
+        let namespace = TrackNamespace::from_utf8_path("example.com/meeting=123/participant=100");
+        let prefix = TrackNamespacePrefix::from_utf8_path("example.com/meeting=123");
+
+        let suffix = namespace.strip_prefix(&prefix).unwrap();
+
+        assert_eq!(suffix.to_utf8_path(), "/participant=100");
+    }
+
+    #[test]
+    fn strip_prefix_returns_empty_suffix_for_exact_match() {
+        let namespace = TrackNamespace::from_utf8_path("example.com/meeting=123");
+        let prefix = TrackNamespacePrefix::from_utf8_path("example.com/meeting=123");
+
+        let suffix = namespace.strip_prefix(&prefix).unwrap();
+
+        assert!(suffix.fields.is_empty());
+    }
+
+    #[test]
+    fn strip_prefix_rejects_non_matching_prefix() {
+        let namespace = TrackNamespace::from_utf8_path("example.com/meeting=123");
+        let prefix = TrackNamespacePrefix::from_utf8_path("example.org");
+
+        assert!(namespace.strip_prefix(&prefix).is_none());
+    }
+
+    #[test]
+    fn join_suffix_reconstructs_namespace() {
+        let prefix = TrackNamespacePrefix::from_utf8_path("example.com/meeting=123");
+        let suffix = TrackNamespacePrefix::from_utf8_path("participant=100/video");
+
+        let namespace = prefix.join_suffix(&suffix).unwrap();
+
+        assert_eq!(
+            namespace.to_utf8_path(),
+            "/example.com/meeting=123/participant=100/video"
+        );
+    }
+
+    #[test]
+    fn join_suffix_accepts_empty_suffix_when_prefix_is_full_namespace() {
+        let prefix = TrackNamespacePrefix::from_utf8_path("example.com/meeting=123");
+        let suffix = TrackNamespacePrefix::new();
+
+        let namespace = prefix.join_suffix(&suffix).unwrap();
+
+        assert_eq!(namespace.to_utf8_path(), "/example.com/meeting=123");
+    }
+
+    #[test]
+    fn join_suffix_rejects_empty_full_namespace() {
+        let prefix = TrackNamespacePrefix::new();
+        let suffix = TrackNamespacePrefix::new();
+
+        let err = prefix.join_suffix(&suffix).unwrap_err();
+
+        assert!(matches!(err, TrackNamespaceError::TooFewFields));
+    }
+
+    #[test]
+    fn prefixes_overlap_when_one_contains_the_other() {
+        let root = TrackNamespacePrefix::new();
+        let meeting = TrackNamespacePrefix::from_utf8_path("example.com/meeting=123");
+        let participant =
+            TrackNamespacePrefix::from_utf8_path("example.com/meeting=123/participant=100");
+        let other_meeting = TrackNamespacePrefix::from_utf8_path("example.com/meeting=456");
+
+        assert!(root.overlaps(&meeting));
+        assert!(meeting.overlaps(&root));
+        assert!(meeting.overlaps(&participant));
+        assert!(participant.overlaps(&meeting));
+        assert!(meeting.overlaps(&meeting));
+        assert!(!meeting.overlaps(&other_meeting));
+        assert!(!other_meeting.overlaps(&participant));
+    }
+
+    #[test]
+    fn try_from_rejects_namespace_total_over_limit() {
+        let fields = vec![
+            TupleField {
+                value: vec![b'a'; 2049],
+            },
+            TupleField {
+                value: vec![b'b'; 2048],
+            },
+        ];
+
+        let err = TrackNamespace::try_from(fields).unwrap_err();
+
+        assert!(matches!(
+            err,
+            TrackNamespaceError::NamespaceTooLarge(4097, MAX_FULL_TRACK_NAME_LEN)
         ));
     }
 

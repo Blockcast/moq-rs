@@ -10,7 +10,7 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
-    coding::{KeyValuePairs, TrackNamespace},
+    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
     mlog,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
@@ -21,7 +21,8 @@ use crate::watch::Queue;
 use super::{
     split_published_state, ObjectForwarderRecv, PendingRequest, PendingRequests, PublishNamespace,
     PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, RequestId, RequestIdAllocation,
-    Session, SessionConfig, SessionError, Subscribed, TrackStatusRequested,
+    Session, SessionConfig, SessionError, Subscribed, SubscribedNamespace, SubscribedNamespaceInfo,
+    SubscribedNamespaceRecv, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -111,6 +112,12 @@ pub struct Publisher {
     /// TRACK_STATUS requests for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_track_status_requested: Queue<TrackStatusRequested>,
 
+    /// Active inbound SUBSCRIBE_NAMESPACE prefixes, keyed by Request ID.
+    subscribed_namespace_prefixes: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
+
+    /// SUBSCRIBE_NAMESPACE requests surfaced to the application.
+    unknown_subscribed_namespace: Queue<SubscribedNamespace>,
+
     /// Queue for outbound control messages; processed by the session run_send task.
     outgoing: Queue<Message>,
 
@@ -146,6 +153,8 @@ impl Publisher {
             subscribed_names: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
+            subscribed_namespace_prefixes: Default::default(),
+            unknown_subscribed_namespace: Default::default(),
             outgoing,
             request_id,
             pending_requests,
@@ -438,6 +447,10 @@ impl Publisher {
         self.unknown_track_status_requested.pop().await
     }
 
+    pub async fn subscribed_namespace(&mut self) -> Option<SubscribedNamespace> {
+        self.unknown_subscribed_namespace.pop().await
+    }
+
     fn add_mlog_event<F>(&self, make_event: F)
     where
         F: FnOnce(f64) -> mlog::Event,
@@ -498,9 +511,12 @@ impl Publisher {
                 );
             }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
-            // SUBSCRIBE_NAMESPACE not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
+            // Draft-16 §3.3/§9.25: SUBSCRIBE_NAMESPACE begins a dedicated bidi stream.
             message::Subscriber::SubscribeNamespace(msg) => {
-                self.send_not_supported(msg.id, "subscribe_namespace");
+                return Err(SessionError::ProtocolViolation(format!(
+                    "SUBSCRIBE_NAMESPACE {} received on control stream",
+                    msg.id
+                )));
             }
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)?;
@@ -751,6 +767,51 @@ impl Publisher {
         Ok(())
     }
 
+    pub(super) fn recv_subscribe_namespace(
+        &mut self,
+        msg: message::SubscribeNamespace,
+    ) -> Result<SubscribedNamespaceRecv, SessionError> {
+        let forward = msg.params.forward()?.unwrap_or(true);
+
+        {
+            let mut prefixes = self
+                .subscribed_namespace_prefixes
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if Self::has_subscribed_namespace_overlap(&prefixes, &msg.track_namespace_prefix) {
+                return Ok(SubscribedNamespaceRecv::rejected(
+                    msg.id,
+                    RequestErrorCode::PrefixOverlap as u64,
+                    "prefix overlap",
+                ));
+            }
+            prefixes.insert(msg.id, msg.track_namespace_prefix.clone());
+        }
+
+        let info = SubscribedNamespaceInfo {
+            request_id: msg.id,
+            namespace_prefix: msg.track_namespace_prefix,
+            subscribe_options: msg.subscribe_options,
+            forward,
+        };
+        let (mut send, recv) =
+            SubscribedNamespace::new(info, self.subscribed_namespace_prefixes.clone());
+
+        if let Err(send_back) = self.unknown_subscribed_namespace.push(send) {
+            send = send_back;
+            send.reject(RequestErrorCode::InternalError as u64, "internal error")?;
+        }
+
+        Ok(recv)
+    }
+
+    fn has_subscribed_namespace_overlap(
+        prefixes: &HashMap<u64, TrackNamespacePrefix>,
+        prefix: &TrackNamespacePrefix,
+    ) -> bool {
+        prefixes.values().any(|existing| existing.overlaps(prefix))
+    }
+
     fn recv_unsubscribe(&mut self, msg: message::Unsubscribe) -> Result<(), SessionError> {
         if let Some(mut subscribed) = self.remove_subscribe(msg.id)? {
             subscribed.recv_unsubscribe()?;
@@ -911,10 +972,11 @@ impl Publisher {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use crate::{
-        coding::{TrackName, TrackNamespace},
+        coding::{TrackName, TrackNamespace, TrackNamespacePrefix},
         serve::FullTrackName,
     };
 
@@ -957,5 +1019,27 @@ mod tests {
         assert_eq!(names.by_name.get(&track), Some(&6));
         assert_eq!(names.by_id.get(&6), Some(&track));
         assert!(!names.by_id.contains_key(&8));
+    }
+
+    #[test]
+    fn subscribed_namespace_overlap_detects_common_prefix() {
+        let mut prefixes = HashMap::new();
+        prefixes.insert(
+            0,
+            TrackNamespacePrefix::from_utf8_path("example.com/meeting=123"),
+        );
+
+        assert!(Publisher::has_subscribed_namespace_overlap(
+            &prefixes,
+            &TrackNamespacePrefix::from_utf8_path("example.com/meeting=123/participant=100")
+        ));
+        assert!(Publisher::has_subscribed_namespace_overlap(
+            &prefixes,
+            &TrackNamespacePrefix::from_utf8_path("example.com")
+        ));
+        assert!(!Publisher::has_subscribed_namespace_overlap(
+            &prefixes,
+            &TrackNamespacePrefix::from_utf8_path("example.com/meeting=456")
+        ));
     }
 }

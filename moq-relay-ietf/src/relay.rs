@@ -10,18 +10,18 @@ use moq_native_ietf::quic::{self, Endpoint};
 use moq_transport::session::SessionConfig;
 use url::Url;
 
-use crate::{metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
+use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
+use crate::{
+    metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
+    RelayInfo, RemoteManager, Session, SessionContext,
+};
 
 // A type alias for boxed future
 type ServerFuture = Pin<
     Box<
         dyn Future<
             Output = (
-                anyhow::Result<(
-                    web_transport::Session,
-                    String,
-                    moq_transport::session::Transport,
-                )>,
+                anyhow::Result<(web_transport::Session, quic::ConnInfo)>,
                 quic::Server,
             ),
         >,
@@ -57,6 +57,16 @@ pub struct RelayConfig {
 
     /// MoQT session configuration used for inbound and relay-to-relay sessions.
     pub session: SessionConfig,
+
+    /// Classifies inbound connections as public clients or internal relay
+    /// peers via connection tags (the well-known `interface` tag). Consulted
+    /// once per accepted connection with the peer's socket address and
+    /// connection path.
+    ///
+    /// When `None`, every inbound connection is treated as a public client.
+    /// Outbound connections the relay dials itself (`--announce`,
+    /// [`RemoteManager`]) are always tagged internal and bypass this.
+    pub connection_tagger: Option<Arc<dyn ConnectionTagger>>,
 }
 
 impl RelayConfig {
@@ -71,6 +81,8 @@ pub struct Relay {
     config: RelayConfig,
     locals: Locals,
     remotes: RemoteManager,
+    upstream_namespaces: UpstreamNamespaces,
+    upstream_namespaces_runner: UpstreamNamespacesRunner,
 }
 
 impl Relay {
@@ -118,11 +130,15 @@ impl Relay {
             remote_clients,
             config.session,
         );
+        let (upstream_namespaces, upstream_namespaces_runner) =
+            UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 
         Ok(Self {
             config,
             locals,
             remotes,
+            upstream_namespaces,
+            upstream_namespaces_runner,
         })
     }
 
@@ -132,6 +148,8 @@ impl Relay {
             config,
             locals,
             remotes,
+            upstream_namespaces,
+            upstream_namespaces_runner,
         } = self;
 
         let RelayConfig {
@@ -140,11 +158,19 @@ impl Relay {
             mlog_dir,
             coordinator,
             session: session_config,
+            connection_tagger,
             ..
         } = config;
 
         let run_result = async {
             let mut tasks = FuturesUnordered::new();
+            tasks.push(
+                async move {
+                    upstream_namespaces_runner.run().await;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .boxed(),
+            );
 
             // Use the remote manager for routing to remote relays.
             let remote_manager = remotes.clone();
@@ -184,22 +210,28 @@ impl Relay {
                 // Multi-scope forwarding (routing different incoming scopes to different
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
+                let forward_context = SessionContext::internal(
+                    forward_scope,
+                    Some(RelayInfo::new(url.clone())),
+                );
 
                 let forward_coordinator = coordinator.clone();
                 let session = Session {
                     session,
-                    producer: Some(Producer::new(
+                    producer: Some(Producer::new_with_upstream_namespaces(
                         publisher,
                         locals.clone(),
                         remote_manager.clone(),
-                        forward_scope.clone(),
+                        upstream_namespaces.clone(),
+                        forward_context.clone(),
                     )),
                     consumer: Some(Consumer::new(
                         subscriber,
                         locals.clone(),
                         forward_coordinator,
+                        remote_manager.clone(),
                         None,
-                        forward_scope,
+                        forward_context,
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
@@ -250,7 +282,13 @@ impl Relay {
                             .boxed(),
                         );
 
-                        let (conn, connection_id, transport) = conn_result.context("failed to accept QUIC connection")?;
+                        let (conn, info) = conn_result.context("failed to accept QUIC connection")?;
+                        let quic::ConnInfo {
+                            id: connection_id,
+                            transport,
+                            remote_address: remote_addr,
+                            server_name,
+                        } = info;
 
                         metrics::counter!("moq_relay_connections_total").increment(1);
 
@@ -262,6 +300,8 @@ impl Relay {
                         let remotes = remote_manager.clone();
                         let forward = forward_producer.clone();
                         let coordinator = coordinator.clone();
+                        let upstream_namespaces = upstream_namespaces.clone();
+                        let connection_tagger = connection_tagger.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -312,9 +352,31 @@ impl Relay {
                                 }
                             };
 
-                            let scope_id = scope_info.as_ref().map(|s| s.scope_id.clone());
                             let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
                             let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
+
+                            // Classify the connection interface (public client vs internal
+                            // relay peer). This is deliberately separate from scope
+                            // resolution above: resolve_scope() returns identity +
+                            // permissions, while the embedder-supplied tagger decides the
+                            // transport interface from the peer socket address, TLS SNI, and
+                            // connection path. With no tagger configured every inbound
+                            // connection is treated as a public client. For connections
+                            // classified internal, the peer relay identity is derived from
+                            // the inbound socket address (see RelayInfo::from_socket_addr).
+                            let scope = scope_info.as_ref().map(|info| info.scope_id.clone());
+                            let context = match connection_tagger.as_ref() {
+                                Some(tagger) => {
+                                    let meta = ConnectionMeta::new(
+                                        Some(remote_addr),
+                                        server_name,
+                                        moq_session.connection_path().map(str::to_string),
+                                    );
+                                    let tags = tagger.tag(&meta);
+                                    SessionContext::from_tags(scope, &tags, Some(remote_addr))
+                                }
+                                None => SessionContext::public(scope),
+                            };
 
                             if let Some(ref info) = scope_info {
                                 tracing::debug!(
@@ -334,13 +396,13 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone())), None)
+                                (publisher.map(|publisher| Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone())), None)
                             } else {
                                 (None, publisher)
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context)), None)
                             } else {
                                 (None, subscriber)
                             };
