@@ -3,7 +3,7 @@
 
 use std::collections::hash_map;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
 use moq_transport::{
     coding::{TrackNamespace, TrackNamespacePrefix},
@@ -88,12 +88,12 @@ pub enum TrackChange {
 #[derive(Clone)]
 pub struct Locals {
     /// Actual media tracks, indexed by (scope, full track name).
-    tracks: Arc<Mutex<HashMap<ScopeKey, HashMap<FullTrackName, TrackEntry>>>>,
+    tracks: Arc<RwLock<HashMap<ScopeKey, HashMap<FullTrackName, TrackEntry>>>>,
 
     /// Namespace sources, indexed by (scope, namespace) and matched by prefix.
     /// Each entry can have one local PUBLISH_NAMESPACE route source and shared
     /// ownership by any number of remote discovery registrations.
-    namespaces: Arc<Mutex<HashMap<ScopeKey, HashMap<TrackNamespace, NamespaceEntry>>>>,
+    namespaces: Arc<RwLock<HashMap<ScopeKey, HashMap<TrackNamespace, NamespaceEntry>>>>,
 
     /// Namespace add/remove notifications for SUBSCRIBE_NAMESPACE handlers.
     namespace_changes: broadcast::Sender<NamespaceChange>,
@@ -133,7 +133,7 @@ impl Locals {
         scope: Option<&str>,
         prefix: &TrackNamespacePrefix,
     ) -> Vec<TrackNamespace> {
-        let Ok(namespaces) = self.namespaces.lock() else {
+        let Ok(namespaces) = self.namespaces.read() else {
             return Vec::new();
         };
         let Some(bucket) = namespaces.get(scope.unwrap_or(UNSCOPED)) else {
@@ -152,27 +152,63 @@ impl Locals {
         scope: Option<&str>,
         prefix: &TrackNamespacePrefix,
     ) -> Vec<TrackReader> {
-        let Ok(mut tracks) = self.tracks.lock() else {
-            return Vec::new();
-        };
-        let Some(bucket) = tracks.get_mut(scope.unwrap_or(UNSCOPED)) else {
-            return Vec::new();
-        };
+        let scope_key = scope.unwrap_or(UNSCOPED);
 
-        // Prune closed tracks and collect matching readers in a single pass so the
-        // `tracks` lock (contended with register/retrieve/drop) is held as briefly
-        // as possible.
+        // Collect matching readers under a shared read lock so concurrent
+        // SUBSCRIBE_NAMESPACE fan-outs don't serialize against each other. Note any
+        // closed entries and prune them afterwards under a brief write lock, keeping
+        // the common (no-stale) path read-only.
         let mut matches = Vec::new();
-        bucket.retain(|full_name, entry| {
-            if entry.reader.is_closed() {
-                return false;
+        let mut stale = Vec::new();
+        {
+            let Ok(tracks) = self.tracks.read() else {
+                return Vec::new();
+            };
+            let Some(bucket) = tracks.get(scope_key) else {
+                return Vec::new();
+            };
+            for (full_name, entry) in bucket.iter() {
+                if entry.reader.is_closed() {
+                    stale.push(full_name.clone());
+                } else if entry.source == TrackSource::Published
+                    && prefix.is_prefix_of(&full_name.namespace)
+                {
+                    matches.push(entry.reader.clone());
+                }
             }
-            if entry.source == TrackSource::Published && prefix.is_prefix_of(&full_name.namespace) {
-                matches.push(entry.reader.clone());
-            }
-            true
-        });
+        }
+
+        if !stale.is_empty() {
+            self.prune_closed_tracks(scope_key, &stale);
+        }
+
         matches
+    }
+
+    /// Remove the given tracks from a scope bucket if they are still closed.
+    ///
+    /// Invoked off the read path (e.g. by [`Locals::list_tracks_matching`]) so that
+    /// closed-entry cleanup takes the write lock only briefly and only when a closed
+    /// entry was actually observed. The re-check guards against removing an entry
+    /// that a concurrent writer replaced with a live reader.
+    fn prune_closed_tracks(&self, scope_key: &str, keys: &[FullTrackName]) {
+        let Ok(mut tracks) = self.tracks.write() else {
+            return;
+        };
+        let Some(bucket) = tracks.get_mut(scope_key) else {
+            return;
+        };
+        for key in keys {
+            if bucket
+                .get(key)
+                .is_some_and(|entry| entry.reader.is_closed())
+            {
+                bucket.remove(key);
+            }
+        }
+        if bucket.is_empty() {
+            tracks.remove(scope_key);
+        }
     }
 
     /// Register namespace routing metadata from PUBLISH_NAMESPACE.
@@ -191,7 +227,7 @@ impl Locals {
         let added = {
             let mut namespaces = self
                 .namespaces
-                .lock()
+                .write()
                 .map_err(|_| ServeError::internal_ctx("locals namespace registry lock poisoned"))?;
             let bucket = namespaces.entry(scope_key.clone()).or_default();
             match bucket.entry(namespace.clone()) {
@@ -240,7 +276,7 @@ impl Locals {
         let (source, added) = {
             let mut namespaces = self
                 .namespaces
-                .lock()
+                .write()
                 .map_err(|_| ServeError::internal_ctx("locals namespace registry lock poisoned"))?;
             let bucket = namespaces.entry(scope_key.clone()).or_default();
             match bucket.entry(namespace.clone()) {
@@ -309,7 +345,7 @@ impl Locals {
 
         let mut tracks = self
             .tracks
-            .lock()
+            .write()
             .map_err(|_| ServeError::internal_ctx("locals track registry lock poisoned"))?;
         let bucket = tracks.entry(scope_key.clone()).or_default();
         match bucket.entry(full_name.clone()) {
@@ -339,16 +375,23 @@ impl Locals {
         scope: Option<&str>,
         full_name: &FullTrackName,
     ) -> Option<TrackReader> {
-        let mut tracks = self.tracks.lock().ok()?;
-        let bucket = tracks.get_mut(scope.unwrap_or(UNSCOPED))?;
-        if bucket
-            .get(full_name)
-            .is_some_and(|entry| entry.reader.is_closed())
+        let scope_key = scope.unwrap_or(UNSCOPED);
+
+        // Fast path: look up under a shared read lock.
         {
-            bucket.remove(full_name);
-            return None;
+            let tracks = self.tracks.read().ok()?;
+            let bucket = tracks.get(scope_key)?;
+            match bucket.get(full_name) {
+                Some(entry) if !entry.reader.is_closed() => return Some(entry.reader.clone()),
+                Some(_) => {} // closed: fall through to prune under the write lock
+                None => return None,
+            }
         }
-        bucket.get(full_name).map(|entry| entry.reader.clone())
+
+        // The entry was closed; remove it under a brief write lock (re-checking in
+        // case a concurrent writer replaced it with a live reader).
+        self.prune_closed_tracks(scope_key, std::slice::from_ref(full_name));
+        None
     }
 
     /// Return the best namespace route source for a requested namespace.
@@ -357,7 +400,7 @@ impl Locals {
         scope: Option<&str>,
         namespace: &TrackNamespace,
     ) -> Option<NamespaceSource> {
-        let namespaces = self.namespaces.lock().ok()?;
+        let namespaces = self.namespaces.read().ok()?;
         let bucket = namespaces.get(scope.unwrap_or(UNSCOPED))?;
 
         let mut best_match: Option<NamespaceSource> = None;
@@ -414,7 +457,7 @@ impl Locals {
         // owns requesting it from the source; concurrent callers share the reserved
         // reader instead of racing to insert and failing with a spurious `None`.
         let (writer, reader) = {
-            let mut tracks = self.tracks.lock().ok()?;
+            let mut tracks = self.tracks.write().ok()?;
             let bucket = tracks
                 .entry(scope.unwrap_or(UNSCOPED).to_string())
                 .or_default();
@@ -438,7 +481,7 @@ impl Locals {
         };
 
         if source.requests.send(writer).await.is_err() {
-            if let Ok(mut tracks) = self.tracks.lock() {
+            if let Ok(mut tracks) = self.tracks.write() {
                 if let Some(bucket) = tracks.get_mut(scope.unwrap_or(UNSCOPED)) {
                     bucket.remove(&full_name);
                 }
@@ -468,7 +511,7 @@ impl Drop for LocalNamespaceRegistration {
         tracing::debug!(namespace = %ns, scope = %scope, "deregistering namespace route source from locals");
 
         let mut removed = false;
-        if let Ok(mut namespaces) = self.locals.namespaces.lock() {
+        if let Ok(mut namespaces) = self.locals.namespaces.write() {
             if let Some(bucket) = namespaces.get_mut(self.scope_key.as_str()) {
                 let remove_namespace = if let Some(entry) = bucket.get_mut(&self.namespace) {
                     entry.local.take().is_some() && entry.remote.upgrade().is_none()
@@ -501,7 +544,7 @@ pub struct RemoteNamespaceRegistration {
 impl Drop for RemoteNamespaceSource {
     fn drop(&mut self) {
         let mut removed = false;
-        if let Ok(mut namespaces) = self.locals.namespaces.lock() {
+        if let Ok(mut namespaces) = self.locals.namespaces.write() {
             if let Some(bucket) = namespaces.get_mut(self.scope_key.as_str()) {
                 let remove_namespace = if let Some(entry) = bucket.get_mut(&self.namespace) {
                     if std::ptr::eq(entry.remote.as_ptr(), self) {
@@ -559,7 +602,7 @@ impl Drop for LocalTrackRegistration {
         tracing::debug!(namespace = %namespace, track = %track, scope = %scope, "deregistering track from locals");
 
         let mut removed = false;
-        if let Ok(mut tracks) = self.locals.tracks.lock() {
+        if let Ok(mut tracks) = self.locals.tracks.write() {
             if let Some(bucket) = tracks.get_mut(self.scope_key.as_str()) {
                 removed = bucket.remove(&self.full_name).is_some();
                 if bucket.is_empty() {
