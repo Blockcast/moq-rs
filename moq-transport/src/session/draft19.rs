@@ -29,6 +29,13 @@ fn control_error(session: &web_transport::Session, error: SessionError) -> Draft
     error.into()
 }
 
+fn first_response_fin_error(lifecycle: &mut RequestStream) -> StreamProtocolError {
+    match lifecycle.receive_fin() {
+        Ok(()) => StreamProtocolError::InvalidTransition,
+        Err(error) => error,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Draft19SessionError {
     #[error(transparent)]
@@ -186,8 +193,8 @@ impl Draft19RequestStream {
 
     pub async fn receive_first_response(&mut self) -> Result<Frame, Draft19SessionError> {
         if self.receiver.done().await? {
-            self.lifecycle.receive_fin()?;
-            unreachable!("premature FIN must fail")
+            let error = first_response_fin_error(&mut self.lifecycle);
+            return Err(self.protocol_error(error));
         }
         let frame = self
             .receiver
@@ -272,5 +279,26 @@ impl Draft19RequestStream {
             StreamAction::None => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_response_fin_is_an_error_before_and_after_a_response() {
+        let mut waiting = RequestStream::new(WireProfile::Draft19, 0x16).unwrap();
+        assert_eq!(
+            first_response_fin_error(&mut waiting),
+            StreamProtocolError::PrematureFin
+        );
+
+        let mut complete = RequestStream::new(WireProfile::Draft19, 0x16).unwrap();
+        complete.receive_first_response(0x18).unwrap();
+        assert_eq!(
+            first_response_fin_error(&mut complete),
+            StreamProtocolError::InvalidTransition
+        );
     }
 }
