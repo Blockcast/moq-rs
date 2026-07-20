@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::session::{Publisher, SessionError, Subscriber};
@@ -95,6 +95,15 @@ pub struct ConnectionMeta {
     /// Remote socket address of the peer, when known.
     pub remote_addr: Option<SocketAddr>,
 
+    /// Local IP the connection was accepted on: the destination IP the peer
+    /// targeted, when known.
+    ///
+    /// On a wildcard bind (`0.0.0.0` / `[::]`) this identifies which local
+    /// address/interface (e.g. an anycast VIP) actually received the
+    /// connection, letting a tagger classify by inbound interface. `None` when
+    /// the platform does not expose the destination address.
+    pub local_ip: Option<IpAddr>,
+
     /// TLS SNI (Server Name Indication) the client requested, when present.
     ///
     /// Available for both WebTransport and raw MoQT connections, so this is the
@@ -108,6 +117,9 @@ pub struct ConnectionMeta {
 
 impl ConnectionMeta {
     /// Create connection metadata from a remote address, TLS SNI, and path.
+    ///
+    /// Use [`with_local_ip`](Self::with_local_ip) to attach the local IP the
+    /// connection was accepted on.
     pub fn new(
         remote_addr: Option<SocketAddr>,
         server_name: Option<String>,
@@ -115,9 +127,18 @@ impl ConnectionMeta {
     ) -> Self {
         Self {
             remote_addr,
+            local_ip: None,
             server_name,
             path,
         }
+    }
+
+    /// Attach the local IP the connection was accepted on (the destination IP
+    /// the peer targeted, from `ConnInfo::local_ip`). Returns `self` for
+    /// builder-style chaining. See [`local_ip`](Self::local_ip).
+    pub fn with_local_ip(mut self, local_ip: Option<IpAddr>) -> Self {
+        self.local_ip = local_ip;
+        self
     }
 }
 
@@ -155,6 +176,9 @@ impl ConnectionMeta {
 ///
 /// * [`ConnectionMeta::remote_addr`] — the dialer's source IP/port (e.g. match
 ///   an internal subnet or allowlist).
+/// * [`ConnectionMeta::local_ip`] — the local IP/interface the connection was
+///   accepted on (e.g. match an internal-facing VIP on a multi-homed or
+///   anycast host).
 /// * [`ConnectionMeta::server_name`] — the TLS SNI the dialer presents, derived
 ///   from the host of the URL it dialed, so relays that dial an internal
 ///   hostname can be matched here.
@@ -544,6 +568,11 @@ mod tests {
         assert_eq!(meta.remote_addr, Some(addr));
         assert_eq!(meta.server_name.as_deref(), Some("relay.example.com"));
         assert_eq!(meta.path.as_deref(), Some("/tenant/stream"));
+        // local_ip is opt-in and defaults to None.
+        assert_eq!(meta.local_ip, None);
+
+        let local: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(meta.with_local_ip(Some(local)).local_ip, Some(local));
     }
 
     /// Example tagger that marks connections internal when they arrive on a
@@ -587,5 +616,46 @@ mod tests {
         // Missing SNI (e.g. no server name) defaults to public.
         let no_sni = tagger.tag(&ConnectionMeta::new(None, None, None));
         assert_eq!(no_sni.interface(), SessionInterface::Public);
+    }
+
+    /// Example tagger that marks connections internal when accepted on a known
+    /// internal-facing local IP (e.g. a private VIP), otherwise public.
+    /// Exercises the `local_ip` plumbing all the way to a tagger.
+    struct LocalIpTagger {
+        internal_local_ip: IpAddr,
+    }
+
+    impl ConnectionTagger for LocalIpTagger {
+        fn tag(&self, meta: &ConnectionMeta) -> ConnectionTags {
+            match meta.local_ip {
+                Some(ip) if ip == self.internal_local_ip => {
+                    ConnectionTags::new().with_interface(SessionInterface::Internal)
+                }
+                _ => ConnectionTags::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn connection_tagger_classifies_by_local_ip() {
+        let internal_vip: IpAddr = "10.0.0.9".parse().unwrap();
+        let public_vip: IpAddr = "203.0.113.9".parse().unwrap();
+        let tagger = LocalIpTagger {
+            internal_local_ip: internal_vip,
+        };
+
+        // Accepted on the internal VIP -> internal.
+        let internal =
+            tagger.tag(&ConnectionMeta::new(None, None, None).with_local_ip(Some(internal_vip)));
+        assert_eq!(internal.interface(), SessionInterface::Internal);
+
+        // Accepted on a public VIP -> public.
+        let public =
+            tagger.tag(&ConnectionMeta::new(None, None, None).with_local_ip(Some(public_vip)));
+        assert_eq!(public.interface(), SessionInterface::Public);
+
+        // Unknown local IP defaults to public.
+        let unknown = tagger.tag(&ConnectionMeta::new(None, None, None));
+        assert_eq!(unknown.interface(), SessionInterface::Public);
     }
 }

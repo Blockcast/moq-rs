@@ -287,6 +287,10 @@ impl Relay {
                             id: connection_id,
                             transport,
                             remote_address: remote_addr,
+                            // The local IP the connection was accepted on
+                            // (destination IP the peer targeted); forwarded to the
+                            // connection tagger for inbound-interface classification.
+                            local_ip,
                             server_name,
                         } = info;
 
@@ -371,7 +375,8 @@ impl Relay {
                                         Some(remote_addr),
                                         server_name,
                                         moq_session.connection_path().map(str::to_string),
-                                    );
+                                    )
+                                    .with_local_ip(local_ip);
                                     let tags = tagger.tag(&meta);
                                     SessionContext::from_tags(scope, &tags, Some(remote_addr))
                                 }
