@@ -185,6 +185,19 @@ fn required_profile_label(offered: &[String]) -> &'static str {
     WireProfile::from_name(&offered[0]).map_or("unknown", WireProfile::name)
 }
 
+fn connect_error_outcome(error: &quinn::ConnectionError) -> &'static str {
+    const NO_APPLICATION_PROTOCOL: u8 = 120;
+
+    match error {
+        quinn::ConnectionError::TransportError(error)
+            if error.code == quinn::TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL) =>
+        {
+            "mismatch"
+        }
+        _ => "connect_error",
+    }
+}
+
 #[derive(Parser, Clone)]
 pub struct Args {
     /// Listen for UDP packets on the given address.
@@ -330,8 +343,12 @@ impl Config {
     }
 
     pub fn with_wire_profiles(mut self, profiles: impl IntoIterator<Item = WireProfile>) -> Self {
-        self.wire_profiles = profiles.into_iter().collect();
-        self.wire_profiles.dedup();
+        self.wire_profiles.clear();
+        for profile in profiles {
+            if !self.wire_profiles.contains(&profile) {
+                self.wire_profiles.push(profile);
+            }
+        }
         self
     }
 
@@ -742,7 +759,7 @@ impl Client {
                         "moqt" => "raw_quic",
                         _ => "unknown",
                     },
-                    "outcome" => "mismatch",
+                    "outcome" => connect_error_outcome(&error),
                     "offered" => required.name(),
                     "supported" => supported_profiles_label(&self.wire_profiles),
                     "required" => required.name(),
@@ -1017,6 +1034,34 @@ mod tests {
         assert_eq!(
             select_wire_profile(&["moqt-19-preview".to_string()], &[WireProfile::Draft19]),
             None
+        );
+    }
+
+    #[test]
+    fn wire_profiles_are_unique_in_preference_order() {
+        let config = Config::new("127.0.0.1:0".parse().unwrap(), None, tls_config())
+            .unwrap()
+            .with_wire_profiles([
+                WireProfile::Draft19,
+                WireProfile::Draft16,
+                WireProfile::Draft19,
+            ]);
+
+        assert_eq!(
+            config.wire_profiles,
+            vec![WireProfile::Draft19, WireProfile::Draft16]
+        );
+    }
+
+    #[test]
+    fn only_no_application_protocol_is_a_negotiation_mismatch() {
+        let mismatch =
+            quinn::ConnectionError::TransportError(quinn::TransportErrorCode::crypto(120).into());
+
+        assert_eq!(connect_error_outcome(&mismatch), "mismatch");
+        assert_eq!(
+            connect_error_outcome(&quinn::ConnectionError::TimedOut),
+            "connect_error"
         );
     }
 
