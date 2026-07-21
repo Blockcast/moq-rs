@@ -29,12 +29,14 @@ async fn main() -> Result<()> {
     let quic_endpoint = quic::Endpoint::new(quic::Config::new(args.bind, None, tls.clone())?)?;
 
     tracing::info!(url = %args.url, "connecting to relay");
-    let (session, connection_id, transport) = quic_endpoint.client.connect(&args.url, None).await?;
+    let (session, connection_id, transport, selected_version) =
+        quic_endpoint.client.connect(&args.url, None).await?;
     tracing::info!(%connection_id, "connected to relay");
 
-    let (session, subscriber) = Subscriber::connect(session, transport)
-        .await
-        .context("failed to create MoQ Transport subscriber session")?;
+    let (session, subscriber) =
+        Subscriber::connect_negotiated(session, transport, selected_version)
+            .await
+            .context("failed to create MoQ Transport subscriber session")?;
 
     // Per the M.0 finding (.planning/moq-rs-m0-results.md): the
     // namespace lives in the URL-path-derived tenant scope on the

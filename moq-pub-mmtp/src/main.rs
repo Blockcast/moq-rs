@@ -97,12 +97,14 @@ async fn main() -> Result<()> {
     let quic_endpoint = quic::Endpoint::new(quic::Config::new(args.bind, None, tls.clone())?)?;
 
     tracing::info!(url = %args.url, "connecting to relay");
-    let (session, connection_id, transport) = quic_endpoint.client.connect(&args.url, None).await?;
+    let (session, connection_id, transport, selected_version) =
+        quic_endpoint.client.connect(&args.url, None).await?;
     tracing::info!(%connection_id, "connected to relay");
 
-    let (session, mut publisher) = Publisher::connect(session, transport)
-        .await
-        .context("failed to create MoQ Transport publisher")?;
+    let (session, mut publisher) =
+        Publisher::connect_negotiated(session, transport, selected_version)
+            .await
+            .context("failed to create MoQ Transport publisher")?;
 
     // Run the three long-lived halves on SEPARATE tokio tasks rather than as
     // three branches of one `select!`. A single `select!` is one future = one

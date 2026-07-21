@@ -524,6 +524,7 @@ mod tests {
             None,
             rid,
             crate::session::PendingRequests::default(),
+            crate::profile::WireProfile::Draft16,
         );
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
@@ -542,6 +543,7 @@ mod tests {
             None,
             rid,
             crate::session::PendingRequests::default(),
+            crate::profile::WireProfile::Draft16,
         );
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();

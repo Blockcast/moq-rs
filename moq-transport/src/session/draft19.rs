@@ -48,14 +48,15 @@ pub enum Draft19SessionError {
 ///
 /// Construction opens the local unidirectional control stream, sends SETUP,
 /// accepts the peer's unidirectional control stream, and decodes its SETUP.
-/// It intentionally does not advertise `moqt-19`; callers may only construct
-/// it after selecting the explicit draft-19 profile out of band.
+/// Callers may only construct it after exact transport negotiation selected
+/// the explicit draft-19 profile.
 pub struct Draft19Session {
     session: web_transport::Session,
     control_sender: Writer,
     control_receiver: Reader,
     control_state: ControlStreamPair,
     peer_setup: Setup,
+    selected_version: WireProfile,
 }
 
 impl Draft19Session {
@@ -91,11 +92,16 @@ impl Draft19Session {
             control_receiver,
             control_state,
             peer_setup,
+            selected_version: profile,
         })
     }
 
     pub const fn peer_setup(&self) -> &Setup {
         &self.peer_setup
+    }
+
+    pub const fn selected_version(&self) -> WireProfile {
+        self.selected_version
     }
 
     pub const fn control_ready(&self) -> bool {
