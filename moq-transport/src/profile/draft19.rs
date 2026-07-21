@@ -3,15 +3,19 @@
 
 //! Draft-19 framing and stream-lifecycle foundation.
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use bytes::{Buf, BufMut, Bytes};
 use thiserror::Error;
 
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, Vi64};
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, SessionUri, Vi64};
 use crate::profile::WireProfile;
 
 pub const SETUP_TYPE: u64 = 0x2f00;
+pub const GOAWAY_TYPE: u64 = 0x10;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -229,13 +233,118 @@ impl Encode for Frame {
     }
 }
 
+/// Draft-19 GOAWAY body, usable on either a control or request stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoAway {
+    pub new_session_uri: SessionUri,
+    pub timeout_ms: u64,
+}
+
+impl GoAway {
+    pub fn into_frame(self) -> Result<Frame, EncodeError> {
+        if self.new_session_uri.0.len() > SessionUri::MAX_LEN {
+            return Err(EncodeError::FieldBoundsExceeded("SessionUri".to_string()));
+        }
+        let mut payload = Vec::new();
+        Vi64::new(self.new_session_uri.0.len() as u64).encode(&mut payload)?;
+        payload.put_slice(self.new_session_uri.0.as_bytes());
+        Vi64::new(self.timeout_ms).encode(&mut payload)?;
+        Ok(Frame {
+            message_type: GOAWAY_TYPE,
+            payload: payload.into(),
+        })
+    }
+
+    pub fn from_frame(frame: &Frame) -> Result<Self, DecodeError> {
+        if frame.message_type != GOAWAY_TYPE {
+            return Err(DecodeError::InvalidMessage(frame.message_type));
+        }
+
+        let mut payload = frame.payload.clone();
+        let uri_len = Vi64::decode(&mut payload)?.into_inner();
+        let uri_len = usize::try_from(uri_len)
+            .map_err(|_| DecodeError::FieldBoundsExceeded("SessionUri".to_string()))?;
+        if uri_len > SessionUri::MAX_LEN {
+            return Err(DecodeError::FieldBoundsExceeded("SessionUri".to_string()));
+        }
+        <Vi64 as Decode>::decode_remaining(&mut payload, uri_len)?;
+        let mut uri = vec![0; uri_len];
+        payload.copy_to_slice(&mut uri);
+        let new_session_uri = SessionUri(String::from_utf8(uri)?);
+        let timeout_ms = Vi64::decode(&mut payload)?.into_inner();
+        if payload.has_remaining() {
+            return Err(DecodeError::InvalidLength(
+                frame.payload.len(),
+                frame.payload.len() - payload.remaining(),
+            ));
+        }
+
+        Ok(Self {
+            new_session_uri,
+            timeout_ms,
+        })
+    }
+}
+
+/// GOAWAY tracking is deliberately per stream so request migration cannot
+/// consume the control stream's single-GOAWAY allowance (or vice versa).
+#[derive(Debug, Default)]
+pub struct GoAwayState {
+    sent: bool,
+    received: bool,
+    deadline: Option<Instant>,
+}
+
+impl GoAwayState {
+    pub const fn sent(&self) -> bool {
+        self.sent
+    }
+
+    pub const fn received(&self) -> bool {
+        self.received
+    }
+
+    pub const fn active(&self) -> bool {
+        self.sent || self.received
+    }
+
+    pub fn record_sent(
+        &mut self,
+        goaway: &GoAway,
+        now: Instant,
+    ) -> Result<(), StreamProtocolError> {
+        if self.sent {
+            return Err(StreamProtocolError::DuplicateGoAway);
+        }
+        self.sent = true;
+        self.deadline = (goaway.timeout_ms != 0)
+            .then(|| now.checked_add(Duration::from_millis(goaway.timeout_ms)))
+            .flatten();
+        Ok(())
+    }
+
+    pub fn record_received(&mut self) -> Result<(), StreamProtocolError> {
+        if self.received {
+            return Err(StreamProtocolError::DuplicateGoAway);
+        }
+        self.received = true;
+        Ok(())
+    }
+
+    pub fn timeout_expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub enum SessionErrorCode {
+    NoError = 0x0,
     InternalError = 0x1,
     Unauthorized = 0x2,
     ProtocolViolation = 0x3,
     KeyValueFormattingError = 0x6,
+    GoAwayTimeout = 0x10,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -267,6 +376,8 @@ pub enum StreamProtocolError {
     InvalidTransition,
     #[error("control stream closed")]
     ControlStreamClosed,
+    #[error("received or sent multiple GOAWAY messages on one stream")]
+    DuplicateGoAway,
 }
 
 impl StreamProtocolError {
@@ -275,7 +386,8 @@ impl StreamProtocolError {
             Self::ProfileMismatch(_)
             | Self::InvalidFirstMessage { .. }
             | Self::InvalidFirstResponse { .. }
-            | Self::ControlStreamClosed => Some(SessionErrorCode::ProtocolViolation),
+            | Self::ControlStreamClosed
+            | Self::DuplicateGoAway => Some(SessionErrorCode::ProtocolViolation),
             Self::PrematureFin | Self::InvalidTransition => None,
         }
     }
@@ -532,6 +644,26 @@ impl RequestStream {
         }
         self.send = SendState::Finished;
         Ok(())
+    }
+
+    pub fn finish_sending_for_goaway(&mut self) -> Result<(), StreamProtocolError> {
+        if self.send != SendState::Open {
+            return Err(StreamProtocolError::InvalidTransition);
+        }
+        self.send_required_before_fin = false;
+        self.send = SendState::Finished;
+        Ok(())
+    }
+
+    pub fn reset_sending(
+        &mut self,
+        code: StreamErrorCode,
+    ) -> Result<StreamAction, StreamProtocolError> {
+        if self.send != SendState::Open {
+            return Err(StreamProtocolError::InvalidTransition);
+        }
+        self.send = SendState::Reset(code);
+        Ok(StreamAction::Reset(code))
     }
 
     pub fn receive_stop_sending(
