@@ -83,9 +83,9 @@ async fn main() -> Result<()> {
         "built publisher router from catalog"
     );
 
-    // Publish the catalog JSON on the canonical `catalog` track. The returned
-    // writer is retained for the session lifetime so subscribers do not observe
-    // a closed catalog track.
+    // Publish the catalog JSON on the canonical track and any temporary
+    // compatibility tracks. The returned writers are retained for the session
+    // lifetime so subscribers do not observe a closed catalog track.
     let _catalog_subgroups = publish_catalog_track(&mut tracks_writer, &catalog_bytes)?;
     tracing::info!(
         bytes = catalog_bytes.len(),
@@ -335,8 +335,13 @@ fn ceil_div_u128(numerator: u128, denominator: u128) -> u128 {
     (numerator + denominator - 1) / denominator
 }
 
-/// Catalog track name required by draft-ietf-moq-msf-00 §5.2.
-const CATALOG_TRACK_NAMES: [&str; 1] = ["catalog"];
+/// Catalog track names published during the deploy-ordered migration.
+///
+/// `catalog` is required by draft-ietf-moq-msf-00 §5.2. `catalog.json` remains
+/// temporarily because the deployed dual-stack relay probes it first and has
+/// no timeout fallback (BLO-15946/BLO-16838). Remove the alias only after the
+/// relay probes `catalog` first and that build is verified in production.
+const CATALOG_TRACK_NAMES: [&str; 2] = ["catalog", "catalog.json"];
 
 /// Publish the broadcast's catalog JSON on each catalog track name.
 ///
@@ -813,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_catalog_track_registers_only_canonical_name() {
+    fn publish_catalog_track_registers_canonical_and_relay_compatibility_names() {
         // On startup, the publisher posts the full catalog JSON as a single
         // object on group 0 at control priority 32.
         let cat = catalog_with(
@@ -835,8 +840,8 @@ mod tests {
             .get_track_reader(&ns(), "catalog")
             .expect("canonical catalog track is registered");
         assert!(!reader.is_closed());
+        assert!(tr.get_track_reader(&ns(), "catalog.json").is_some());
         assert!(tr.get_track_reader(&ns(), ".catalog").is_none());
-        assert!(tr.get_track_reader(&ns(), "catalog.json").is_none());
     }
 
     #[test]
