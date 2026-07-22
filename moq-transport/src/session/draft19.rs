@@ -38,6 +38,22 @@ fn first_response_fin_error(lifecycle: &mut RequestStream) -> StreamProtocolErro
     }
 }
 
+fn request_goaway_timeout_action(
+    goaway: &GoAwayState,
+    lifecycle: &mut RequestStream,
+    now: Instant,
+) -> Result<Option<StreamAction>, StreamProtocolError> {
+    if !goaway.timeout_expired(now) {
+        return Ok(None);
+    }
+
+    match lifecycle.reset_sending(StreamErrorCode::GoingAway) {
+        Ok(action) => Ok(Some(action)),
+        Err(StreamProtocolError::InvalidTransition) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Draft19SessionError {
     #[error(transparent)]
@@ -368,12 +384,10 @@ impl Draft19RequestStream {
     }
 
     pub fn enforce_goaway_timeout(&mut self, now: Instant) -> Result<bool, Draft19SessionError> {
-        if !self.goaway.timeout_expired(now) {
-            return Ok(false);
-        }
-        match self.lifecycle.reset_sending(StreamErrorCode::GoingAway)? {
-            StreamAction::Reset(code) => self.sender.reset(code as u32),
-            _ => unreachable!("reset_sending always returns a reset action"),
+        match request_goaway_timeout_action(&self.goaway, &mut self.lifecycle, now)? {
+            None => return Ok(false),
+            Some(StreamAction::Reset(code)) => self.sender.reset(code as u32),
+            Some(_) => unreachable!("reset_sending always returns a reset action"),
         }
         Ok(true)
     }
@@ -395,6 +409,21 @@ impl Draft19RequestStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn active_goaway(now: Instant) -> GoAwayState {
+        let mut goaway = GoAwayState::default();
+        goaway
+            .record_sent(
+                &GoAway {
+                    new_session_uri: crate::coding::SessionUri(String::new()),
+                    timeout_ms: 1,
+                },
+                now,
+            )
+            .unwrap();
+        goaway
+    }
 
     #[test]
     fn first_response_fin_is_an_error_before_and_after_a_response() {
@@ -409,6 +438,37 @@ mod tests {
         assert_eq!(
             first_response_fin_error(&mut complete),
             StreamProtocolError::InvalidTransition
+        );
+    }
+
+    #[test]
+    fn request_goaway_timeout_enforcement_is_idempotent() {
+        let now = Instant::now();
+        let goaway = active_goaway(now);
+        let expired = now + Duration::from_millis(1);
+        let mut lifecycle = RequestStream::new(WireProfile::Draft19, 0x03).unwrap();
+
+        assert_eq!(
+            request_goaway_timeout_action(&goaway, &mut lifecycle, expired).unwrap(),
+            Some(StreamAction::Reset(StreamErrorCode::GoingAway))
+        );
+        assert_eq!(
+            request_goaway_timeout_action(&goaway, &mut lifecycle, expired).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn request_goaway_timeout_after_early_finish_is_a_noop() {
+        let now = Instant::now();
+        let goaway = active_goaway(now);
+        let mut lifecycle = RequestStream::new(WireProfile::Draft19, 0x03).unwrap();
+        lifecycle.finish_sending_for_goaway().unwrap();
+
+        assert_eq!(
+            request_goaway_timeout_action(&goaway, &mut lifecycle, now + Duration::from_millis(1),)
+                .unwrap(),
+            None
         );
     }
 }
