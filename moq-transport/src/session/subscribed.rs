@@ -77,6 +77,11 @@ pub(super) struct ObjectForwarder {
 }
 
 impl ObjectForwarder {
+    fn quinn_priority(moq_priority: u8) -> i32 {
+        // MoQT sends smaller priorities first; Quinn sends larger priorities first.
+        -i32::from(moq_priority)
+    }
+
     pub(super) fn new(
         publisher: Publisher,
         track_alias: u64,
@@ -428,8 +433,7 @@ impl ObjectForwarder {
             .ok_or(ServeError::Done)?
             .record_stream_opened();
 
-        // TODO figure out u32 vs u64 priority
-        send_stream.set_priority(subgroup_reader.priority as i32);
+        send_stream.set_priority(Self::quinn_priority(subgroup_reader.priority));
 
         let mut output = SubgroupOutput::Stream(Writer::new(send_stream));
         Self::serve_subgroup_objects(
@@ -787,6 +791,27 @@ impl ObjectForwarderRecv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quinn_priority_schedules_source_before_repair() {
+        let source = ObjectForwarder::quinn_priority(128);
+        let repair = ObjectForwarder::quinn_priority(240);
+
+        assert!(source > repair, "Quinn sends larger priorities first");
+    }
+
+    #[test]
+    fn quinn_priority_reverses_the_full_moq_range() {
+        assert_eq!(ObjectForwarder::quinn_priority(0), 0);
+        assert_eq!(ObjectForwarder::quinn_priority(u8::MAX), -255);
+
+        for priority in 0..u8::MAX {
+            assert!(
+                ObjectForwarder::quinn_priority(priority)
+                    > ObjectForwarder::quinn_priority(priority + 1)
+            );
+        }
+    }
 
     #[test]
     fn subscribed_state_counts_opened_streams() {
