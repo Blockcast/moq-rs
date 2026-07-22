@@ -335,28 +335,8 @@ fn ceil_div_u128(numerator: u128, denominator: u128) -> u128 {
     (numerator + denominator - 1) / denominator
 }
 
-/// Catalog track names. The broadcast's catalog JSON is published under each.
-///
-///   - `catalog` — the canonical, REQUIRED name. draft-ietf-moq-msf-00 §5.2:
-///     "The catalog track MUST have a case-sensitive Track Name of `catalog`."
-///     Shaka MSF subscribes to it (`lib/msf/msf_parser.js` `subscribeToCatalog_`).
-///   - `.catalog` — a legacy compatibility alias for the moq.dev/hang
-///     (WARP-lineage) ecosystem (moq-pub, moq-sub, gst-moq-pub subscribe to
-///     `.catalog`). The dot-prefix is reserved at the *namespace* level by
-///     moq-transport §3.2.1, so it is not idiomatic for a media track name; it
-///     is kept only so non-MSF consumers still resolve the catalog.
-///   - `catalog.json` — a hang-lineage alias. The Blockcast dual-stack-relay
-///     probes upstream catalog track names in the order
-///     `["catalog.json", "catalog", ".catalog"]` and advances only on a
-///     SUBSCRIBE_ERROR (BLO-15946). moq-transport treats a subscribe to a
-///     not-yet-existent track as valid and answers neither OK nor ERROR, so a
-///     publisher that omits `catalog.json` leaves the relay's first candidate
-///     parked forever and the catalog never ingests. Serving it here makes the
-///     relay's first probe resolve immediately.
-///
-/// `catalog` is listed first as the conformant name; drop the aliases once the
-/// non-MSF / relay consumers migrate.
-const CATALOG_TRACK_NAMES: [&str; 3] = ["catalog", ".catalog", "catalog.json"];
+/// Catalog track name required by draft-ietf-moq-msf-00 §5.2.
+const CATALOG_TRACK_NAMES: [&str; 1] = ["catalog"];
 
 /// Publish the broadcast's catalog JSON on each catalog track name.
 ///
@@ -833,12 +813,9 @@ mod tests {
     }
 
     #[test]
-    fn publish_catalog_track_registers_canonical_and_compatibility_names() {
-        // T2: on startup, the publisher MUST post the full catalog JSON as a
-        // single object on group 0 at control priority 32, under all catalog track
-        // names: `catalog` is canonical, while `.catalog` serves legacy
-        // WARP-lineage consumers and `catalog.json` satisfies the relay's first
-        // catalog probe. The byte-for-byte write contract is covered in T9 smoke.
+    fn publish_catalog_track_registers_only_canonical_name() {
+        // On startup, the publisher posts the full catalog JSON as a single
+        // object on group 0 at control priority 32.
         let cat = catalog_with(
             vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
@@ -858,8 +835,8 @@ mod tests {
             .get_track_reader(&ns(), "catalog")
             .expect("canonical catalog track is registered");
         assert!(!reader.is_closed());
-        assert!(tr.get_track_reader(&ns(), ".catalog").is_some());
-        assert!(tr.get_track_reader(&ns(), "catalog.json").is_some());
+        assert!(tr.get_track_reader(&ns(), ".catalog").is_none());
+        assert!(tr.get_track_reader(&ns(), "catalog.json").is_none());
     }
 
     #[test]
