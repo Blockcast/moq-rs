@@ -37,3 +37,7 @@ socket2 = "0.5"
 anyhow = { version = "1", features = ["backtrace"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = { workspace = true }
+metrics = "0.24"
+
+[dev-dependencies]
+rcgen = "0.13"

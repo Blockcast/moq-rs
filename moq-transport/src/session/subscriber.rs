@@ -17,6 +17,7 @@ use crate::{
     data,
     message::{self, Message, RequestErrorCode},
     mlog,
+    profile::WireProfile,
     serve::{self, FullTrackName, ServeError},
 };
 
@@ -87,6 +88,8 @@ pub struct Subscriber {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    selected_version: WireProfile,
 }
 
 /// Which subscription owns a given Track Alias (draft-16 §10.1).
@@ -181,6 +184,7 @@ impl Subscriber {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        selected_version: WireProfile,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
@@ -196,7 +200,13 @@ impl Subscriber {
             request_id,
             pending_requests,
             mlog,
+            selected_version,
         }
+    }
+
+    /// Returns the immutable wire profile selected for this subscriber's session.
+    pub const fn selected_version(&self) -> WireProfile {
+        self.selected_version
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
@@ -224,6 +234,22 @@ impl Subscriber {
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
         Self::connect_with_config(session, transport, SessionConfig::default()).await
+    }
+
+    pub async fn connect_negotiated(
+        session: web_transport::Session,
+        transport: super::Transport,
+        selected_version: WireProfile,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) = Session::connect_with_profile(
+            session,
+            None,
+            transport,
+            selected_version,
+            SessionConfig::default(),
+        )
+        .await?;
+        Ok((session, subscriber))
     }
 
     pub async fn connect_with_config(
@@ -1370,6 +1396,7 @@ mod tests {
             None,
             request_id,
             PendingRequests::default(),
+            WireProfile::Draft16,
         )
     }
 

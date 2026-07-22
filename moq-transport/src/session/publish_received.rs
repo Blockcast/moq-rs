@@ -396,6 +396,7 @@ mod tests {
             None,
             rid,
             crate::session::PendingRequests::default(),
+            crate::profile::WireProfile::Draft16,
         );
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();

@@ -13,6 +13,7 @@ use crate::{
     coding::{KeyValuePairs, TrackNamespace},
     message::{self, Message},
     mlog,
+    profile::WireProfile,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
 };
 
@@ -127,6 +128,8 @@ pub struct Publisher {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    selected_version: WireProfile,
 }
 
 impl Publisher {
@@ -136,6 +139,7 @@ impl Publisher {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        selected_version: WireProfile,
     ) -> Self {
         Self {
             webtransport,
@@ -150,7 +154,13 @@ impl Publisher {
             request_id,
             pending_requests,
             mlog,
+            selected_version,
         }
+    }
+
+    /// Returns the immutable wire profile selected for this publisher's session.
+    pub const fn selected_version(&self) -> WireProfile {
+        self.selected_version
     }
 
     pub async fn accept(
@@ -176,6 +186,22 @@ impl Publisher {
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
         Self::connect_with_config(session, transport, SessionConfig::default()).await
+    }
+
+    pub async fn connect_negotiated(
+        session: web_transport::Session,
+        transport: super::Transport,
+        selected_version: WireProfile,
+    ) -> Result<(Session, Publisher), SessionError> {
+        let (session, publisher, _) = Session::connect_with_profile(
+            session,
+            None,
+            transport,
+            selected_version,
+            SessionConfig::default(),
+        )
+        .await?;
+        Ok((session, publisher))
     }
 
     pub async fn connect_with_config(

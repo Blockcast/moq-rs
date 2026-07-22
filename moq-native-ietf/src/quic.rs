@@ -17,13 +17,16 @@ use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use url::Url;
 
-use moq_transport::session::Transport;
+use moq_transport::{profile::WireProfile, session::Transport};
 
 use crate::tls;
 
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
+
+type AcceptedSession = (web_transport::Session, String, Transport, WireProfile);
+type AcceptFuture = BoxFuture<'static, anyhow::Result<AcceptedSession>>;
 
 /// Represents the address family of the local QUIC socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +126,78 @@ fn build_transport_config() -> quinn::TransportConfig {
     transport
 }
 
+fn select_wire_profile(offered: &[String], supported: &[WireProfile]) -> Option<WireProfile> {
+    supported.iter().copied().find(|profile| {
+        offered
+            .iter()
+            .any(|offered| offered.as_str() == profile.name())
+    })
+}
+
+fn validate_selected_profile(
+    required: WireProfile,
+    selected: Option<&str>,
+) -> anyhow::Result<WireProfile> {
+    anyhow::ensure!(
+        selected == Some(required.name()),
+        "WebTransport protocol mismatch: required={} selected={}",
+        required,
+        selected.unwrap_or("<none>")
+    );
+    Ok(required)
+}
+
+fn offered_profiles_label(offered: &[String]) -> &'static str {
+    let draft19 = offered.iter().any(|profile| profile == "moqt-19");
+    let draft16 = offered.iter().any(|profile| profile == "moqt-16");
+    let unknown = offered
+        .iter()
+        .any(|profile| WireProfile::from_name(profile).is_none());
+    match (draft19, draft16, unknown) {
+        (false, false, false) => "none",
+        (true, false, false) => "moqt-19",
+        (false, true, false) => "moqt-16",
+        (true, true, false) => "moqt-19+moqt-16",
+        (false, false, true) => "unknown",
+        _ => "known+unknown",
+    }
+}
+
+fn supported_profiles_label(supported: &[WireProfile]) -> &'static str {
+    let draft19 = supported.contains(&WireProfile::Draft19);
+    let draft16 = supported.contains(&WireProfile::Draft16);
+    match (draft19, draft16) {
+        (false, false) => "none",
+        (true, false) => "moqt-19",
+        (false, true) => "moqt-16",
+        (true, true) => "moqt-19+moqt-16",
+    }
+}
+
+fn required_profile_label(offered: &[String]) -> &'static str {
+    if offered.len() != 1 {
+        return if offered.is_empty() {
+            "none"
+        } else {
+            "multiple"
+        };
+    }
+    WireProfile::from_name(&offered[0]).map_or("unknown", WireProfile::name)
+}
+
+fn connect_error_outcome(error: &quinn::ConnectionError) -> &'static str {
+    const NO_APPLICATION_PROTOCOL: u8 = 120;
+
+    match error {
+        quinn::ConnectionError::TransportError(error)
+            if error.code == quinn::TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL) =>
+        {
+            "mismatch"
+        }
+        _ => "connect_error",
+    }
+}
+
 #[derive(Parser, Clone)]
 pub struct Args {
     /// Listen for UDP packets on the given address.
@@ -211,6 +286,8 @@ pub struct Config {
     pub qlog_dir: Option<PathBuf>,
     pub tls: tls::Config,
     pub tags: HashSet<String>,
+    /// Wire profiles accepted by the endpoint, in server preference order.
+    pub wire_profiles: Vec<WireProfile>,
     /// Optional hook to wrap the [`quinn::AsyncUdpSocket`] before endpoint
     /// creation. Defaults to `None` (no wrapping). See [`SocketWrapperFn`].
     pub socket_wrapper: Option<SocketWrapperFn>,
@@ -230,6 +307,7 @@ impl Config {
             qlog_dir,
             tls,
             tags: HashSet::new(),
+            wire_profiles: vec![WireProfile::Draft16],
             socket_wrapper: None,
         })
     }
@@ -254,12 +332,23 @@ impl Config {
             qlog_dir,
             tls,
             tags: HashSet::new(),
+            wire_profiles: vec![WireProfile::Draft16],
             socket_wrapper: None,
         }
     }
 
     pub fn with_tag(mut self, tag: String) -> Self {
         self.tags.insert(tag);
+        self
+    }
+
+    pub fn with_wire_profiles(mut self, profiles: impl IntoIterator<Item = WireProfile>) -> Self {
+        self.wire_profiles.clear();
+        for profile in profiles {
+            if !self.wire_profiles.contains(&profile) {
+                self.wire_profiles.push(profile);
+            }
+        }
         self
     }
 
@@ -290,6 +379,10 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn new(config: Config) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !config.wire_profiles.is_empty(),
+            "at least one MoQT wire profile must be configured"
+        );
         // Validate qlog directory if provided
 
         if let Some(qlog_dir) = &config.qlog_dir {
@@ -304,14 +397,14 @@ impl Endpoint {
 
         // Build transport config with our standard settings
         let transport = Arc::new(build_transport_config());
+        let wire_profiles = config.wire_profiles.clone();
 
         let mut server_config = None;
 
         if let Some(mut config) = config.tls.server {
-            config.alpn_protocols = vec![
-                web_transport_quinn::ALPN.as_bytes().to_vec(),
-                moq_transport::setup::ALPN.to_vec(),
-            ];
+            config.alpn_protocols = std::iter::once(web_transport_quinn::ALPN.as_bytes().to_vec())
+                .chain(wire_profiles.iter().map(|profile| profile.alpn().to_vec()))
+                .collect();
             config.key_log = Arc::new(rustls::KeyLogFile::new());
 
             let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
@@ -352,6 +445,7 @@ impl Endpoint {
             accept: Default::default(),
             qlog_dir: config.qlog_dir.map(Arc::new),
             base_server_config: Arc::new(base_server_config),
+            wire_profiles: wire_profiles.clone(),
         });
 
         let client = Client {
@@ -359,6 +453,7 @@ impl Endpoint {
             config: config.tls.client,
             transport,
             is_dual_stack: config.is_dual_stack,
+            wire_profiles,
         };
 
         Ok(Self {
@@ -371,22 +466,22 @@ impl Endpoint {
 
 pub struct Server {
     quic: quinn::Endpoint,
-    accept: FuturesUnordered<
-        BoxFuture<'static, anyhow::Result<(web_transport::Session, String, Transport)>>,
-    >,
+    accept: FuturesUnordered<AcceptFuture>,
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
+    wire_profiles: Vec<WireProfile>,
 }
 
 impl Server {
-    pub async fn accept(&mut self) -> Option<(web_transport::Session, String, Transport)> {
+    pub async fn accept(&mut self) -> Option<AcceptedSession> {
         loop {
             tokio::select! {
                 res = self.quic.accept() => {
                     let conn = res?;
                     let qlog_dir = self.qlog_dir.clone();
                     let base_server_config = self.base_server_config.clone();
-                    self.accept.push(Self::accept_session(conn, qlog_dir, base_server_config).boxed());
+                    let wire_profiles = self.wire_profiles.clone();
+                    self.accept.push(Self::accept_session(conn, qlog_dir, base_server_config, wire_profiles).boxed());
                 },
                 res = self.accept.next(), if !self.accept.is_empty() => {
                     match res? {
@@ -405,7 +500,8 @@ impl Server {
         conn: quinn::Incoming,
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
-    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
+        wire_profiles: Vec<WireProfile>,
+    ) -> anyhow::Result<AcceptedSession> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
         let orig_dst_cid = conn.orig_dst_cid();
@@ -451,14 +547,14 @@ impl Server {
             .unwrap();
 
         let alpn = handshake.protocol.context("missing ALPN")?;
-        let alpn = String::from_utf8_lossy(&alpn);
+        let alpn_display = String::from_utf8_lossy(&alpn);
         let server_name = handshake.server_name.unwrap_or_default();
 
         tracing::debug!(
             "received QUIC handshake: cid={} ip={} alpn={} server={}",
             connection_id_hex,
             conn.remote_address(),
-            alpn,
+            alpn_display,
             server_name,
         );
 
@@ -470,33 +566,55 @@ impl Server {
             connection_id_hex,
             conn.stable_id(),
             conn.remote_address(),
-            alpn,
+            alpn_display,
             server_name,
         );
 
-        let alpn_bytes = alpn.as_bytes();
-        let (session, transport) = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
+        let (session, transport, selected_version) = if alpn == web_transport_quinn::ALPN.as_bytes()
+        {
             // Wait for the WebTransport CONNECT request (includes H3 SETTINGS exchange).
             let request = web_transport_quinn::Request::accept(conn)
                 .await
                 .context("failed to receive WebTransport request")?;
 
-            let moqt_protocol = std::str::from_utf8(moq_transport::setup::ALPN)
-                .context("invalid MoQT ALPN")?
-                .to_string();
-            let response = if request.protocols.contains(&moqt_protocol) {
-                web_transport_quinn::proto::ConnectResponse::OK.with_protocol(moqt_protocol)
-            } else {
-                web_transport_quinn::proto::ConnectResponse::OK
+            let selected_version = select_wire_profile(&request.protocols, &wire_profiles);
+            let Some(selected_version) = selected_version else {
+                let offered = request.protocols.join(",");
+                let supported = wire_profiles
+                    .iter()
+                    .map(|profile| profile.name())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                metrics::counter!(
+                    "moq_negotiation_total",
+                    "transport" => "webtransport",
+                    "outcome" => "mismatch",
+                    "offered" => offered_profiles_label(&request.protocols),
+                    "supported" => supported_profiles_label(&wire_profiles),
+                    "required" => required_profile_label(&request.protocols),
+                )
+                .increment(1);
+                request
+                    .reject(web_transport_quinn::http::StatusCode::BAD_REQUEST)
+                    .await
+                    .context("failed to reject WebTransport protocol mismatch")?;
+                anyhow::bail!(
+                    "WebTransport protocol mismatch: offered=[{}] supported=[{}]",
+                    offered,
+                    supported
+                );
             };
 
             // Accept the CONNECT request.
             let session = request
-                .respond(response)
+                .respond(
+                    web_transport_quinn::proto::ConnectResponse::OK
+                        .with_protocol(selected_version.name()),
+                )
                 .await
                 .context("failed to respond to WebTransport request")?;
-            (session, Transport::WebTransport)
-        } else if alpn_bytes == moq_transport::setup::ALPN {
+            (session, Transport::WebTransport, selected_version)
+        } else if let Some(selected_version) = WireProfile::from_alpn(&alpn) {
             // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
             let request = url::Url::parse("moqt://localhost").unwrap();
             let session = web_transport_quinn::Session::raw(
@@ -504,12 +622,17 @@ impl Server {
                 request,
                 web_transport_quinn::proto::ConnectResponse::default(),
             );
-            (session, Transport::RawQuic)
+            (session, Transport::RawQuic, selected_version)
         } else {
-            anyhow::bail!("unsupported ALPN: {}", alpn)
+            anyhow::bail!("unsupported ALPN: {}", alpn_display)
         };
 
-        Ok((session.into(), connection_id_hex, transport))
+        Ok((
+            session.into(),
+            connection_id_hex,
+            transport,
+            selected_version,
+        ))
     }
 
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {
@@ -525,6 +648,7 @@ pub struct Client {
     config: rustls::ClientConfig,
     transport: Arc<quinn::TransportConfig>,
     is_dual_stack: bool,
+    wire_profiles: Vec<WireProfile>,
 }
 
 impl Client {
@@ -558,13 +682,33 @@ impl Client {
         &self,
         url: &Url,
         socket_addr: Option<net::SocketAddr>,
-    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
+    ) -> anyhow::Result<(web_transport::Session, String, Transport, WireProfile)> {
+        self.connect_with_profile(url, socket_addr, WireProfile::Draft16)
+            .await
+    }
+
+    pub async fn connect_with_profile(
+        &self,
+        url: &Url,
+        socket_addr: Option<net::SocketAddr>,
+        required: WireProfile,
+    ) -> anyhow::Result<(web_transport::Session, String, Transport, WireProfile)> {
+        anyhow::ensure!(
+            self.wire_profiles.contains(&required),
+            "required MoQT profile {} is not enabled; supported=[{}]",
+            required,
+            self.wire_profiles
+                .iter()
+                .map(|profile| profile.name())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         let mut config = self.config.clone();
 
         // TODO support connecting to both ALPNs at the same time
         config.alpn_protocols = vec![match url.scheme() {
             "https" => web_transport_quinn::ALPN.as_bytes().to_vec(),
-            "moqt" => moq_transport::setup::ALPN.to_vec(),
+            "moqt" => required.alpn().to_vec(),
             _ => anyhow::bail!("url scheme must be 'https' or 'moqt'"),
         }];
 
@@ -605,7 +749,25 @@ impl Client {
             }
         };
 
-        let connection = self.quic.connect_with(config, addr, &host)?.await?;
+        let connection = match self.quic.connect_with(config, addr, &host)?.await {
+            Ok(connection) => connection,
+            Err(error) => {
+                metrics::counter!(
+                    "moq_negotiation_total",
+                    "transport" => match url.scheme() {
+                        "https" => "webtransport",
+                        "moqt" => "raw_quic",
+                        _ => "unknown",
+                    },
+                    "outcome" => connect_error_outcome(&error),
+                    "offered" => required.name(),
+                    "supported" => supported_profiles_label(&self.wire_profiles),
+                    "required" => required.name(),
+                )
+                .increment(1);
+                return Err(error.into());
+            }
+        };
 
         // Extract the CID that was used
         let connection_id_hex = cid_capture
@@ -615,30 +777,62 @@ impl Client {
             .context("CID not captured")?
             .to_string();
 
-        let (session, transport) = match url.scheme() {
+        let (session, transport, selected_version) = match url.scheme() {
             "https" => {
-                let moqt_protocol = std::str::from_utf8(moq_transport::setup::ALPN)
-                    .context("invalid MoQT ALPN")?
-                    .to_string();
                 let request = web_transport_quinn::proto::ConnectRequest::new(url.clone())
-                    .with_protocol(moqt_protocol);
+                    .with_protocol(required.name());
+                let session = web_transport_quinn::Session::connect(connection, request).await?;
+                let selected_version =
+                    validate_selected_profile(required, session.response().protocol.as_deref())?;
+                (session, Transport::WebTransport, selected_version)
+            }
+            "moqt" => {
+                let handshake = connection
+                    .handshake_data()
+                    .context("missing QUIC handshake data")?
+                    .downcast::<quinn::crypto::rustls::HandshakeData>()
+                    .map_err(|_| anyhow::anyhow!("invalid QUIC handshake data"))?;
+                let selected = handshake.protocol.context("missing ALPN")?;
+                let selected_version = WireProfile::from_alpn(&selected)
+                    .context("server selected an unsupported MoQT ALPN")?;
+                anyhow::ensure!(
+                    selected_version == required,
+                    "native QUIC protocol mismatch: required={} selected={}",
+                    required,
+                    selected_version
+                );
                 (
-                    web_transport_quinn::Session::connect(connection, request).await?,
-                    Transport::WebTransport,
+                    web_transport_quinn::Session::raw(
+                        connection,
+                        url.clone(),
+                        web_transport_quinn::proto::ConnectResponse::default(),
+                    ),
+                    Transport::RawQuic,
+                    selected_version,
                 )
             }
-            "moqt" => (
-                web_transport_quinn::Session::raw(
-                    connection,
-                    url.clone(),
-                    web_transport_quinn::proto::ConnectResponse::default(),
-                ),
-                Transport::RawQuic,
-            ),
             _ => unreachable!(),
         };
 
-        Ok((session.into(), connection_id_hex, transport))
+        metrics::counter!(
+            "moq_negotiation_total",
+            "transport" => match transport {
+                Transport::WebTransport => "webtransport",
+                Transport::RawQuic => "raw_quic",
+            },
+            "outcome" => "selected",
+            "offered" => required.name(),
+            "supported" => supported_profiles_label(&self.wire_profiles),
+            "required" => required.name(),
+        )
+        .increment(1);
+
+        Ok((
+            session.into(),
+            connection_id_hex,
+            transport,
+            selected_version,
+        ))
     }
 
     /// Default DNS resolution logic that filters results by address family.
@@ -731,7 +925,58 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn tls_config() -> tls::Config {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = CertificateDer::from(certified.cert.der().to_vec());
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let mut config = tls::Args {
+            disable_verify: true,
+            ..Default::default()
+        }
+        .load()
+        .unwrap();
+        config.server = Some(server);
+        config
+    }
+
+    fn endpoint(profiles: &[WireProfile]) -> Endpoint {
+        Endpoint::new(
+            Config::new("127.0.0.1:0".parse().unwrap(), None, tls_config())
+                .unwrap()
+                .with_wire_profiles(profiles.iter().copied()),
+        )
+        .unwrap()
+    }
+
+    async fn negotiate(
+        scheme: &str,
+        server_profiles: &[WireProfile],
+        required: WireProfile,
+    ) -> (
+        anyhow::Result<(web_transport::Session, String, Transport, WireProfile)>,
+        tokio::task::JoinHandle<Option<(web_transport::Session, String, Transport, WireProfile)>>,
+    ) {
+        let mut server = endpoint(server_profiles).server.unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = endpoint(&[required]).client;
+        let accept = tokio::spawn(async move { server.accept().await });
+        let url = Url::parse(&format!("{scheme}://localhost:{}/", addr.port())).unwrap();
+        let connected = client
+            .connect_with_profile(&url, Some(addr), required)
+            .await;
+        (connected, accept)
+    }
 
     /// Installing a pass-through socket wrapper must still produce a working
     /// endpoint. Exercises the `socket_wrapper` branch of `Endpoint::new`,
@@ -767,5 +1012,105 @@ mod tests {
             endpoint.server.is_none(),
             "client-only TLS config should yield no server"
         );
+    }
+
+    #[test]
+    fn webtransport_requires_exact_selected_protocol() {
+        assert_eq!(
+            validate_selected_profile(WireProfile::Draft19, Some("moqt-19")).unwrap(),
+            WireProfile::Draft19
+        );
+        assert!(validate_selected_profile(WireProfile::Draft19, Some("moqt-16")).is_err());
+        assert!(validate_selected_profile(WireProfile::Draft19, None).is_err());
+    }
+
+    #[test]
+    fn webtransport_selects_only_an_exact_common_protocol() {
+        let offered = vec!["moqt-19-preview".to_string(), "moqt-16".to_string()];
+        assert_eq!(
+            select_wire_profile(&offered, &[WireProfile::Draft19, WireProfile::Draft16]),
+            Some(WireProfile::Draft16)
+        );
+        assert_eq!(
+            select_wire_profile(&["moqt-19-preview".to_string()], &[WireProfile::Draft19]),
+            None
+        );
+    }
+
+    #[test]
+    fn wire_profiles_are_unique_in_preference_order() {
+        let config = Config::new("127.0.0.1:0".parse().unwrap(), None, tls_config())
+            .unwrap()
+            .with_wire_profiles([
+                WireProfile::Draft19,
+                WireProfile::Draft16,
+                WireProfile::Draft19,
+            ]);
+
+        assert_eq!(
+            config.wire_profiles,
+            vec![WireProfile::Draft19, WireProfile::Draft16]
+        );
+    }
+
+    #[test]
+    fn only_no_application_protocol_is_a_negotiation_mismatch() {
+        let mismatch =
+            quinn::ConnectionError::TransportError(quinn::TransportErrorCode::crypto(120).into());
+
+        assert_eq!(connect_error_outcome(&mismatch), "mismatch");
+        assert_eq!(
+            connect_error_outcome(&quinn::ConnectionError::TimedOut),
+            "connect_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_quic_selects_exact_moqt_19() {
+        let (client, server) =
+            negotiate("moqt", &[WireProfile::Draft19], WireProfile::Draft19).await;
+        let (_, _, transport, selected) = client.unwrap();
+        assert_eq!(transport, Transport::RawQuic);
+        assert_eq!(selected, WireProfile::Draft19);
+        let (_, _, transport, selected) = server.await.unwrap().unwrap();
+        assert_eq!(transport, Transport::RawQuic);
+        assert_eq!(selected, WireProfile::Draft19);
+    }
+
+    #[tokio::test]
+    async fn native_quic_rejects_moqt_19_to_moqt_16() {
+        let (client, server) =
+            negotiate("moqt", &[WireProfile::Draft16], WireProfile::Draft19).await;
+        let error = match client {
+            Ok(_) => panic!("mismatched ALPN unexpectedly connected"),
+            Err(error) => error.to_string().to_ascii_lowercase(),
+        };
+        assert!(
+            error.contains("application protocol") || error.contains("peer doesn't support"),
+            "unexpected TLS error: {error}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn webtransport_selects_and_echoes_exact_moqt_19() {
+        let (client, server) =
+            negotiate("https", &[WireProfile::Draft19], WireProfile::Draft19).await;
+        let (session, _, transport, selected) = client.unwrap();
+        assert_eq!(session.protocol(), Some("moqt-19"));
+        assert_eq!(transport, Transport::WebTransport);
+        assert_eq!(selected, WireProfile::Draft19);
+        let (session, _, transport, selected) = server.await.unwrap().unwrap();
+        assert_eq!(session.protocol(), Some("moqt-19"));
+        assert_eq!(transport, Transport::WebTransport);
+        assert_eq!(selected, WireProfile::Draft19);
+    }
+
+    #[tokio::test]
+    async fn webtransport_rejects_without_an_exact_common_protocol() {
+        let (client, server) =
+            negotiate("https", &[WireProfile::Draft16], WireProfile::Draft19).await;
+        assert!(client.is_err());
+        server.abort();
     }
 }

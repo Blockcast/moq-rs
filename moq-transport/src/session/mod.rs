@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex};
 use crate::coding::{KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
+use crate::profile::WireProfile;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
@@ -65,6 +66,12 @@ pub enum Transport {
     /// Raw QUIC with MoQT framing directly on QUIC streams.
     /// ALPN: "moqt-16". Path carried in CLIENT_SETUP PATH parameter.
     RawQuic,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct NegotiatedProtocol {
+    transport: Transport,
+    selected_version: WireProfile,
 }
 
 const DEFAULT_MAX_REQUEST_ID: u64 = 100;
@@ -112,6 +119,9 @@ pub struct Session {
 
     /// The transport protocol negotiated for this connection.
     transport: Transport,
+
+    /// Exact wire profile selected by ALPN or WebTransport subprotocol negotiation.
+    selected_version: WireProfile,
 
     /// The connection path, derived from the WebTransport URL path or CLIENT_SETUP PATH parameter.
     /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
@@ -216,6 +226,11 @@ impl Session {
     /// Returns the negotiated transport protocol for this connection.
     pub fn transport(&self) -> Transport {
         self.transport
+    }
+
+    /// Returns the immutable wire profile verified by transport negotiation.
+    pub const fn selected_version(&self) -> WireProfile {
+        self.selected_version
     }
 
     /// Returns the connection path, if one was present on the incoming connection.
@@ -468,7 +483,7 @@ impl Session {
         sender: Writer,
         recver: Reader,
         mlog: Option<mlog::MlogWriter>,
-        transport: Transport,
+        protocol: NegotiatedProtocol,
         connection_path: Option<String>,
         request_id: RequestId,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
@@ -484,12 +499,14 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
+            protocol.selected_version,
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
+            protocol.selected_version,
         ));
 
         let session = Self {
@@ -502,7 +519,8 @@ impl Session {
             request_id,
             pending_requests,
             mlog: mlog_shared,
-            transport,
+            transport: protocol.transport,
+            selected_version: protocol.selected_version,
             connection_path,
         };
 
@@ -522,7 +540,14 @@ impl Session {
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
-        Self::connect_with_config(session, mlog_path, transport, SessionConfig::default()).await
+        Self::connect_with_profile(
+            session,
+            mlog_path,
+            transport,
+            WireProfile::Draft16,
+            SessionConfig::default(),
+        )
+        .await
     }
 
     /// Create an outbound/client QUIC connection with explicit session configuration.
@@ -530,6 +555,18 @@ impl Session {
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_profile(session, mlog_path, transport, WireProfile::Draft16, config)
+            .await
+    }
+
+    /// Create an outbound connection with a transport-verified wire profile.
+    pub async fn connect_with_profile(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        selected_version: WireProfile,
         config: SessionConfig,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let url = session.url().clone();
@@ -606,7 +643,18 @@ impl Session {
         Self::log_peer_max_request_id(peer_max);
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
-        let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
+        let session = Session::new(
+            session,
+            sender,
+            recver,
+            mlog,
+            NegotiatedProtocol {
+                transport,
+                selected_version,
+            },
+            path,
+            request_id,
+        );
         let publisher = session.1.ok_or(SessionError::Internal)?;
         let subscriber = session.2.ok_or(SessionError::Internal)?;
         Ok((session.0, publisher, subscriber))
@@ -622,7 +670,14 @@ impl Session {
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
-        Self::accept_with_config(session, mlog_path, transport, SessionConfig::default()).await
+        Self::accept_with_profile(
+            session,
+            mlog_path,
+            transport,
+            WireProfile::Draft16,
+            SessionConfig::default(),
+        )
+        .await
     }
 
     /// Accept an inbound server connection with explicit session configuration.
@@ -630,6 +685,17 @@ impl Session {
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        Self::accept_with_profile(session, mlog_path, transport, WireProfile::Draft16, config).await
+    }
+
+    /// Accept an inbound connection with a transport-verified wire profile.
+    pub async fn accept_with_profile(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        selected_version: WireProfile,
         config: SessionConfig,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|p| {
@@ -709,7 +775,10 @@ impl Session {
             sender,
             recver,
             mlog,
-            transport,
+            NegotiatedProtocol {
+                transport,
+                selected_version,
+            },
             connection_path,
             request_id,
         ))

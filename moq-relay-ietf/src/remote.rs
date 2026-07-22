@@ -327,19 +327,21 @@ impl Remote {
         cache_key: RemoteCacheKey,
         cache_slot: Weak<Mutex<Option<Remote>>>,
     ) -> anyhow::Result<Self> {
-        let (session, _quic_client_initial_cid, transport) = match client.connect(&url, addr).await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
-                    .increment(1);
-                return Err(err);
-            }
-        };
+        let (session, _quic_client_initial_cid, transport, selected_version) =
+            match client.connect(&url, addr).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
+                        .increment(1);
+                    return Err(err);
+                }
+            };
 
-        let (session, subscriber) = match moq_transport::session::Subscriber::connect_with_config(
+        let (session, _, subscriber) = match moq_transport::session::Session::connect_with_profile(
             session,
+            None,
             transport,
+            selected_version,
             session_config,
         )
         .await

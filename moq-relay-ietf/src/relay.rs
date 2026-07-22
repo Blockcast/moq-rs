@@ -21,6 +21,7 @@ type ServerFuture = Pin<
                     web_transport::Session,
                     String,
                     moq_transport::session::Transport,
+                    moq_transport::profile::WireProfile,
                 )>,
                 quic::Server,
             ),
@@ -154,17 +155,18 @@ impl Relay {
                 tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
 
                 // Establish a QUIC connection to the forward URL
-                let (session, _quic_client_initial_cid, transport) = quic_endpoints[0]
+                let (session, _quic_client_initial_cid, transport, selected_version) = quic_endpoints[0]
                     .client
                     .connect(url, None)
                     .await
                     .context("failed to establish forward connection")?;
 
                 // Create the MoQ session over the connection
-                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
+                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_profile(
                     session,
                     None,
                     transport,
+                    selected_version,
                     session_config,
                 )
                 .await
@@ -250,9 +252,17 @@ impl Relay {
                             .boxed(),
                         );
 
-                        let (conn, connection_id, transport) = conn_result.context("failed to accept QUIC connection")?;
+                        let (conn, connection_id, transport, selected_version) = conn_result.context("failed to accept QUIC connection")?;
 
-                        metrics::counter!("moq_relay_connections_total").increment(1);
+                        metrics::counter!(
+                            "moq_relay_connections_total",
+                            "transport" => match transport {
+                                moq_transport::session::Transport::WebTransport => "webtransport",
+                                moq_transport::session::Transport::RawQuic => "raw_quic",
+                            },
+                            "selected_version" => selected_version.name(),
+                        )
+                        .increment(1);
 
                         // Construct mlog path from connection ID if mlog directory is configured
                         let mlog_path = mlog_dir.as_ref()
@@ -273,7 +283,7 @@ impl Relay {
                             let raw_conn = conn.clone();
 
                             // Create the MoQ session over the connection (setup handshake etc)
-                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(conn, mlog_path, transport, session_config).await {
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_profile(conn, mlog_path, transport, selected_version, session_config).await {
                                 Ok(session) => session,
                                 Err(err) => {
                                     tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
