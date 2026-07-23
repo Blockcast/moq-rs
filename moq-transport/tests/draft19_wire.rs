@@ -211,6 +211,57 @@ fn draft19_goaway_duplicate_tracking_is_scoped_per_stream() {
 }
 
 #[test]
+fn draft19_goaway_record_sent_rejects_a_second_send_on_one_stream() {
+    let now = Instant::now();
+    let goaway = GoAway {
+        new_session_uri: SessionUri(String::new()),
+        timeout_ms: 1,
+    };
+    let mut state = GoAwayState::default();
+    state.record_sent(&goaway, now).unwrap();
+    assert_eq!(
+        state.record_sent(&goaway, now).unwrap_err(),
+        StreamProtocolError::DuplicateGoAway
+    );
+}
+
+#[test]
+fn draft19_goaway_sent_and_received_are_tracked_independently() {
+    let now = Instant::now();
+    let goaway = GoAway {
+        new_session_uri: SessionUri(String::new()),
+        timeout_ms: 1,
+    };
+
+    // Recording a sent GOAWAY must not mark the stream as having received one.
+    let mut sender = GoAwayState::default();
+    sender.record_sent(&goaway, now).unwrap();
+    assert!(sender.sent());
+    assert!(!sender.received());
+
+    // ...and vice versa: a received GOAWAY leaves the sent flag clear.
+    let mut receiver = GoAwayState::default();
+    receiver.record_received().unwrap();
+    assert!(receiver.received());
+    assert!(!receiver.sent());
+}
+
+#[test]
+fn draft19_goaway_decode_rejects_a_within_cap_length_overrunning_the_payload() {
+    // A URI length that is under the 8,192 cap but larger than the bytes that
+    // actually follow must be a clean decode error, never a panic on the
+    // fixed-size copy that materializes the URI.
+    let mut payload = Vec::new();
+    Vi64::new(64).encode(&mut payload).unwrap();
+    payload.extend_from_slice(b"short");
+    let truncated = Frame {
+        message_type: GOAWAY_TYPE,
+        payload: payload.into(),
+    };
+    assert!(GoAway::from_frame(&truncated).is_err());
+}
+
+#[test]
 fn draft19_goaway_timeout_zero_never_expires_and_nonzero_is_an_upper_hint() {
     let now = Instant::now();
     let mut no_deadline = GoAwayState::default();

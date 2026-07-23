@@ -6,8 +6,8 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::profile::draft19::{
-    ControlStreamPair, Frame, GoAway, GoAwayState, RequestStream, RequestStreamRole, Setup,
-    StreamAction, StreamErrorCode, StreamProtocolError, GOAWAY_TYPE,
+    ControlStreamPair, Frame, GoAway, GoAwayState, RequestStream, RequestStreamRole,
+    SessionErrorCode, Setup, StreamAction, StreamErrorCode, StreamProtocolError, GOAWAY_TYPE,
 };
 use crate::profile::WireProfile;
 
@@ -52,6 +52,19 @@ fn request_goaway_timeout_action(
         Err(StreamProtocolError::InvalidTransition) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Pure decision for control-stream GOAWAY timeout enforcement: yields the
+/// session error code the sender closes with once its advertised timeout has
+/// elapsed while requests are still open, or `None` to leave the session open.
+/// Mirrors `request_goaway_timeout_action` so the close decision is testable
+/// without a live transport.
+fn control_goaway_timeout_action(
+    goaway: &GoAwayState,
+    now: Instant,
+    has_open_requests: bool,
+) -> Option<SessionErrorCode> {
+    (has_open_requests && goaway.timeout_expired(now)).then_some(SessionErrorCode::GoAwayTimeout)
 }
 
 #[derive(Debug, Error)]
@@ -167,14 +180,14 @@ impl Draft19Session {
     }
 
     pub fn enforce_control_goaway_timeout(&self, now: Instant, has_open_requests: bool) -> bool {
-        if has_open_requests && self.control_goaway.timeout_expired(now) {
-            self.session.close(
-                crate::profile::draft19::SessionErrorCode::GoAwayTimeout as u32,
-                "GOAWAY timeout elapsed with open requests",
-            );
-            return true;
+        match control_goaway_timeout_action(&self.control_goaway, now, has_open_requests) {
+            Some(code) => {
+                self.session
+                    .close(code as u32, "GOAWAY timeout elapsed with open requests");
+                true
+            }
+            None => false,
         }
-        false
     }
 
     pub fn close_after_goaway(&self) -> Result<(), Draft19SessionError> {
@@ -469,6 +482,24 @@ mod tests {
             request_goaway_timeout_action(&goaway, &mut lifecycle, now + Duration::from_millis(1),)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn control_goaway_timeout_closes_with_goaway_timeout_only_after_expiry_with_open_requests() {
+        let now = Instant::now();
+        let goaway = active_goaway(now); // timeout_ms: 1
+        let expired = now + Duration::from_millis(1);
+
+        // Not yet expired: no close even with open requests.
+        assert_eq!(control_goaway_timeout_action(&goaway, now, true), None);
+        // Expired but nothing left to drain: no close.
+        assert_eq!(control_goaway_timeout_action(&goaway, expired, false), None);
+        // Expired with open requests: force close, and specifically with
+        // GOAWAY_TIMEOUT (not any other session code).
+        assert_eq!(
+            control_goaway_timeout_action(&goaway, expired, true),
+            Some(SessionErrorCode::GoAwayTimeout)
         );
     }
 }
