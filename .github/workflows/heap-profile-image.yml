@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2026 Blockcast Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Publish heap-profile image
+
+on:
+  push:
+    branches:
+      - release/blo-17747-heap-profile-image
+    paths:
+      - .github/workflows/heap-profile-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REVISION: 4dd3491c0a60f9e44546318cb562f6c089d559ac
+  BASE_REVISION: ec22a944e656163ef41fcd6de77199f28a34f15c
+  PROFILE_KIND: heap
+  IMAGE: registry.blockcast.net/blockcast/pim-multicast-gateway/moq-pub-mmtp
+  TAG: heap-profile-4dd3491-blo-17747
+
+jobs:
+  build-push-verify:
+    runs-on: default
+    steps:
+      - name: Check out immutable profiling source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REVISION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to audited Harbor registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.blockcast.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push dedicated non-production image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          build-args: |
+            HEAP_PROFILING=1
+            SOURCE_REVISION=${{ env.SOURCE_REVISION }}
+            BASE_REVISION=${{ env.BASE_REVISION }}
+            PROFILE_KIND=${{ env.PROFILE_KIND }}
+
+      - name: Pull immutable digest and verify OCI contract
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          REF="$IMAGE@$DIGEST"
+          docker pull --platform linux/amd64 "$REF"
+          test "$(docker image inspect "$REF" --format '{{.Architecture}}')" = "amd64"
+          test "$(docker image inspect "$REF" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_REVISION"
+          test "$(docker image inspect "$REF" --format '{{index .Config.Labels "org.opencontainers.image.base.revision"}}')" = "$BASE_REVISION"
+          test "$(docker image inspect "$REF" --format '{{index .Config.Labels "org.blockcast.profile.kind"}}')" = "$PROFILE_KIND"
+          test "$(docker image inspect "$REF" --format '{{json .Config.Cmd}}')" = '["moq-relay"]'
+          docker run --rm --memory=512m "$REF" moq-pub-mmtp --help
+          {
+            echo "## Published heap-profile image"
+            echo
+            echo "- Tag: \`$IMAGE:$TAG\`"
+            echo "- Digest: \`$REF\`"
+            echo "- Source: \`$SOURCE_REVISION\`"
+            echo "- Behavior base: \`$BASE_REVISION\`"
+            echo "- Platform: \`linux/amd64\`"
+            echo "- Profile: \`$PROFILE_KIND\`"
+            echo "- CLI smoke: \`moq-pub-mmtp --help\` under 512 MiB passed"
+          } >> "$GITHUB_STEP_SUMMARY"
