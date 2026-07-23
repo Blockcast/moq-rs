@@ -378,6 +378,8 @@ pub enum StreamProtocolError {
     ControlStreamClosed,
     #[error("received or sent multiple GOAWAY messages on one stream")]
     DuplicateGoAway,
+    #[error("server received GOAWAY with a non-empty New Session URI")]
+    ServerGoAwayWithNewSessionUri,
 }
 
 impl StreamProtocolError {
@@ -387,7 +389,8 @@ impl StreamProtocolError {
             | Self::InvalidFirstMessage { .. }
             | Self::InvalidFirstResponse { .. }
             | Self::ControlStreamClosed
-            | Self::DuplicateGoAway => Some(SessionErrorCode::ProtocolViolation),
+            | Self::DuplicateGoAway
+            | Self::ServerGoAwayWithNewSessionUri => Some(SessionErrorCode::ProtocolViolation),
             Self::PrematureFin | Self::InvalidTransition => None,
         }
     }

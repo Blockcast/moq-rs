@@ -11,6 +11,7 @@ use moq_transport::profile::draft19::{
     StreamProtocolError, GOAWAY_TYPE,
 };
 use moq_transport::profile::WireProfile;
+use moq_transport::session::Draft19SessionRole;
 
 fn encode<T: Encode>(value: &T) -> Vec<u8> {
     let mut wire = Vec::new();
@@ -191,6 +192,42 @@ fn draft19_goaway_enforces_the_8192_byte_uri_cap_on_both_paths() {
         payload: payload.into(),
     };
     assert!(GoAway::from_frame(&oversized_frame).is_err());
+}
+
+#[test]
+fn draft19_goaway_new_session_uri_is_role_aware_at_the_session_boundary() {
+    let empty = GoAway {
+        new_session_uri: SessionUri(String::new()),
+        timeout_ms: 0,
+    };
+    Draft19SessionRole::Server
+        .validate_received_goaway(&empty)
+        .unwrap();
+    Draft19SessionRole::Client
+        .validate_received_goaway(&empty)
+        .unwrap();
+
+    let maximum = GoAway::from_frame(
+        &GoAway {
+            new_session_uri: SessionUri("x".repeat(8_192)),
+            timeout_ms: 1,
+        }
+        .into_frame()
+        .unwrap(),
+    )
+    .unwrap();
+    Draft19SessionRole::Client
+        .validate_received_goaway(&maximum)
+        .unwrap();
+
+    let error = Draft19SessionRole::Server
+        .validate_received_goaway(&maximum)
+        .unwrap_err();
+    assert_eq!(error, StreamProtocolError::ServerGoAwayWithNewSessionUri);
+    assert_eq!(
+        error.session_code(),
+        Some(SessionErrorCode::ProtocolViolation)
+    );
 }
 
 #[test]
