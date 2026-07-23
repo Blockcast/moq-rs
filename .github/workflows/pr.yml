@@ -45,3 +45,21 @@ jobs:
       # runner image — install into the writable CARGO_HOME instead.
       - run: cargo install cargo-machete --locked
       - run: cargo machete
+
+  heap-profile-image:
+    runs-on: default
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test -p moq-transport
+      - run: cargo test -p moq-pub-mmtp --features heap-profiling heap_profile_and_allocator_totals_are_non_empty
+        env:
+          _RJEM_MALLOC_CONF: prof:true,prof_active:false,lg_prof_sample:0
+      - run: >-
+          docker build --file Dockerfile
+          --build-arg HEAP_PROFILING=1
+          --build-arg SOURCE_REVISION=${{ github.sha }}
+          --build-arg BASE_REVISION=ec22a944e656163ef41fcd6de77199f28a34f15c
+          --build-arg PROFILE_KIND=heap
+          --tag moq-pub-mmtp:heap-profile-${{ github.sha }} .

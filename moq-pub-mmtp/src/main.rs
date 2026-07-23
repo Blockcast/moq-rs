@@ -31,6 +31,10 @@ use publish::{
     dispatch, RepairSink, SharedPresentationEpoch, TrackState, CONTROL_PRIORITY, SOURCE_PRIORITY,
 };
 
+#[cfg(feature = "heap-profiling")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // The canonical MSF catalog has no publisher-retention field. Keep the policy
 // explicit and bounded in the runtime until it is configurable outside the
 // wire schema.

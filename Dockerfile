@@ -56,14 +56,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     find . -path '*/src/*.rs' -o -path '*/src/**/*.rs' | xargs touch && \
     cargo build --release && cp /build/target/release/moq-* /usr/local/cargo/bin
 
-# Optional: overwrite moq-pub-mmtp with a profiling-enabled build (feature
-# `profiling` = on-demand pprof endpoint, itself inert unless MOQ_PUB_PROFILE_ADDR
-# is set at runtime). `--build-arg PROFILING=1` swaps in the profiling binary;
-# unset (the default) makes this a no-op and the default binary is unchanged.
+# Optional: overwrite moq-pub-mmtp with a profiling-enabled build. CPU profiling
+# uses PROFILING=1; retained-allocation profiling uses HEAP_PROFILING=1 and the
+# jemalloc-backed `heap-profiling` feature. Both remain runtime-gated by
+# MOQ_PUB_PROFILE_ADDR; the default image is unchanged.
 ARG PROFILING=""
+ARG HEAP_PROFILING=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    if [ -n "$PROFILING" ]; then \
+    if [ -n "$HEAP_PROFILING" ]; then \
+      JEMALLOC_SYS_WITH_MALLOC_CONF="prof:true,prof_active:false,lg_prof_sample:19" \
+        RUSTFLAGS="-C force-frame-pointers=yes" \
+        cargo rustc --release -p moq-pub-mmtp --features heap-profiling -- \
+          -C link-arg=-no-pie && \
+      cp /build/target/release/moq-pub-mmtp /usr/local/cargo/bin/moq-pub-mmtp; \
+    elif [ -n "$PROFILING" ]; then \
       cargo build --release -p moq-pub-mmtp --features profiling && \
       cp /build/target/release/moq-pub-mmtp /usr/local/cargo/bin/moq-pub-mmtp; \
     fi
@@ -87,12 +94,20 @@ CMD [ "publish" ]
 # Create an image with just the binaries
 FROM debian:bookworm-slim
 
+ARG SOURCE_REVISION="unknown"
+ARG BASE_REVISION="unknown"
+ARG PROFILE_KIND="default"
+
 RUN apt-get update && \
 	apt-get install -y --no-install-recommends ca-certificates curl libssl3 && \
 	rm -rf /var/lib/apt/lists/*
 
-LABEL org.opencontainers.image.source=https://github.com/kixelated/moq-rs
+LABEL org.opencontainers.image.source=https://github.com/Blockcast/moq-rs
 LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+LABEL org.opencontainers.image.base.revision=$BASE_REVISION
+LABEL org.opencontainers.image.description="moq-rs binaries"
+LABEL org.blockcast.profile.kind=$PROFILE_KIND
 
 COPY --from=builder /usr/local/cargo/bin/moq-* /usr/local/bin
 
