@@ -37,6 +37,10 @@ jobs:
 
       # Make sure u guys don't write bad code
       - run: cargo test --verbose
+      - name: Verify production shred datagram delivery
+        run: |
+          cargo build -p moq-relay-ietf -p moq-pub-mmtp -p moq-sub-raw
+          bash moq-pub-mmtp/tests/shred-datagram-e2e.sh
       - run: cargo clippy --no-deps
       - run: cargo fmt --check
 
