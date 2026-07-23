@@ -25,6 +25,16 @@ fail() {
   exit 1
 }
 
+wait_for_log() {
+  local pid=$1 log=$2 pattern=$3
+  for _ in $(seq 1 50); do
+    grep -qF "$pattern" "$log" 2>/dev/null && return
+    kill -0 "$pid" 2>/dev/null || fail "process exited while waiting for: $pattern"
+    sleep 0.1
+  done
+  fail "timed out waiting for: $pattern"
+}
+
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$TMP/key.pem" -out "$TMP/cert.pem" -days 1 \
   -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost' \
@@ -38,7 +48,7 @@ dd if=/dev/zero of="$TMP/input.bin" bs=1228 count=1 status=none
   --coordinator-file "$TMP/coordinator.json" \
   >"$TMP/relay.log" 2>&1 &
 RELAY_PID=$!
-sleep 1
+wait_for_log "$RELAY_PID" "$TMP/relay.log" "listening on 127.0.0.1:4443"
 
 "$ROOT/target/debug/moq-pub-mmtp" moqt://localhost:4443 \
   --name solana-shreds \
@@ -49,7 +59,7 @@ sleep 1
   --tls-disable-verify \
   >"$TMP/publisher.log" 2>&1 &
 PUB_PID=$!
-sleep 1
+wait_for_log "$PUB_PID" "$TMP/publisher.log" "listening for datagrams"
 
 "$ROOT/target/debug/moq-sub-raw" moqt://localhost:4443 \
   --name solana-shreds \
@@ -59,7 +69,7 @@ sleep 1
   --tls-disable-verify \
   >"$TMP/subscriber.log" 2>&1 &
 SUB_PID=$!
-sleep 2
+wait_for_log "$SUB_PID" "$TMP/relay.log" "serving subscribe from local"
 
 # One dd output block is one UDP datagram. Smaller default blocks would create
 # multiple datagrams and test latest-wins loss rather than the 1,228-byte MTU.
