@@ -75,6 +75,21 @@ pub enum Draft19SessionError {
     Protocol(#[from] StreamProtocolError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Draft19SessionRole {
+    Client,
+    Server,
+}
+
+impl Draft19SessionRole {
+    pub fn validate_received_goaway(self, goaway: &GoAway) -> Result<(), StreamProtocolError> {
+        if self == Self::Server && !goaway.new_session_uri.0.is_empty() {
+            return Err(StreamProtocolError::ServerGoAwayWithNewSessionUri);
+        }
+        Ok(())
+    }
+}
+
 /// Operational draft-19 stream core.
 ///
 /// Construction opens the local unidirectional control stream, sends SETUP,
@@ -83,6 +98,7 @@ pub enum Draft19SessionError {
 /// the explicit draft-19 profile.
 pub struct Draft19Session {
     session: web_transport::Session,
+    role: Draft19SessionRole,
     control_sender: Writer,
     control_receiver: Reader,
     control_state: ControlStreamPair,
@@ -101,6 +117,7 @@ impl Draft19Session {
 
     pub async fn establish(
         session: web_transport::Session,
+        role: Draft19SessionRole,
         profile: WireProfile,
         local_setup: Setup,
     ) -> Result<Self, Draft19SessionError> {
@@ -120,6 +137,7 @@ impl Draft19Session {
 
         Ok(Self {
             session,
+            role,
             control_sender,
             control_receiver,
             control_state,
@@ -171,9 +189,12 @@ impl Draft19Session {
             .await
             .map_err(|error| control_error(&self.session, error))?;
         if frame.message_type == GOAWAY_TYPE {
-            GoAway::from_frame(&frame)
+            let goaway = GoAway::from_frame(&frame)
                 .map_err(SessionError::from)
                 .map_err(|error| control_error(&self.session, error))?;
+            if let Err(error) = self.role.validate_received_goaway(&goaway) {
+                return Err(self.protocol_error(error));
+            }
             if let Err(error) = self.control_goaway.record_received() {
                 return Err(self.protocol_error(error));
             }
@@ -219,6 +240,7 @@ impl Draft19Session {
         let (send, recv) = self.session.open_bi().await.map_err(SessionError::from)?;
         let mut stream = Draft19RequestStream {
             session: self.session.clone(),
+            role: self.role,
             sender: Writer::new(send),
             receiver: Reader::new(recv),
             lifecycle,
@@ -243,6 +265,7 @@ impl Draft19Session {
         .map_err(|error| self.protocol_error(error))?;
         Ok(Draft19RequestStream {
             session: self.session.clone(),
+            role: self.role,
             sender: Writer::new(send),
             receiver,
             lifecycle,
@@ -253,6 +276,7 @@ impl Draft19Session {
 
 pub struct Draft19RequestStream {
     session: web_transport::Session,
+    role: Draft19SessionRole,
     sender: Writer,
     receiver: Reader,
     lifecycle: RequestStream,
@@ -295,9 +319,12 @@ impl Draft19RequestStream {
             .await
             .map_err(|error| transport_error(&self.session, error))?;
         if frame.message_type == GOAWAY_TYPE {
-            GoAway::from_frame(&frame)
+            let goaway = GoAway::from_frame(&frame)
                 .map_err(SessionError::from)
                 .map_err(|error| transport_error(&self.session, error))?;
+            if let Err(error) = self.role.validate_received_goaway(&goaway) {
+                return Err(self.protocol_error(error));
+            }
             if let Err(error) = self.goaway.record_received() {
                 return Err(self.protocol_error(error));
             }
@@ -342,9 +369,12 @@ impl Draft19RequestStream {
             .await
             .map_err(|error| transport_error(&self.session, error))?;
         if frame.message_type == GOAWAY_TYPE {
-            GoAway::from_frame(&frame)
+            let goaway = GoAway::from_frame(&frame)
                 .map_err(SessionError::from)
                 .map_err(|error| transport_error(&self.session, error))?;
+            if let Err(error) = self.role.validate_received_goaway(&goaway) {
+                return Err(self.protocol_error(error));
+            }
             if let Err(error) = self.goaway.record_received() {
                 return Err(self.protocol_error(error));
             }
