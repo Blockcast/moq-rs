@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Blockcast Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::time::{Duration, Instant};
+
 use bytes::{Buf, Bytes, BytesMut};
-use moq_transport::coding::{Decode, Encode, Vi64};
+use moq_transport::coding::{Decode, Encode, SessionUri, Vi64};
 use moq_transport::profile::draft19::{
-    ControlStreamPair, Frame, RequestKind, RequestStream, RequestStreamRole, SessionErrorCode,
-    Setup, SetupOption, SetupOptions, StreamAction, StreamErrorCode, StreamProtocolError,
+    ControlStreamPair, Frame, GoAway, GoAwayState, RequestKind, RequestStream, RequestStreamRole,
+    SessionErrorCode, Setup, SetupOption, SetupOptions, StreamAction, StreamErrorCode,
+    StreamProtocolError, GOAWAY_TYPE,
 };
 use moq_transport::profile::WireProfile;
 
@@ -133,6 +136,172 @@ fn draft19_frame_uses_vi64_type_and_exact_u16_payload_length() {
 
     let mut truncated = Bytes::from_static(&[0x03, 0x00, 0x02, 0xff]);
     assert!(Frame::decode(&mut truncated).is_err());
+}
+
+#[test]
+fn draft19_goaway_is_byte_exact_and_round_trips_uri_then_timeout() {
+    let goaway = GoAway {
+        new_session_uri: SessionUri("moqt://next.example".into()),
+        timeout_ms: 250,
+    };
+    let frame = goaway.clone().into_frame().unwrap();
+    assert_eq!(frame.message_type, GOAWAY_TYPE);
+    assert_eq!(
+        encode(&frame),
+        [
+            vec![0x10, 0x00, 0x16, 0x13],
+            b"moqt://next.example".to_vec(),
+            vec![0x80, 0xfa],
+        ]
+        .concat()
+    );
+    assert_eq!(GoAway::from_frame(&frame).unwrap(), goaway);
+
+    let no_redirect = GoAway {
+        new_session_uri: SessionUri(String::new()),
+        timeout_ms: 0,
+    };
+    assert_eq!(
+        encode(&no_redirect.into_frame().unwrap()),
+        vec![0x10, 0, 2, 0, 0]
+    );
+}
+
+#[test]
+fn draft19_goaway_enforces_the_8192_byte_uri_cap_on_both_paths() {
+    let maximum = GoAway {
+        new_session_uri: SessionUri("x".repeat(8_192)),
+        timeout_ms: 1,
+    };
+    assert_eq!(
+        GoAway::from_frame(&maximum.clone().into_frame().unwrap()).unwrap(),
+        maximum
+    );
+
+    let oversized = GoAway {
+        new_session_uri: SessionUri("x".repeat(8_193)),
+        timeout_ms: 1,
+    };
+    assert!(oversized.into_frame().is_err());
+
+    let mut payload = Vec::new();
+    Vi64::new(8_193).encode(&mut payload).unwrap();
+    let oversized_frame = Frame {
+        message_type: GOAWAY_TYPE,
+        payload: payload.into(),
+    };
+    assert!(GoAway::from_frame(&oversized_frame).is_err());
+}
+
+#[test]
+fn draft19_goaway_duplicate_tracking_is_scoped_per_stream() {
+    let mut control = GoAwayState::default();
+    let mut request_a = GoAwayState::default();
+    let mut request_b = GoAwayState::default();
+
+    control.record_received().unwrap();
+    request_a.record_received().unwrap();
+    request_b.record_received().unwrap();
+    assert_eq!(
+        request_a.record_received().unwrap_err(),
+        StreamProtocolError::DuplicateGoAway
+    );
+    assert!(control.received());
+    assert!(request_b.received());
+}
+
+#[test]
+fn draft19_goaway_record_sent_rejects_a_second_send_on_one_stream() {
+    let now = Instant::now();
+    let goaway = GoAway {
+        new_session_uri: SessionUri(String::new()),
+        timeout_ms: 1,
+    };
+    let mut state = GoAwayState::default();
+    state.record_sent(&goaway, now).unwrap();
+    assert_eq!(
+        state.record_sent(&goaway, now).unwrap_err(),
+        StreamProtocolError::DuplicateGoAway
+    );
+}
+
+#[test]
+fn draft19_goaway_sent_and_received_are_tracked_independently() {
+    let now = Instant::now();
+    let goaway = GoAway {
+        new_session_uri: SessionUri(String::new()),
+        timeout_ms: 1,
+    };
+
+    // Recording a sent GOAWAY must not mark the stream as having received one.
+    let mut sender = GoAwayState::default();
+    sender.record_sent(&goaway, now).unwrap();
+    assert!(sender.sent());
+    assert!(!sender.received());
+
+    // ...and vice versa: a received GOAWAY leaves the sent flag clear.
+    let mut receiver = GoAwayState::default();
+    receiver.record_received().unwrap();
+    assert!(receiver.received());
+    assert!(!receiver.sent());
+}
+
+#[test]
+fn draft19_goaway_decode_rejects_a_within_cap_length_overrunning_the_payload() {
+    // A URI length that is under the 8,192 cap but larger than the bytes that
+    // actually follow must be a clean decode error, never a panic on the
+    // fixed-size copy that materializes the URI.
+    let mut payload = Vec::new();
+    Vi64::new(64).encode(&mut payload).unwrap();
+    payload.extend_from_slice(b"short");
+    let truncated = Frame {
+        message_type: GOAWAY_TYPE,
+        payload: payload.into(),
+    };
+    assert!(GoAway::from_frame(&truncated).is_err());
+}
+
+#[test]
+fn draft19_goaway_timeout_zero_never_expires_and_nonzero_is_an_upper_hint() {
+    let now = Instant::now();
+    let mut no_deadline = GoAwayState::default();
+    no_deadline
+        .record_sent(
+            &GoAway {
+                new_session_uri: SessionUri(String::new()),
+                timeout_ms: 0,
+            },
+            now,
+        )
+        .unwrap();
+    assert!(!no_deadline.timeout_expired(now + Duration::from_secs(86_400)));
+
+    let mut bounded = GoAwayState::default();
+    bounded
+        .record_sent(
+            &GoAway {
+                new_session_uri: SessionUri(String::new()),
+                timeout_ms: 50,
+            },
+            now,
+        )
+        .unwrap();
+    assert!(!bounded.timeout_expired(now + Duration::from_millis(49)));
+    assert!(bounded.timeout_expired(now + Duration::from_millis(50)));
+}
+
+#[test]
+fn draft19_request_goaway_allows_early_fin_and_uses_going_away_reset() {
+    let mut early = RequestStream::new(WireProfile::Draft19, 0x1d).unwrap();
+    early.finish_sending_for_goaway().unwrap();
+
+    let mut expired = RequestStream::new(WireProfile::Draft19, 0x03).unwrap();
+    assert_eq!(
+        expired.reset_sending(StreamErrorCode::GoingAway).unwrap(),
+        StreamAction::Reset(StreamErrorCode::GoingAway)
+    );
+    assert_eq!(StreamErrorCode::GoingAway as u64, 0x04);
+    assert_eq!(SessionErrorCode::GoAwayTimeout as u64, 0x10);
 }
 
 #[test]
