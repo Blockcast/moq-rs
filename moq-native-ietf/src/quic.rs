@@ -118,11 +118,19 @@ fn bind_smart(addr: net::SocketAddr) -> anyhow::Result<(net::UdpSocket, bool)> {
 /// This is used both for the base endpoint config and when creating
 /// per-connection configs with qlog enabled.
 fn build_transport_config() -> quinn::TransportConfig {
+    // A 1,228-byte Solana shred needs up to 1,234 bytes after MoQ framing.
+    // Quinn consumes another 39 bytes at the current raw-QUIC profile, so the
+    // controlled shred path must support at least a 1,280-byte UDP payload
+    // (1,328-byte IPv6 PMTU). DPLPMTUD can raise this on Ethernet paths and
+    // black-hole detection can lower it when the path contract is violated.
+    const INITIAL_UDP_PAYLOAD_MTU: u16 = 1_280;
+
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(time::Duration::from_secs(10).try_into().unwrap()));
     transport.keep_alive_interval(Some(time::Duration::from_secs(4))); // TODO make this smarter
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-    transport.mtu_discovery_config(None); // Disable MTU discovery
+    transport.initial_mtu(INITIAL_UDP_PAYLOAD_MTU);
+    transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
     transport
 }
 
@@ -976,6 +984,24 @@ mod tests {
             .connect_with_profile(&url, Some(addr), required)
             .await;
         (connected, accept)
+    }
+
+    #[tokio::test]
+    async fn production_shred_datagram_fits_initial_quic_mtu() {
+        const ENCODED_SHRED_LEN: usize = 1_234;
+
+        let (connected, accept) =
+            negotiate("moqt", &[WireProfile::Draft19], WireProfile::Draft19).await;
+        let (client, ..) = connected.expect("client connects");
+        let (server, ..) = accept.await.unwrap().expect("server accepts");
+        let payload = vec![0x5a; ENCODED_SHRED_LEN];
+
+        assert!(client.max_datagram_size().await >= ENCODED_SHRED_LEN);
+        client
+            .send_datagram(payload.clone().into())
+            .await
+            .expect("production-sized shred datagram sends");
+        assert_eq!(server.recv_datagram().await.unwrap(), payload);
     }
 
     /// Installing a pass-through socket wrapper must still produce a working
