@@ -1245,6 +1245,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmtp-moq-carriage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "moq-transport",
+ "serde_json",
+ "thiserror 1.0.61",
+ "tokio",
+]
+
+[[package]]
 name = "moq-api"
 version = "0.2.12"
 dependencies = [
