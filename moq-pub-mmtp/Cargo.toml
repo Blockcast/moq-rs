@@ -22,6 +22,14 @@ edition = "2021"
 # never compiles pprof/tiny_http and the shipped binary is byte-for-byte
 # unchanged.
 profiling = ["dep:pprof", "dep:tiny_http"]
+# Profiling-image-only allocator instrumentation. This implies the existing
+# HTTP profiling endpoint but remains inert unless MOQ_PUB_PROFILE_ADDR is
+# explicitly set when the process starts.
+heap-profiling = [
+	"profiling",
+	"dep:tikv-jemallocator",
+	"dep:tikv-jemalloc-ctl",
+]
 
 [dependencies]
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.9" }
@@ -55,6 +63,8 @@ pprof = { version = "0.15", features = ["flamegraph", "protobuf-codec"], optiona
 # Tiny blocking HTTP server on its own std thread — cannot perturb the tokio
 # hot path and answers even when the runtime is CPU-saturated.
 tiny_http = { version = "0.12", optional = true }
+tikv-jemallocator = { version = "0.7", features = ["profiling", "stats"], optional = true }
+tikv-jemalloc-ctl = { version = "0.7", features = ["profiling", "stats"], optional = true }
 
 # Run the parity-vector example test modules under `cargo test` (CI). Without
 # `test = true`, the `#[test]` fns in these examples are never compiled or run.
