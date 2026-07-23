@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - release/blo-17747-heap-profile-image
+      - release/blo-17771-heap-profile-image
     paths:
       - .github/workflows/heap-profile-image.yml
   workflow_dispatch:
@@ -15,11 +16,11 @@ permissions:
   contents: read
 
 env:
-  SOURCE_REVISION: 4dd3491c0a60f9e44546318cb562f6c089d559ac
-  BASE_REVISION: ec22a944e656163ef41fcd6de77199f28a34f15c
+  SOURCE_REVISION: 04b32e3e3f3f84c805f3dbc47db8d896cea1de18
+  BASE_REVISION: 0587d708835a08211b62bc32d28dbd7ed6ddfab8
   PROFILE_KIND: heap
   IMAGE: registry.blockcast.net/blockcast/pim-multicast-gateway/moq-pub-mmtp
-  TAG: heap-profile-4dd3491-blo-17747
+  TAG: heap-profile-04b32e3-blo-17771
 
 jobs:
   build-push-verify:
