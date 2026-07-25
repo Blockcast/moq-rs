@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase};
+use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase, SUBGROUP_HISTORY_GROUPS_PARAM};
 use crate::message::RequestErrorCode;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
@@ -237,6 +237,12 @@ impl Subscribed {
             params
                 .set_largest_object(largest)
                 .map_err(|_| SessionError::Internal)?;
+        }
+        // Advertise the per-track subgroup history window (BLO-10339) when the
+        // publisher set one, so a subscribing relay can bound its mirror's
+        // retention to ours rather than retaining unbounded. Omitted when None.
+        if let Some(window) = track.history_window() {
+            params.set_intvalue(SUBGROUP_HISTORY_GROUPS_PARAM, window.get());
         }
 
         self.forwarder

@@ -72,6 +72,33 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
+    // BLO-10339: the subgroup history window param survives SubscribeOk
+    // encode/decode so a relay can read the publisher's window off the wire.
+    #[test]
+    fn encode_decode_carries_subgroup_history_window() {
+        let mut buf = BytesMut::new();
+
+        let mut kvps = KeyValuePairs::new();
+        kvps.set_intvalue(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM, 8);
+
+        let msg = SubscribeOk {
+            id: 12345,
+            track_alias: 100,
+            params: kvps,
+            track_extensions: TrackExtensions::default(),
+        };
+        msg.encode(&mut buf).unwrap();
+        let decoded = SubscribeOk::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert!(matches!(
+            decoded
+                .params
+                .get(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM)
+                .map(|k| &k.value),
+            Some(crate::coding::Value::IntValue(8))
+        ));
+    }
+
     #[test]
     fn track_alias_independent_of_request_id() {
         // track_alias can differ from the request id — it is chosen by the publisher.
