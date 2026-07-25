@@ -1,0 +1,59 @@
+[2m2026-05-28T03:15:33.483094Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:60558 [3mdual_stack[0m[2m=[0mtrue
+[2m2026-05-28T03:15:33.483701Z[0m [32m INFO[0m [2mmoq_pub[0m[2m:[0m connecting to relay: url=https://localhost:4443/
+[2m2026-05-28T03:15:33.491090Z[0m [32m INFO[0m [2mmoq_pub[0m[2m:[0m connected with CID: 860c012ca2b01db73939bf7d35e74756 (use this to look up qlog/mlog on server)
+[2m2026-05-28T03:15:34.232405Z[0m [32m INFO[0m [2mmoq_pub::media[0m[2m:[0m catalog: {
+  "version": 1,
+  "streamingFormat": 1,
+  "streamingFormatVersion": "0.2",
+  "supportsDeltaUpdates": true,
+  "commonTrackFields": {
+    "namespace": "/bbb",
+    "packaging": "cmaf",
+    "renderGroup": 1
+  },
+  "tracks": [
+    {
+      "name": "1.m4s",
+      "initTrack": "0.mp4",
+      "selectionParams": {
+        "codec": "avc1.42C00D",
+        "width": 320,
+        "height": 180
+      }
+    },
+    {
+      "name": "2.m4s",
+      "initTrack": "0.mp4",
+      "selectionParams": {
+        "codec": "mp4a.40.2",
+        "bitrate": 159997,
+        "samplerate": 48000,
+        "channelConfig": "2"
+      }
+    }
+  ]
+}
+timestamp: 0 segment: 0:0 priority: 127
+timestamp: 0 segment: 0:0 priority: 127
+timestamp: 6144 segment: 1:0 priority: 127
+timestamp: 25601 segment: 1:0 priority: 127
+timestamp: 12288 segment: 2:0 priority: 127
+timestamp: 49153 segment: 2:0 priority: 127
+timestamp: 18432 segment: 3:0 priority: 127
+timestamp: 73729 segment: 3:0 priority: 127
+timestamp: 24576 segment: 4:0 priority: 127
+timestamp: 97281 segment: 4:0 priority: 127
+timestamp: 30720 segment: 5:0 priority: 127
+timestamp: 121857 segment: 5:0 priority: 127
+timestamp: 36864 segment: 6:0 priority: 127
+timestamp: 145409 segment: 6:0 priority: 127
+timestamp: 43008 segment: 7:0 priority: 127
+timestamp: 169985 segment: 7:0 priority: 127
+timestamp: 49152 segment: 8:0 priority: 127
+timestamp: 193537 segment: 8:0 priority: 127
+timestamp: 55296 segment: 9:0 priority: 127
+timestamp: 217089 segment: 9:0 priority: 127
+[aost#0:1/copy @ 0x643de69964c0] Error submitting a packet to the muxer: Broken pipe
+[out#0/mp4 @ 0x643de694b840] Error muxing a packet
+[out#0/mp4 @ 0x643de694b840] Error writing trailer: Broken pipe
+[out#0/mp4 @ 0x643de694b840] Error closing file: Broken pipe

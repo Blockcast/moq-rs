@@ -1,0 +1,20 @@
+[2m2026-05-28T02:54:47.068028Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:40076 [3mdual_stack[0m[2m=[0mtrue
+[2m2026-05-28T02:54:47.068318Z[0m [32m INFO[0m [2mmoq_clock_ietf[0m[2m:[0m connecting to server: url=https://localhost:4443/
+[2m2026-05-28T02:54:47.086390Z[0m [32m INFO[0m [2mmoq_clock_ietf[0m[2m:[0m connected with CID: 5dfbd8d31beaa689561ca7a1d0ec9382 (use this to look up qlog/mlog on server)
+2026-05-28 02:54:45
+2026-05-28 02:54:46
+2026-05-28 02:54:47
+2026-05-28 02:54:48
+2026-05-28 02:54:49
+2026-05-28 02:54:50
+2026-05-28 02:54:51
+2026-05-28 02:54:52
+2026-05-28 02:54:53
+2026-05-28 02:54:54
+2026-05-28 02:54:55
+2026-05-28 02:54:56
+2026-05-28 02:54:57
+2026-05-28 02:54:58
+2026-05-28 02:54:59
+[2m2026-05-28T02:55:00.004123Z[0m [32m INFO[0m [2mmoq_transport::session::subscriber[0m[2m:[0m [SUBSCRIBER] recv_subgroup: completed subgroup (group_id=54, subgroup_id=0, 16 objects received)
+2026-05-28 02:55:00

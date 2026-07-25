@@ -1,0 +1,151 @@
+[2m2026-05-28T03:17:50.205382Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:33637 [3mdual_stack[0m[2m=[0mtrue
+[2m2026-05-28T03:17:50.205853Z[0m [32m INFO[0m [2mmoq_pub[0m[2m:[0m connecting to relay: url=https://localhost:4443/
+[2m2026-05-28T03:17:50.211131Z[0m [32m INFO[0m [2mmoq_pub[0m[2m:[0m connected with CID: c5aa6063a01177bd473bee15cb25f1a5 (use this to look up qlog/mlog on server)
+[2m2026-05-28T03:17:50.877130Z[0m [32m INFO[0m [2mmoq_pub::media[0m[2m:[0m catalog: {
+  "version": 1,
+  "streamingFormat": 1,
+  "streamingFormatVersion": "0.2",
+  "supportsDeltaUpdates": true,
+  "commonTrackFields": {
+    "namespace": "/bbb",
+    "packaging": "cmaf",
+    "renderGroup": 1
+  },
+  "tracks": [
+    {
+      "name": "1.m4s",
+      "initTrack": "0.mp4",
+      "selectionParams": {
+        "codec": "avc1.42C00D",
+        "width": 320,
+        "height": 180
+      }
+    },
+    {
+      "name": "2.m4s",
+      "initTrack": "0.mp4",
+      "selectionParams": {
+        "codec": "mp4a.40.2",
+        "bitrate": 159997,
+        "samplerate": 48000,
+        "channelConfig": "2"
+      }
+    }
+  ]
+}
+timestamp: 0 segment: 0:0 priority: 127
+timestamp: 0 segment: 0:0 priority: 127
+timestamp: 6144 segment: 1:0 priority: 127
+timestamp: 25601 segment: 1:0 priority: 127
+timestamp: 12288 segment: 2:0 priority: 127
+timestamp: 49153 segment: 2:0 priority: 127
+timestamp: 18432 segment: 3:0 priority: 127
+timestamp: 73729 segment: 3:0 priority: 127
+timestamp: 24576 segment: 4:0 priority: 127
+timestamp: 97281 segment: 4:0 priority: 127
+timestamp: 30720 segment: 5:0 priority: 127
+timestamp: 121857 segment: 5:0 priority: 127
+timestamp: 36864 segment: 6:0 priority: 127
+timestamp: 145409 segment: 6:0 priority: 127
+timestamp: 43008 segment: 7:0 priority: 127
+timestamp: 169985 segment: 7:0 priority: 127
+timestamp: 49152 segment: 8:0 priority: 127
+timestamp: 193537 segment: 8:0 priority: 127
+timestamp: 55296 segment: 9:0 priority: 127
+timestamp: 217089 segment: 9:0 priority: 127
+timestamp: 61440 segment: 10:0 priority: 127
+timestamp: 241665 segment: 10:0 priority: 127
+[2m2026-05-28T03:17:55.480731Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=0, subgroup_id=0, 1 objects sent)
+[2m2026-05-28T03:17:55.482827Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=0, subgroup_id=0, 1 objects sent)
+timestamp: 67584 segment: 11:0 priority: 127
+[2m2026-05-28T03:17:55.919019Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=10, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:17:55.919086Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=10, subgroup_id=0, 12 objects sent)
+timestamp: 265217 segment: 11:0 priority: 127
+timestamp: 73728 segment: 12:0 priority: 127
+[2m2026-05-28T03:17:56.418739Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=11, subgroup_id=0, 24 objects sent)
+[2m2026-05-28T03:17:56.418788Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=11, subgroup_id=0, 12 objects sent)
+timestamp: 289793 segment: 12:0 priority: 127
+timestamp: 79872 segment: 13:0 priority: 127
+[2m2026-05-28T03:17:56.918779Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=12, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:17:56.918831Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=12, subgroup_id=0, 12 objects sent)
+timestamp: 313345 segment: 13:0 priority: 127
+timestamp: 86016 segment: 14:0 priority: 127
+[2m2026-05-28T03:17:57.418771Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=13, subgroup_id=0, 24 objects sent)
+[2m2026-05-28T03:17:57.418881Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=13, subgroup_id=0, 12 objects sent)
+timestamp: 337921 segment: 14:0 priority: 127
+timestamp: 92160 segment: 15:0 priority: 127
+[2m2026-05-28T03:17:57.919172Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=14, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:17:57.919222Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=14, subgroup_id=0, 12 objects sent)
+timestamp: 361473 segment: 15:0 priority: 127
+timestamp: 98304 segment: 16:0 priority: 127
+[2m2026-05-28T03:17:58.418778Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=15, subgroup_id=0, 22 objects sent)
+[2m2026-05-28T03:17:58.418836Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=15, subgroup_id=0, 12 objects sent)
+timestamp: 385024 segment: 16:0 priority: 127
+timestamp: 104448 segment: 17:0 priority: 127
+[2m2026-05-28T03:17:58.918781Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=16, subgroup_id=0, 25 objects sent)
+[2m2026-05-28T03:17:58.918814Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=16, subgroup_id=0, 12 objects sent)
+timestamp: 409601 segment: 17:0 priority: 127
+timestamp: 110592 segment: 18:0 priority: 127
+[2m2026-05-28T03:17:59.418862Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=17, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:17:59.418959Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=17, subgroup_id=0, 12 objects sent)
+timestamp: 433153 segment: 18:0 priority: 127
+timestamp: 116736 segment: 19:0 priority: 127
+[2m2026-05-28T03:17:59.918864Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=18, subgroup_id=0, 24 objects sent)
+[2m2026-05-28T03:17:59.918920Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=18, subgroup_id=0, 12 objects sent)
+timestamp: 457729 segment: 19:0 priority: 127
+timestamp: 122880 segment: 20:0 priority: 127
+[2m2026-05-28T03:18:00.418739Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=19, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:18:00.418779Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=19, subgroup_id=0, 12 objects sent)
+timestamp: 481281 segment: 20:0 priority: 127
+timestamp: 129024 segment: 21:0 priority: 127
+[2m2026-05-28T03:18:00.918576Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=20, subgroup_id=0, 24 objects sent)
+[2m2026-05-28T03:18:00.918643Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=20, subgroup_id=0, 12 objects sent)
+timestamp: 505857 segment: 21:0 priority: 127
+timestamp: 135168 segment: 22:0 priority: 127
+[2m2026-05-28T03:18:01.418839Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=21, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:18:01.418877Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=21, subgroup_id=0, 12 objects sent)
+timestamp: 529409 segment: 22:0 priority: 127
+timestamp: 141312 segment: 23:0 priority: 127
+[2m2026-05-28T03:18:01.918777Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=22, subgroup_id=0, 24 objects sent)
+[2m2026-05-28T03:18:01.918946Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=22, subgroup_id=0, 12 objects sent)
+timestamp: 553985 segment: 23:0 priority: 127
+timestamp: 147456 segment: 24:0 priority: 127
+[2m2026-05-28T03:18:02.418933Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=23, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:18:02.419001Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=23, subgroup_id=0, 12 objects sent)
+timestamp: 577537 segment: 24:0 priority: 127
+timestamp: 153600 segment: 25:0 priority: 127
+[2m2026-05-28T03:18:02.919010Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=24, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:18:02.919075Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=24, subgroup_id=0, 12 objects sent)
+timestamp: 601089 segment: 25:0 priority: 127
+timestamp: 159744 segment: 26:0 priority: 127
+[2m2026-05-28T03:18:03.418907Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=25, subgroup_id=0, 24 objects sent)
+[2m2026-05-28T03:18:03.418976Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=25, subgroup_id=0, 12 objects sent)
+timestamp: 625665 segment: 26:0 priority: 127
+timestamp: 165888 segment: 27:0 priority: 127
+[2m2026-05-28T03:18:03.918719Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=26, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:18:03.918755Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=26, subgroup_id=0, 12 objects sent)
+timestamp: 649217 segment: 27:0 priority: 127
+timestamp: 172032 segment: 28:0 priority: 127
+[2m2026-05-28T03:18:04.418861Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=27, subgroup_id=0, 24 objects sent)
+[2m2026-05-28T03:18:04.418924Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=27, subgroup_id=0, 12 objects sent)
+timestamp: 673793 segment: 28:0 priority: 127
+timestamp: 178176 segment: 29:0 priority: 127
+[2m2026-05-28T03:18:04.918983Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=28, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:18:04.919031Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=28, subgroup_id=0, 12 objects sent)
+timestamp: 697345 segment: 29:0 priority: 127
+timestamp: 184320 segment: 30:0 priority: 127
+[2m2026-05-28T03:18:05.418830Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=29, subgroup_id=0, 24 objects sent)
+[2m2026-05-28T03:18:05.418897Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=29, subgroup_id=0, 12 objects sent)
+timestamp: 721921 segment: 30:0 priority: 127
+timestamp: 190464 segment: 31:0 priority: 127
+[2m2026-05-28T03:18:05.919044Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=30, subgroup_id=0, 23 objects sent)
+[2m2026-05-28T03:18:05.919169Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=30, subgroup_id=0, 12 objects sent)
+timestamp: 745473 segment: 31:0 priority: 127
+timestamp: 196608 segment: 32:0 priority: 127
+[2m2026-05-28T03:18:06.418899Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=31, subgroup_id=0, 22 objects sent)
+[2m2026-05-28T03:18:06.418951Z[0m [32m INFO[0m [2mmoq_transport::session::subscribed[0m[2m:[0m [PUBLISHER] serve_subgroup: completed subgroup (group_id=31, subgroup_id=0, 12 objects sent)
+timestamp: 769024 segment: 32:0 priority: 127
+[vost#0:0/copy @ 0x5cfcde1dc140] Error submitting a packet to the muxer: Broken pipe
+[out#0/mp4 @ 0x5cfcde1dc840] Error muxing a packet
+[out#0/mp4 @ 0x5cfcde1dc840] Error writing trailer: Broken pipe
+[out#0/mp4 @ 0x5cfcde1dc840] Error closing file: Broken pipe
