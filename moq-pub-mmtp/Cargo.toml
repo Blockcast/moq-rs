@@ -32,8 +32,8 @@ heap-profiling = [
 ]
 
 [dependencies]
-moq-native-ietf = { path = "../moq-native-ietf", version = "0.9" }
-moq-transport = { path = "../moq-transport", version = "0.15" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
+moq-transport = { path = "../moq-transport", version = "0.16" }
 moq-catalog = { path = "../moq-catalog", version = "0.2" }
 
 # Canonical MMTP/MPU header parsers (ISO/IEC 23008-1).
