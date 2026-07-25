@@ -29,6 +29,13 @@ fn control_error(session: &web_transport::Session, error: SessionError) -> Draft
     error.into()
 }
 
+fn first_response_fin_error(lifecycle: &mut RequestStream) -> StreamProtocolError {
+    match lifecycle.receive_fin() {
+        Ok(()) => StreamProtocolError::InvalidTransition,
+        Err(error) => error,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Draft19SessionError {
     #[error(transparent)]
@@ -41,14 +48,15 @@ pub enum Draft19SessionError {
 ///
 /// Construction opens the local unidirectional control stream, sends SETUP,
 /// accepts the peer's unidirectional control stream, and decodes its SETUP.
-/// It intentionally does not advertise `moqt-19`; callers may only construct
-/// it after selecting the explicit draft-19 profile out of band.
+/// Callers may only construct it after exact transport negotiation selected
+/// the explicit draft-19 profile.
 pub struct Draft19Session {
     session: web_transport::Session,
     control_sender: Writer,
     control_receiver: Reader,
     control_state: ControlStreamPair,
     peer_setup: Setup,
+    selected_version: WireProfile,
 }
 
 impl Draft19Session {
@@ -84,11 +92,16 @@ impl Draft19Session {
             control_receiver,
             control_state,
             peer_setup,
+            selected_version: profile,
         })
     }
 
     pub const fn peer_setup(&self) -> &Setup {
         &self.peer_setup
+    }
+
+    pub const fn selected_version(&self) -> WireProfile {
+        self.selected_version
     }
 
     pub const fn control_ready(&self) -> bool {
@@ -186,8 +199,8 @@ impl Draft19RequestStream {
 
     pub async fn receive_first_response(&mut self) -> Result<Frame, Draft19SessionError> {
         if self.receiver.done().await? {
-            self.lifecycle.receive_fin()?;
-            unreachable!("premature FIN must fail")
+            let error = first_response_fin_error(&mut self.lifecycle);
+            return Err(self.protocol_error(error));
         }
         let frame = self
             .receiver
@@ -272,5 +285,26 @@ impl Draft19RequestStream {
             StreamAction::None => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_response_fin_is_an_error_before_and_after_a_response() {
+        let mut waiting = RequestStream::new(WireProfile::Draft19, 0x16).unwrap();
+        assert_eq!(
+            first_response_fin_error(&mut waiting),
+            StreamProtocolError::PrematureFin
+        );
+
+        let mut complete = RequestStream::new(WireProfile::Draft19, 0x16).unwrap();
+        complete.receive_first_response(0x18).unwrap();
+        assert_eq!(
+            first_response_fin_error(&mut complete),
+            StreamProtocolError::InvalidTransition
+        );
     }
 }

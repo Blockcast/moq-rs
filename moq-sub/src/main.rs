@@ -29,16 +29,21 @@ async fn main() -> anyhow::Result<()> {
     let tls = config.tls.load()?;
     let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls)?)?;
 
-    let (session, connection_id, transport) = quic.client.connect(&config.url, None).await?;
+    let (session, connection_id, transport, selected_version) =
+        quic.client.connect(&config.url, None).await?;
 
     tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
 
-    let (session, subscriber) = moq_transport::session::Subscriber::connect(session, transport)
-        .await
-        .context("failed to create MoQ Transport session")?;
+    let (session, subscriber) = moq_transport::session::Subscriber::connect_negotiated(
+        session,
+        transport,
+        selected_version,
+    )
+    .await
+    .context("failed to create MoQ Transport session")?;
 
     // Associate empty set of Tracks with provided namespace
     let tracks = Tracks::new(TrackNamespace::from_utf8_path(&config.name));

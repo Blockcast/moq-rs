@@ -434,6 +434,7 @@ mod tests {
             None,
             request_id,
             PendingRequests::default(),
+            crate::profile::WireProfile::Draft16,
         )
     }
 

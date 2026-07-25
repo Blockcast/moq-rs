@@ -366,6 +366,7 @@ impl RequestKind {
         match self {
             Self::Subscribe => 0x04,
             Self::Fetch => 0x18,
+            // Draft-19 uses REQUEST_OK (0x07) for the remaining request families.
             _ => 0x07,
         }
     }
