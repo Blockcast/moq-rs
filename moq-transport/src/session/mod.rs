@@ -494,6 +494,16 @@ impl Session {
                     "MoQT control message"
                 );
             }
+            Message::Unknown(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "UNKNOWN",
+                    message_type = m.message_type,
+                    payload_len = m.payload.len(),
+                    "MoQT control message"
+                );
+            }
         }
     }
 
@@ -1002,6 +1012,15 @@ impl Session {
 
         loop {
             let msg: message::Message = recver.decode().await?;
+
+            if let Message::Unknown(ref unknown) = msg {
+                tracing::debug!(
+                    message_type = unknown.message_type,
+                    payload_len = unknown.payload.len(),
+                    "ignored unknown control message"
+                );
+                continue;
+            }
 
             // Emit structured tracing log for received control messages
             Self::log_control_message(&msg, "recv");

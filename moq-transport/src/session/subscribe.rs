@@ -470,6 +470,23 @@ mod tests {
     }
 
     #[test]
+    fn next_group_filter_starts_after_current_group() {
+        let mut params = KeyValuePairs::default();
+        params
+            .set_subscription_filter(&SubscriptionFilter {
+                filter_type: FilterType::NextGroupStart,
+                start_location: None,
+                end_group_id: None,
+            })
+            .unwrap();
+        let info = subscribe_info_with(params);
+        let filter = info.delivery_filter(Some(Location::new(2, 3)));
+
+        assert!(!filter.allows(2, 4));
+        assert!(filter.allows(3, 0));
+    }
+
+    #[test]
     fn absolute_range_filter_limits_start_and_end_group() {
         let mut params = KeyValuePairs::default();
         params
