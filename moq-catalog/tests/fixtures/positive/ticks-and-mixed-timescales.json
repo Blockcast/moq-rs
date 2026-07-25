@@ -1,0 +1,8 @@
+{
+  "version":1,"streamingFormat":"mmtp","streamingFormatVersion":"draft-ramadan-moq-mmt-00",
+  "tracks":[
+    {"name":"video-frame","packaging":"mmtp","codec":"avc1.640028","framerate":30,"mmtpMode":"mfu","timescale":90000,"groupDurationTicks":3000,"altGroup":1},
+    {"name":"video-four-seconds","packaging":"mmtp","codec":"avc1.640028","mmtpMode":"mfu","timescale":90000,"groupDurationMs":4000,"groupDurationTicks":360000,"altGroup":2},
+    {"name":"audio-four-seconds","packaging":"mmtp","codec":"mp4a.40.2","samplerate":48000,"channelConfig":"2","mmtpMode":"mfu","timescale":48000,"groupDurationMs":4000,"groupDurationTicks":192000,"altGroup":2}
+  ]
+}

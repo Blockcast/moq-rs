@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# moq-pub-mmtp: publish raw MMTP packets over IETF moq-transport (draft-14+).
+# Companion to moq-pub. Reads length-prefixed MMTP packets from stdin (or UDP),
+# announces a namespace, and writes each packet as a MoQ object on the track
+# corresponding to its MMTP packet_id (per draft-ramadan-moq-mmt §7.1).
+
+[package]
+name = "moq-pub-mmtp"
+description = "MMTP publisher for Media over QUIC (IETF draft-14+)"
+authors = ["Blockcast"]
+repository = "https://github.com/Blockcast/pim-multicast-gateway"
+license = "MIT OR Apache-2.0"
+
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Off by default. Compiles the on-demand pprof CPU-profiling endpoint
+# (src/profiling.rs), which is ADDITIONALLY runtime-gated by the
+# MOQ_PUB_PROFILE_ADDR env var. With the feature off, `cargo build --release`
+# never compiles pprof/tiny_http and the shipped binary is byte-for-byte
+# unchanged.
+profiling = ["dep:pprof", "dep:tiny_http"]
+# Profiling-image-only allocator instrumentation. This implies the existing
+# HTTP profiling endpoint but remains inert unless MOQ_PUB_PROFILE_ADDR is
+# explicitly set when the process starts.
+heap-profiling = [
+	"profiling",
+	"dep:tikv-jemallocator",
+	"dep:tikv-jemalloc-ctl",
+]
+
+[dependencies]
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.9" }
+moq-transport = { path = "../moq-transport", version = "0.15" }
+moq-catalog = { path = "../moq-catalog", version = "0.2" }
+
+# Canonical MMTP/MPU header parsers (ISO/IEC 23008-1).
+# Vendored under vendor/mmt-core/ at pinned libmmt commit (see vendor/mmt-core/VENDOR.md).
+mmt-core = { path = "vendor/mmt-core", version = "0.1" }
+
+url = "2"
+bytes = "1"
+
+tokio = { version = "1", features = ["full"] }
+# Source-specific (S,G) multicast joins: std/tokio only expose ASM
+# (`join_multicast_v4` = IP_ADD_MEMBERSHIP). SSM groups (232.0.0.0/8) require
+# IP_ADD_SOURCE_MEMBERSHIP, which socket2 exposes as `join_ssm_v4`.
+socket2 = { version = "0.5", features = ["all"] }
+
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
+serde_json = "1"
+
+# --- feature "profiling" only ---
+# On-demand CPU profiler: SIGPROF/ITIMER_PROF userspace sampling (no
+# CAP_SYS_ADMIN, works under baseline PodSecurity). DWARF from
+# [profile.release] debug=true symbolizes frames without frame pointers.
+pprof = { version = "0.15", features = ["flamegraph", "protobuf-codec"], optional = true }
+# Tiny blocking HTTP server on its own std thread — cannot perturb the tokio
+# hot path and answers even when the runtime is CPU-saturated.
+tiny_http = { version = "0.12", optional = true }
+tikv-jemallocator = { version = "0.7", features = ["profiling", "stats"], optional = true }
+tikv-jemalloc-ctl = { version = "0.7", features = ["profiling", "stats"], optional = true }
+
+# Run the parity-vector example test modules under `cargo test` (CI). Without
+# `test = true`, the `#[test]` fns in these examples are never compiled or run.
+[[example]]
+name = "mmtp_packet_vectors"
+path = "examples/mmtp_packet_vectors.rs"
+test = true
+
+[[example]]
+name = "reassembler_vectors"
+path = "examples/reassembler_vectors.rs"
+test = true

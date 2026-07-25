@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "streamingFormat": "mmtp",
+  "streamingFormatVersion": "draft-ramadan-moq-mmt-00",
+  "tracks": [
+    {
+      "name": "shreds",
+      "packaging": "datagram",
+      "priority": 128
+    }
+  ],
+  "multicast": {
+    "endpoints": [
+      {
+        "sourceAddress": "127.0.0.1",
+        "groupAddress": "232.0.0.1",
+        "port": 5004,
+        "tracks": [
+          {
+            "name": "shreds",
+            "packetId": 0
+          }
+        ]
+      }
+    ]
+  }
+}

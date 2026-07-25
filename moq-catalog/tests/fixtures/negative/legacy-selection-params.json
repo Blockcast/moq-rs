@@ -1,0 +1,1 @@
+{"version":1,"streamingFormat":"mmtp","streamingFormatVersion":"x","tracks":[{"name":"video","packaging":"mmtp","selectionParams":{"codec":"avc1.640028"},"mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000}]}
