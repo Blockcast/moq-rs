@@ -1,0 +1,24 @@
+[package]
+name = "web-transport"
+description = "Generic WebTransport API with native (web-transport-quinn) and WASM (web-transport-wasm) support."
+authors = ["Luke Curley"]
+repository = "https://github.com/moq-dev/web-transport"
+license = "MIT OR Apache-2.0"
+
+version = "0.10.5"
+edition = "2021"
+
+keywords = ["quic", "http3", "webtransport"]
+categories = ["network-programming", "web-programming"]
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytes = "1"
+thiserror = "2"
+url = "2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+web-transport-quinn = { version = "0.11.9", path = "../web-transport-quinn" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-transport-wasm = { version = "0.5.7", path = "../web-transport-wasm" }
