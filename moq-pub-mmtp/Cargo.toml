@@ -77,3 +77,8 @@ test = true
 name = "reassembler_vectors"
 path = "examples/reassembler_vectors.rs"
 test = true
+
+[[example]]
+name = "synth_mmtp"
+path = "examples/synth_mmtp.rs"
+test = true

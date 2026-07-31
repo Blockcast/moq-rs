@@ -843,11 +843,10 @@ mod tests {
     }
 
     #[test]
-    fn mfu_fragments_same_timestamp_share_one_subgroup() {
-        // A single MFU fragmented across MMTP packets (FI=1,2,3) carries the same
-        // per-sample timestamp on every fragment, so all fragments land as
-        // ordered objects in one subgroup — even though the publisher never reads
-        // the Fragmentation Indicator (§5.1).
+    fn fragmented_mfu_packets_share_one_subgroup_raw_passthrough() {
+        // A single MFU fragmented across MMTP packets (FI=1,2,3) carries its DU
+        // identity on the first fragment. Continuations reuse that identity, so
+        // all raw packet bytes land as ordered objects in one MFU subgroup.
         let mut map = make_state_map(1, 5);
         dispatch(
             &mut map,
@@ -855,29 +854,27 @@ mod tests {
             Bytes::from_static(b"init"),
         )
         .unwrap();
-        dispatch(
-            &mut map,
-            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
-            Bytes::from_static(b"f1"),
-        )
-        .unwrap();
-        dispatch(
-            &mut map,
-            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
-            Bytes::from_static(b"f2"),
-        )
-        .unwrap();
-        dispatch(
-            &mut map,
-            &mpu_ts(1, 10, FragmentType::Mfu, 0xABCD),
-            Bytes::from_static(b"f3"),
-        )
-        .unwrap();
+        let mut first = mpu_ts(1, 10, FragmentType::Mfu, 0xABCD);
+        first.fragmentation_indicator = 1;
+        dispatch(&mut map, &first, Bytes::from_static(b"f1")).unwrap();
+        let mut middle = first.clone();
+        middle.fragmentation_indicator = 2;
+        middle.fragment_counter = 1;
+        middle.mfu_identity = None;
+        dispatch(&mut map, &middle, Bytes::from_static(b"f2")).unwrap();
+        let mut last = middle;
+        last.fragmentation_indicator = 3;
+        last.fragment_counter = 2;
+        dispatch(&mut map, &last, Bytes::from_static(b"f3")).unwrap();
         let state = map.get(&1).unwrap();
         assert_eq!(
             state.sink.groups_created,
             vec![(10, 0, 5), (10, 1, 5)],
-            "one Init subgroup + one MFU subgroup for the fragmented frame"
+            "Init uses subgroup 0 and all MFU fragments share subgroup 1"
+        );
+        assert_eq!(
+            state.init_group.as_ref().unwrap().writes,
+            vec![Bytes::from_static(b"init")]
         );
         let mfu = &state.mfu_groups[&MfuIdentity::Timed {
             movie_fragment_sequence_number: 10,
@@ -890,6 +887,10 @@ mod tests {
                 Bytes::from_static(b"f2"),
                 Bytes::from_static(b"f3"),
             ]
+        );
+        assert!(
+            state.active_mfus.is_empty(),
+            "FI=3 closes the active raw-passthrough fragment chain"
         );
     }
 

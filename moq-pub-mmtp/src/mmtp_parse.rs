@@ -171,6 +171,28 @@ mod tests {
         buf.to_vec()
     }
 
+    fn synth_mfu_fragment_packet(fi: u8, fragment_counter: u8) -> Vec<u8> {
+        let mut hdr = MmtpHeader::new(7, PacketType::Mpu);
+        hdr.timestamp = 0x0002_dddd;
+        let mut buf = bytes::BytesMut::with_capacity(64);
+        hdr.write_to(&mut buf).unwrap();
+
+        let mut mpu = MpuHeader::new(FragmentType::Mfu, 42);
+        mpu.fragmentation_indicator = fi;
+        mpu.fragment_counter = fragment_counter;
+        mpu.payload_length = if fi == 1 {
+            (MfuDataUnit::size() + 4) as u16
+        } else {
+            4
+        };
+        mpu.write_to(&mut buf).unwrap();
+        if fi == 1 {
+            MfuDataUnit::new(42, 9).write_to(&mut buf).unwrap();
+        }
+        buf.put_slice(b"frag");
+        buf.to_vec()
+    }
+
     #[test]
     fn rejects_short_packet() {
         let err = route(&[0u8; 8]).unwrap_err();
@@ -243,6 +265,28 @@ mod tests {
         assert_eq!(r.fragmentation_indicator, 2);
         assert_eq!(r.fragment_counter, 4);
         assert_eq!(r.mfu_identity, None);
+    }
+
+    #[test]
+    fn accepts_fragmented_mfu_packets_at_fi_1_2_3() {
+        let expected_identity = MfuIdentity::Timed {
+            movie_fragment_sequence_number: 42,
+            sample_number: 9,
+        };
+        for (fi, counter) in [(1, 0), (2, 1), (3, 2)] {
+            let routing = route(&synth_mfu_fragment_packet(fi, counter))
+                .unwrap_or_else(|err| panic!("route rejected FI={fi}: {err}"));
+            assert_eq!(routing.packet_id, 7);
+            assert_eq!(routing.mpu_sequence, Some(42));
+            assert_eq!(routing.fragment_type, Some(FragmentType::Mfu));
+            assert_eq!(routing.fragmentation_indicator, fi);
+            assert_eq!(routing.fragment_counter, counter);
+            assert_eq!(
+                routing.mfu_identity,
+                (fi == 1).then_some(expected_identity),
+                "only the first fragment carries the MFU data-unit identity"
+            );
+        }
     }
 
     #[test]
