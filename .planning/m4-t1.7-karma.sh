@@ -27,7 +27,26 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 FP_FILE="$WORK/fingerprint.hex"
 
 [[ -d "$SHAKA_ROOT" ]] || { echo "SHAKA_ROOT not found: $SHAKA_ROOT"; exit 1; }
-[[ -s "$CAPTURE" ]]    || { echo "capture not found: $CAPTURE"; exit 1; }
+[[ -s "$CAPTURE" ]]    || {
+  cat >&2 <<EOF
+capture not found: $CAPTURE
+
+The MMTP capture fixtures are no longer tracked in git (BLO-19847: they were
+1.3 MB of the .planning/ tree). Restore the one you need from the archive tag:
+
+  git fetch origin tag planning-archive-2026-08-01
+  git checkout planning-archive-2026-08-01 -- .planning/m4-t1.7-e2e/moq_mmt_capture_full.json
+
+or regenerate the audio+video fixture on a devbox with the Blockcast ffmpeg
+fork (see .planning/m4-t1.7-e2e/capture-av-fixture.md):
+
+  FFMPEG=~/src/pim-multicast-gateway/FFmpeg/build-native/ffmpeg \\
+    bash .planning/m4-t1.7-e2e/make_av_capture.sh
+
+or point CAPTURE=/path/to/your.json at an existing capture.
+EOF
+  exit 1
+}
 
 echo "[1/6] Build binaries..."
 cargo build --release -p moq-pub-mmtp -p moq-relay-ietf 2>&1 | tail -2

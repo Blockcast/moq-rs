@@ -14,7 +14,9 @@
 #
 # Env knobs:
 #   SHAKA_ROOT   shaka-player repo (default ../shaka-player rel to moq-rs)
-#   CAPTURE      full-payload capture json (default /tmp/moq_mmt_capture_full.json)
+#   CAPTURE      full-payload capture json (default .planning/m4-t1.7-e2e/
+#                moq_mmt_capture_full.json — untracked since BLO-19847; the
+#                script prints restore instructions if it is missing)
 #   PORT         relay quic+web bind port (default 4443)
 #   CTRL_PORT    control/static server port (default 8097)
 #   UDP_PORT     publisher UDP listener port (default 5004)
@@ -37,7 +39,26 @@ RESULT="$WORK/result.json"
 FP_FILE="$WORK/fingerprint.hex"
 
 [[ -d "$SHAKA_ROOT" ]] || { echo "SHAKA_ROOT not found: $SHAKA_ROOT"; exit 1; }
-[[ -s "$CAPTURE" ]]    || { echo "capture not found: $CAPTURE"; exit 1; }
+[[ -s "$CAPTURE" ]]    || {
+  cat >&2 <<EOF
+capture not found: $CAPTURE
+
+The MMTP capture fixtures are no longer tracked in git (BLO-19847: they were
+1.3 MB of the .planning/ tree). Restore the one you need from the archive tag:
+
+  git fetch origin tag planning-archive-2026-08-01
+  git checkout planning-archive-2026-08-01 -- .planning/m4-t1.7-e2e/moq_mmt_capture_full.json
+
+or regenerate the audio+video fixture on a devbox with the Blockcast ffmpeg
+fork (see .planning/m4-t1.7-e2e/capture-av-fixture.md):
+
+  FFMPEG=~/src/pim-multicast-gateway/FFmpeg/build-native/ffmpeg \\
+    bash .planning/m4-t1.7-e2e/make_av_capture.sh
+
+or point CAPTURE=/path/to/your.json at an existing capture.
+EOF
+  exit 1
+}
 
 echo "[1/8] Build binaries..."
 cargo build --release -p moq-pub-mmtp -p moq-relay-ietf 2>&1 | tail -2

@@ -4,7 +4,12 @@
 **Repo:** `~/src/pim-multicast-gateway/moq-rs` @ `f9f51dc` (Cloudflare v0.7.17)
 **Build:** `cargo build --release` → 2m 08s, 0 warnings, all 9 crates green.
 **Cert:** `dev/cert` → `dev/localhost.{crt,key}` (valid until 2026-06-07).
-**Logs:** `.planning/m0-logs/`
+**Logs:** `.planning/m0-logs/` — no longer tracked in git (BLO-19847). Retrieve
+with `git fetch origin tag planning-archive-2026-08-01 && git checkout
+planning-archive-2026-08-01 -- .planning/m0-logs`, or browse at
+<https://github.com/Blockcast/moq-rs/tree/planning-archive-2026-08-01/.planning/m0-logs>.
+The excerpts quoted in this document are reproduced inline below, so the
+findings stand on their own without the log files.
 
 ## Summary
 
