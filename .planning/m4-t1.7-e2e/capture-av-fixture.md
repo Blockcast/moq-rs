@@ -22,8 +22,9 @@ FFMPEG=~/src/pim-multicast-gateway/FFmpeg/build-native/ffmpeg \
 ```
 
 `m4-t1.7-e2e.sh` and `m4-t1.7-karma.sh` still default `CAPTURE` to the in-tree
-path, so a restored file is picked up with no flags; they abort with these same
-instructions when it is absent.
+video-only `moq_mmt_capture_full.json`, so restoring that file is picked up with
+no flags. The A/V fixture requires the separate two-track catalog and audio
+harness described below; do not use it as the default harness capture.
 
 Note the regeneration path needs the fork's `moq_mmt` muxer — the system
 `/usr/bin/ffmpeg` does **not** have it, so the archive tag is the reliable

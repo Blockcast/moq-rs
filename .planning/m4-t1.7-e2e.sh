@@ -49,12 +49,6 @@ The MMTP capture fixtures are no longer tracked in git (BLO-19847: they were
   git fetch origin tag planning-archive-2026-08-01
   git restore --source=planning-archive-2026-08-01 --worktree -- .planning/m4-t1.7-e2e/moq_mmt_capture_full.json
 
-or regenerate the audio+video fixture on a devbox with the Blockcast ffmpeg
-fork (see .planning/m4-t1.7-e2e/capture-av-fixture.md):
-
-  FFMPEG=~/src/pim-multicast-gateway/FFmpeg/build-native/ffmpeg \\
-    bash .planning/m4-t1.7-e2e/make_av_capture.sh
-
 or point CAPTURE=/path/to/your.json at an existing capture.
 EOF
   exit 1
