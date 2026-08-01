@@ -14,7 +14,7 @@ Get one back either way:
 ```
 # restore the exact bytes that were on main @ 594ad43
 git fetch origin tag planning-archive-2026-08-01
-git checkout planning-archive-2026-08-01 -- .planning/m4-t1.7-e2e/moq_mmt_capture_av.json
+git restore --source=planning-archive-2026-08-01 --worktree -- .planning/m4-t1.7-e2e/moq_mmt_capture_av.json
 
 # or regenerate the a/v one from scratch (devbox + Blockcast ffmpeg fork)
 FFMPEG=~/src/pim-multicast-gateway/FFmpeg/build-native/ffmpeg \
