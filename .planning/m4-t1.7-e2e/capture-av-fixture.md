@@ -4,6 +4,33 @@ Unblocker fixture for **BLO-8702 Sub-project C** Work area 3 (receiver audio E2E
 The pre-existing `moq_mmt_capture_full.json` is **video-only** (`packet_id=1`); this
 one carries **both** video (`packet_id=1`) and AAC audio (`packet_id=2`).
 
+## Where the fixture lives
+
+**Not tracked in git.** `moq_mmt_capture_av.json` (696 KB) and
+`moq_mmt_capture_full.json` (564 KB) were untracked by BLO-19847 — together they
+were 1.3 MB of the 2.9 MB `.planning/` tree, and `.gitignore` now keeps them out.
+Get one back either way:
+
+```
+# restore the exact bytes that were on main @ 594ad43
+git fetch origin tag planning-archive-2026-08-01
+git restore --source=planning-archive-2026-08-01 --worktree -- .planning/m4-t1.7-e2e/moq_mmt_capture_av.json
+
+# or regenerate the a/v one from scratch (devbox + Blockcast ffmpeg fork)
+FFMPEG=~/src/pim-multicast-gateway/FFmpeg/build-native/ffmpeg \
+  bash .planning/m4-t1.7-e2e/make_av_capture.sh
+```
+
+`m4-t1.7-e2e.sh` and `m4-t1.7-karma.sh` still default `CAPTURE` to the in-tree
+video-only `moq_mmt_capture_full.json`, so restoring that file is picked up with
+no flags. The A/V fixture requires the separate two-track catalog and audio
+harness described below; do not use it as the default harness capture.
+
+Note the regeneration path needs the fork's `moq_mmt` muxer — the system
+`/usr/bin/ffmpeg` does **not** have it, so the archive tag is the reliable
+route for `moq_mmt_capture_full.json`, whose original capture predates
+`make_av_capture.sh`.
+
 ## Provenance
 
 Generated on devbox with the custom Blockcast ffmpeg fork

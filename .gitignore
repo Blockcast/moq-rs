@@ -11,6 +11,16 @@ qlog/
 /mlog/
 .vscode/launch.json
 
+# .planning/ holds the milestone design docs + harness scripts, which are worth
+# tracking. Runtime output of those harnesses is not: it has no diff value and
+# every clone pays for it forever (BLO-19847 evicted 2.6 MB of it). Keep the
+# markdown, ignore anything a run produces.
+.planning/**/*.log
+.planning/m0-logs/
+.planning/**/moq_mmt_capture_*.json
+.planning/**/*.fmp4
+.planning/**/pids.env
+
 # graphify knowledge-graph: commit graph.json/manifest/report; ignore local/viz/cache/cost
 **/graphify-out/cost.json
 **/graphify-out/.graphify_python
