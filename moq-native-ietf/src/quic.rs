@@ -1191,9 +1191,9 @@ mod tests {
         let (_, _, transport, selected) = client.unwrap();
         assert_eq!(transport, Transport::RawQuic);
         assert_eq!(selected, WireProfile::Blockcast01);
-        let (_, _, transport, selected) = server.await.unwrap().unwrap();
-        assert_eq!(transport, Transport::RawQuic);
-        assert_eq!(selected, WireProfile::Blockcast01);
+        let (_, info) = server.await.unwrap().unwrap();
+        assert_eq!(info.transport, Transport::RawQuic);
+        assert_eq!(info.selected_version, WireProfile::Blockcast01);
     }
 
     #[tokio::test]
@@ -1237,10 +1237,10 @@ mod tests {
         assert_eq!(session.protocol(), Some("moqt-blockcast-01"));
         assert_eq!(transport, Transport::WebTransport);
         assert_eq!(selected, WireProfile::Blockcast01);
-        let (session, _, transport, selected) = server.await.unwrap().unwrap();
+        let (session, info) = server.await.unwrap().unwrap();
         assert_eq!(session.protocol(), Some("moqt-blockcast-01"));
-        assert_eq!(transport, Transport::WebTransport);
-        assert_eq!(selected, WireProfile::Blockcast01);
+        assert_eq!(info.transport, Transport::WebTransport);
+        assert_eq!(info.selected_version, WireProfile::Blockcast01);
     }
 
     #[tokio::test]
