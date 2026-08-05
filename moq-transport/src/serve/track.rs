@@ -125,7 +125,9 @@ impl TrackWriter {
         })?;
 
         // Set the Stream mode to TrackReaderMode::Subgroups
-        state.reader_mode = Some(reader.into());
+        // TrackState stores a cloning template, not an active subscriber; it
+        // must not pin every subgroup ever published.
+        state.reader_mode = Some(reader.into_template().into());
         Ok(writer)
     }
 
@@ -332,8 +334,9 @@ track_writers!(Track, Stream, Subgroups, Objects, Datagrams,);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::TrackNamespace;
+    use crate::coding::{Location, TrackNamespace};
     use crate::serve::Subgroup;
+    use bytes::Bytes;
 
     #[test]
     fn test_is_closed_false_before_mode_set() {
@@ -483,6 +486,37 @@ mod tests {
         assert!(
             !reader.is_closed(),
             "track should NOT be closed while actively writing subgroups"
+        );
+    }
+
+    #[test]
+    fn largest_location_does_not_regress_for_out_of_order_subgroups() {
+        let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
+        let (writer, reader) = track.produce();
+        let mut subgroups = writer.subgroups().unwrap();
+
+        let mut group_five = subgroups
+            .create(Subgroup {
+                group_id: 5,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        group_five.write(Bytes::from_static(b"five")).unwrap();
+        assert_eq!(reader.largest_location(), Some(Location::new(5, 0)));
+
+        let mut group_four = subgroups
+            .create(Subgroup {
+                group_id: 4,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        group_four.write(Bytes::from_static(b"four")).unwrap();
+        assert_eq!(
+            reader.largest_location(),
+            Some(Location::new(5, 0)),
+            "an out-of-order subgroup must not move the progress frontier backward"
         );
     }
 }
