@@ -11,6 +11,7 @@ use futures::StreamExt;
 use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase, SUBGROUP_HISTORY_GROUPS_PARAM};
 use crate::message::RequestErrorCode;
 use crate::mlog;
+use crate::profile::WireProfile;
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
@@ -18,6 +19,31 @@ use crate::{data, message, serve};
 use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
 
 // This file defines Publisher handling of inbound Subscriptions
+
+fn subscribe_ok_params(
+    profile: WireProfile,
+    largest_location: Option<Location>,
+    history_window: Option<std::num::NonZeroU64>,
+) -> Result<KeyValuePairs, SessionError> {
+    let mut params = KeyValuePairs::default();
+    if let Some(largest) = largest_location {
+        params
+            .set_largest_object(largest)
+            .map_err(|_| SessionError::Internal)?;
+    }
+
+    match history_window {
+        Some(window) => params.set_intvalue(SUBGROUP_HISTORY_GROUPS_PARAM, window.get()),
+        None if profile == WireProfile::Blockcast01 => {
+            return Err(SessionError::ProtocolViolation(
+                "Blockcast profile requires a non-zero subgroup history window".to_string(),
+            ));
+        }
+        None => {}
+    }
+
+    Ok(params)
+}
 
 #[derive(Debug)]
 struct ObjectForwarderState {
@@ -234,21 +260,13 @@ impl Subscribed {
         let largest_location = track.largest_location();
         self.forwarder.set_largest_location(largest_location)?;
 
-        // Send SubscribeOk using send_message_and_wait to ensure it is sent at least to the QUIC stack before
-        // we start serving the track.  If a subscriber gets the stream before SubscribeOk
-        // then they won't recognize the track_alias in the stream header.
-        let mut params = KeyValuePairs::default();
-        if let Some(largest) = largest_location {
-            params
-                .set_largest_object(largest)
-                .map_err(|_| SessionError::Internal)?;
-        }
-        // Advertise the per-track subgroup history window (BLO-10339) when the
-        // publisher set one, so a subscribing relay can bound its mirror's
-        // retention to ours rather than retaining unbounded. Omitted when None.
-        if let Some(window) = track.history_window() {
-            params.set_intvalue(SUBGROUP_HISTORY_GROUPS_PARAM, window.get());
-        }
+        // Build the SubscribeOk params once so largest-object and bounded-history
+        // metadata cannot shadow each other.
+        let params = subscribe_ok_params(
+            self.forwarder.publisher.selected_version(),
+            largest_location,
+            track.history_window(),
+        )?;
 
         self.forwarder
             .publisher
@@ -785,6 +803,38 @@ impl ObjectForwarderRecv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blockcast_profile_requires_publisher_history_window() {
+        let error = subscribe_ok_params(WireProfile::Blockcast01, None, None)
+            .expect_err("Blockcast publisher must not emit an unbounded SUBSCRIBE_OK");
+
+        assert!(matches!(error, SessionError::ProtocolViolation(_)));
+    }
+
+    #[test]
+    fn blockcast_profile_emits_nonzero_publisher_history_window() {
+        let params =
+            subscribe_ok_params(WireProfile::Blockcast01, None, std::num::NonZeroU64::new(4))
+                .expect("bounded Blockcast publisher emits SUBSCRIBE_OK");
+
+        assert!(matches!(
+            params.get(SUBGROUP_HISTORY_GROUPS_PARAM),
+            Some(crate::coding::KeyValuePair {
+                value: crate::coding::Value::IntValue(4),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn generic_profiles_preserve_unbounded_subscribe_ok() {
+        for profile in [WireProfile::Draft16, WireProfile::Draft19] {
+            let params = subscribe_ok_params(profile, None, None)
+                .expect("generic profiles retain absent-window behavior");
+            assert!(params.get(SUBGROUP_HISTORY_GROUPS_PARAM).is_none());
+        }
+    }
 
     #[test]
     fn quinn_priority_schedules_source_before_repair() {

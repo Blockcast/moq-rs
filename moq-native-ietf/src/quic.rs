@@ -1119,6 +1119,28 @@ mod tests {
     }
 
     #[test]
+    fn mixed_profile_role_matrix_requires_exact_negotiation() {
+        let profiles = [
+            WireProfile::Blockcast01,
+            WireProfile::Draft16,
+            WireProfile::Draft19,
+        ];
+
+        for role in ["publisher", "subscriber", "relay"] {
+            for offered in profiles {
+                for supported in profiles {
+                    let selected = select_wire_profile(&[offered.name().to_string()], &[supported]);
+                    let expected = (offered == supported).then_some(offered);
+                    assert_eq!(
+                        selected, expected,
+                        "role={role} offered={offered} supported={supported}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn wire_profiles_are_unique_in_preference_order() {
         let config = Config::new("127.0.0.1:0".parse().unwrap(), None, tls_config())
             .unwrap()
@@ -1159,6 +1181,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_quic_selects_exact_blockcast_profile() {
+        let (client, server) = negotiate(
+            "moqt",
+            &[WireProfile::Blockcast01],
+            WireProfile::Blockcast01,
+        )
+        .await;
+        let (_, _, transport, selected) = client.unwrap();
+        assert_eq!(transport, Transport::RawQuic);
+        assert_eq!(selected, WireProfile::Blockcast01);
+        let (_, _, transport, selected) = server.await.unwrap().unwrap();
+        assert_eq!(transport, Transport::RawQuic);
+        assert_eq!(selected, WireProfile::Blockcast01);
+    }
+
+    #[tokio::test]
     async fn native_quic_rejects_moqt_19_to_moqt_16() {
         let (client, server) =
             negotiate("moqt", &[WireProfile::Draft16], WireProfile::Draft19).await;
@@ -1185,6 +1223,24 @@ mod tests {
         assert_eq!(session.protocol(), Some("moqt-19"));
         assert_eq!(info.transport, Transport::WebTransport);
         assert_eq!(info.selected_version, WireProfile::Draft19);
+    }
+
+    #[tokio::test]
+    async fn webtransport_selects_and_echoes_exact_blockcast_profile() {
+        let (client, server) = negotiate(
+            "https",
+            &[WireProfile::Blockcast01],
+            WireProfile::Blockcast01,
+        )
+        .await;
+        let (session, _, transport, selected) = client.unwrap();
+        assert_eq!(session.protocol(), Some("moqt-blockcast-01"));
+        assert_eq!(transport, Transport::WebTransport);
+        assert_eq!(selected, WireProfile::Blockcast01);
+        let (session, _, transport, selected) = server.await.unwrap().unwrap();
+        assert_eq!(session.protocol(), Some("moqt-blockcast-01"));
+        assert_eq!(transport, Transport::WebTransport);
+        assert_eq!(selected, WireProfile::Blockcast01);
     }
 
     #[tokio::test]
