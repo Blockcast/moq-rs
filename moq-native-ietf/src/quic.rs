@@ -124,11 +124,16 @@ fn build_transport_config() -> quinn::TransportConfig {
     // (1,328-byte IPv6 PMTU). DPLPMTUD can raise this on Ethernet paths and
     // black-hole detection can lower it when the path contract is violated.
     const INITIAL_UDP_PAYLOAD_MTU: u16 = 1_280;
+    // Datagram media is live and disposable. Keep only a few packets queued so
+    // a congestion-limited path discards old media instead of adding hundreds
+    // of milliseconds of FIFO latency (Quinn's default is 1 MiB).
+    const LIVE_DATAGRAM_SEND_BUFFER_BYTES: usize = INITIAL_UDP_PAYLOAD_MTU as usize * 4;
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(time::Duration::from_secs(10).try_into().unwrap()));
     transport.keep_alive_interval(Some(time::Duration::from_secs(4))); // TODO make this smarter
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    transport.datagram_send_buffer_size(LIVE_DATAGRAM_SEND_BUFFER_BYTES);
     transport.initial_mtu(INITIAL_UDP_PAYLOAD_MTU);
     transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
     transport
