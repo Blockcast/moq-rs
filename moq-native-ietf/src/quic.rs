@@ -161,29 +161,44 @@ fn validate_selected_profile(
 }
 
 fn offered_profiles_label(offered: &[String]) -> &'static str {
+    let blockcast = offered.iter().any(|profile| profile == "moqt-blockcast-01");
     let draft19 = offered.iter().any(|profile| profile == "moqt-19");
     let draft16 = offered.iter().any(|profile| profile == "moqt-16");
     let unknown = offered
         .iter()
         .any(|profile| WireProfile::from_name(profile).is_none());
-    match (draft19, draft16, unknown) {
+    if unknown {
+        return if blockcast || draft19 || draft16 {
+            "known+unknown"
+        } else {
+            "unknown"
+        };
+    }
+    match (blockcast, draft19, draft16) {
         (false, false, false) => "none",
-        (true, false, false) => "moqt-19",
-        (false, true, false) => "moqt-16",
-        (true, true, false) => "moqt-19+moqt-16",
-        (false, false, true) => "unknown",
-        _ => "known+unknown",
+        (true, false, false) => "moqt-blockcast-01",
+        (false, true, false) => "moqt-19",
+        (false, false, true) => "moqt-16",
+        (true, true, false) => "moqt-blockcast-01+moqt-19",
+        (true, false, true) => "moqt-blockcast-01+moqt-16",
+        (false, true, true) => "moqt-19+moqt-16",
+        (true, true, true) => "moqt-blockcast-01+moqt-19+moqt-16",
     }
 }
 
 fn supported_profiles_label(supported: &[WireProfile]) -> &'static str {
+    let blockcast = supported.contains(&WireProfile::Blockcast01);
     let draft19 = supported.contains(&WireProfile::Draft19);
     let draft16 = supported.contains(&WireProfile::Draft16);
-    match (draft19, draft16) {
-        (false, false) => "none",
-        (true, false) => "moqt-19",
-        (false, true) => "moqt-16",
-        (true, true) => "moqt-19+moqt-16",
+    match (blockcast, draft19, draft16) {
+        (false, false, false) => "none",
+        (true, false, false) => "moqt-blockcast-01",
+        (false, true, false) => "moqt-19",
+        (false, false, true) => "moqt-16",
+        (true, true, false) => "moqt-blockcast-01+moqt-19",
+        (true, false, true) => "moqt-blockcast-01+moqt-16",
+        (false, true, true) => "moqt-19+moqt-16",
+        (true, true, true) => "moqt-blockcast-01+moqt-19+moqt-16",
     }
 }
 
@@ -1138,6 +1153,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn negotiation_metric_labels_include_blockcast_profile() {
+        assert_eq!(
+            offered_profiles_label(&["moqt-blockcast-01".to_string()]),
+            "moqt-blockcast-01"
+        );
+        assert_eq!(
+            supported_profiles_label(&[WireProfile::Blockcast01, WireProfile::Draft16]),
+            "moqt-blockcast-01+moqt-16"
+        );
     }
 
     #[test]
