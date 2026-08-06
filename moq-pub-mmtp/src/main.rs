@@ -10,6 +10,7 @@ use moq_catalog::{Root, TrackPackaging};
 use moq_native_ietf::quic;
 use moq_transport::{
     coding::TrackNamespace,
+    profile::WireProfile,
     serve::{DatagramsWriter, SubgroupsWriter, Tracks, TracksWriter},
     session::Publisher,
 };
@@ -98,11 +99,23 @@ async fn main() -> Result<()> {
     );
 
     let tls = args.tls.load()?;
-    let quic_endpoint = quic::Endpoint::new(quic::Config::new(args.bind, None, tls.clone())?)?;
+    let mut quic_config = quic::Config::new(args.bind, None, tls.clone())?;
+    let wire_profile = args.wire_profile.map(WireProfile::from);
+    if let Some(profile) = wire_profile {
+        quic_config = quic_config.with_wire_profiles([WireProfile::Draft16, profile]);
+    }
+    let quic_endpoint = quic::Endpoint::new(quic_config)?;
 
     tracing::info!(url = %args.url, "connecting to relay");
-    let (session, connection_id, transport, selected_version) =
-        quic_endpoint.client.connect(&args.url, None).await?;
+    let (session, connection_id, transport, selected_version) = match wire_profile {
+        Some(profile) => {
+            quic_endpoint
+                .client
+                .connect_with_profile(&args.url, None, profile)
+                .await?
+        }
+        None => quic_endpoint.client.connect(&args.url, None).await?,
+    };
     tracing::info!(%connection_id, "connected to relay");
 
     let (session, mut publisher) =
