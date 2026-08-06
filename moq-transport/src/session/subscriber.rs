@@ -660,15 +660,43 @@ impl Subscriber {
 
             // Extract the publisher's per-track subgroup history window
             // (BLO-10339), if advertised, so the local mirror bounds its
-            // retention. Absent / malformed (0) → None = unbounded (status quo).
-            let history_window = msg
-                .params
-                .get(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM)
-                .and_then(|kvp| match &kvp.value {
-                    crate::coding::Value::IntValue(v) => Some(*v),
+            // retention.
+            //
+            // Absent key → None = unbounded, with no error. That leniency is
+            // deliberate and load-bearing: 0x40 is a private Blockcast
+            // extension, and omitting a parameter is exactly how a conforming
+            // generic peer signals it does not implement one. Requiring the key
+            // is negotiated by the Blockcast wire profile (BLO-22244); it is
+            // not enforced here, and this arm must stay profile-independent.
+            //
+            // Present with value 0 is a different case entirely (BLO-22245).
+            // The peer did implement the extension and sent a meaningless
+            // value: a window of 0 groups would retain nothing, so it cannot be
+            // what any publisher meant. No sender can produce it either — every
+            // emitter of this key writes `NonZeroU64::get()`, so the value is
+            // >= 1 by construction. Widening a malformed frame into "retain
+            // everything" would be a silent fallback that relaxes retention on
+            // the strength of a frame we know to be broken, so reject it.
+            let history_window = match msg.params.get(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM)
+            {
+                None => None,
+                Some(kvp) => match &kvp.value {
+                    crate::coding::Value::IntValue(v) => {
+                        Some(NonZeroU64::new(*v).ok_or_else(|| {
+                            SessionError::ProtocolViolation(format!(
+                                "SUBSCRIBE_OK {} advertised subgroup history window 0; \
+                                 the window must be at least 1 group",
+                                msg.id
+                            ))
+                        })?)
+                    }
+                    // A non-integer value for this key is malformed too, but
+                    // tightening it is deliberately out of scope here — this
+                    // issue's sender inventory covers the zero case only. Left
+                    // as-is rather than silently widened along with it.
                     _ => None,
-                })
-                .and_then(NonZeroU64::new);
+                },
+            };
 
             // Notify the subscribe of the successful subscription
             subscribe.ok(msg.track_alias, history_window)?;
@@ -1781,12 +1809,24 @@ mod tests {
         drop(subscribe);
     }
 
-    // BLO-10339: a wire window of 0 is malformed (the publisher only sets >= 1).
-    // The subscriber must treat it as "no window" (None = unbounded, status quo),
-    // NOT propagate 0 inward and tear the subscription down. Guards the
-    // NonZeroU64::new extraction in recv_subscribe_ok.
+    // BLO-22245: a wire window of 0 is malformed and must be REJECTED, not
+    // silently widened to unbounded.
+    //
+    // This replaces the old `recv_subscribe_ok_zero_window_is_unbounded`, whose
+    // contract was the inverse. The reasoning that justified it — "0 is
+    // malformed, so fall back to the status quo" — is the silent-fallback shape
+    // the engineering principles ban: it relaxes retention to *unbounded* on
+    // the strength of a frame we have just established is broken, and it does
+    // so on our own fork-added extension where no conforming-peer defence
+    // applies. Omission, not zero, is how a generic peer says "unsupported";
+    // that path is asserted separately by
+    // `recv_subscribe_ok_absent_window_is_unbounded` and is untouched here.
+    //
+    // Gated on the sender inventory recorded for BLO-22245 (pim-multicast-gateway
+    // docs/g0/blo-22245-sender-inventory.md): every emitter of key 0x40 in fork
+    // history writes `NonZeroU64::get()`, so no deployed producer can emit 0.
     #[tokio::test]
-    async fn recv_subscribe_ok_zero_window_is_unbounded() {
+    async fn recv_subscribe_ok_zero_window_is_rejected() {
         let mut subscriber = subscriber();
         let observer = subscriber.clone();
         let (writer, reader) =
@@ -1800,26 +1840,34 @@ mod tests {
         params.set_intvalue(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM, 0);
 
         let mut receiver = observer.clone();
-        receiver
+        let err = receiver
             .recv_subscribe_ok(&message::SubscribeOk {
                 id: 0,
                 track_alias: 12,
                 params,
                 track_extensions: Default::default(),
             })
-            .expect("window=0 must not fail the subscribe");
+            .expect_err("window=0 must be rejected as a protocol violation");
 
+        match err {
+            SessionError::ProtocolViolation(reason) => {
+                assert!(
+                    reason.contains("subgroup history window 0"),
+                    "unexpected protocol violation reason: {reason}"
+                );
+            }
+            other => panic!("expected ProtocolViolation, got {other:?}"),
+        }
+
+        // The window must NOT have been applied in any form: rejecting is the
+        // whole point, so the mirror must not have been quietly left unbounded
+        // *and* resolved as a successful subscribe.
         assert_eq!(
             reader.history_window(),
             None,
-            "window=0 → None (unbounded), subscription intact"
+            "rejected SUBSCRIBE_OK must not have applied a window"
         );
 
-        let subscribe = match futures::poll!(&mut subscribe) {
-            Poll::Ready(Ok(s)) => s,
-            Poll::Ready(Err(err)) => panic!("subscribe failed: {err}"),
-            Poll::Pending => panic!("subscribe remained pending after SubscribeOk"),
-        };
         drop(subscribe);
     }
 
