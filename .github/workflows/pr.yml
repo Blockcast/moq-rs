@@ -55,6 +55,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Verify image provenance build contract
+        run: sh deploy/test-image-revision-validation.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo test -p moq-transport
       - run: cargo test -p moq-pub-mmtp --features heap-profiling heap_profile_and_allocator_totals_are_non_empty

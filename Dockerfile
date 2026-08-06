@@ -91,11 +91,30 @@ COPY --from=builder /usr/local/cargo/bin/moq-* /usr/local/bin
 # Use our publish script
 CMD [ "publish" ]
 
-# Create an image with just the binaries
-FROM debian:bookworm-slim
+# Validate image provenance in an independent stage so the contract can be
+# tested without compiling the Rust workspace.
+FROM debian:bookworm-slim AS image-provenance
+ARG SOURCE_REVISION
+ARG BASE_REVISION
 
-ARG SOURCE_REVISION="unknown"
-ARG BASE_REVISION="unknown"
+# BLO-22346: provenance is mandatory, not best-effort. A silent "unknown"
+# default let every published image ship unattributable to any source
+# commit; refuse to build rather than fall back to a value nothing can
+# trace back to a revision.
+RUN for pair in "SOURCE_REVISION=$SOURCE_REVISION" "BASE_REVISION=$BASE_REVISION"; do \
+	name=${pair%%=*}; value=${pair#*=}; \
+	if ! printf '%s' "$value" | grep -Eq '^[0-9a-f]{40}$'; then \
+		echo "error: $name build-arg must be a 40-hex git commit sha (got '$value'). Pass --build-arg $name=<sha> so this image is traceable to source." >&2; \
+		exit 1; \
+	fi; \
+    done
+
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+LABEL org.opencontainers.image.base.revision=$BASE_REVISION
+
+# Create an image with just the binaries.
+FROM image-provenance
+
 ARG PROFILE_KIND="default"
 
 RUN apt-get update && \
@@ -104,8 +123,6 @@ RUN apt-get update && \
 
 LABEL org.opencontainers.image.source=https://github.com/Blockcast/moq-rs
 LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
-LABEL org.opencontainers.image.revision=$SOURCE_REVISION
-LABEL org.opencontainers.image.base.revision=$BASE_REVISION
 LABEL org.opencontainers.image.description="moq-rs binaries"
 LABEL org.blockcast.profile.kind=$PROFILE_KIND
 

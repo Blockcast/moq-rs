@@ -3,7 +3,11 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 x-moq: &x-moq
-  build: .
+  build:
+    context: .
+    args:
+      SOURCE_REVISION: "${SOURCE_REVISION:?SOURCE_REVISION must identify the current moq-rs commit}"
+      BASE_REVISION: "${BASE_REVISION:?BASE_REVISION must identify the owning root commit}"
   environment:
     RUST_LOG: ${RUST_LOG:-debug}
   volumes:
