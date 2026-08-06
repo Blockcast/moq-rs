@@ -94,9 +94,21 @@ CMD [ "publish" ]
 # Create an image with just the binaries
 FROM debian:bookworm-slim
 
-ARG SOURCE_REVISION="unknown"
-ARG BASE_REVISION="unknown"
+ARG SOURCE_REVISION
+ARG BASE_REVISION
 ARG PROFILE_KIND="default"
+
+# BLO-22346: provenance is mandatory, not best-effort. A silent "unknown"
+# default let every published image ship unattributable to any source
+# commit; refuse to build rather than fall back to a value nothing can
+# trace back to a revision.
+RUN for pair in "SOURCE_REVISION=$SOURCE_REVISION" "BASE_REVISION=$BASE_REVISION"; do \
+	name=${pair%%=*}; value=${pair#*=}; \
+	if ! printf '%s' "$value" | grep -Eq '^[0-9a-f]{40}$'; then \
+		echo "error: $name build-arg must be a 40-hex git commit sha (got '$value'). Pass --build-arg $name=<sha> so this image is traceable to source." >&2; \
+		exit 1; \
+	fi; \
+    done
 
 RUN apt-get update && \
 	apt-get install -y --no-install-recommends ca-certificates curl libssl3 && \
