@@ -639,25 +639,6 @@ impl Subscriber {
             .map_err(|_| SessionError::Internal)?
             .get_mut(&msg.id)
         {
-            // Track Aliases are session-scoped (§10.1).  The SUBSCRIBE_OK alias
-            // must not collide with any alias already bound by a SUBSCRIBE or a
-            // PUBLISH subscription.
-            {
-                let mut aliases = self
-                    .track_alias_map
-                    .lock()
-                    .map_err(|_| SessionError::Internal)?;
-                if aliases.contains_alias(msg.track_alias) {
-                    return Err(SessionError::Duplicate);
-                }
-                aliases
-                    .insert(msg.track_alias, TrackOrigin::Subscribe(msg.id))
-                    .map_err(|_| SessionError::Duplicate)?;
-            }
-
-            // Notify waiting tasks that the alias map has been updated.
-            self.track_alias_notify.notify_waiters();
-
             // Extract the publisher's per-track subgroup history window
             // (BLO-10339), if advertised, so the local mirror bounds its
             // retention.
@@ -676,7 +657,8 @@ impl Subscriber {
             // emitter of this key writes `NonZeroU64::get()`, so the value is
             // >= 1 by construction. Widening a malformed frame into "retain
             // everything" would be a silent fallback that relaxes retention on
-            // the strength of a frame we know to be broken, so reject it.
+            // the strength of a frame we know to be broken, so reject it before
+            // publishing the alias or waking any alias waiters.
             let history_window = match msg.params.get(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM)
             {
                 None => None,
@@ -697,6 +679,25 @@ impl Subscriber {
                     _ => None,
                 },
             };
+
+            // Track Aliases are session-scoped (§10.1).  The SUBSCRIBE_OK alias
+            // must not collide with any alias already bound by a SUBSCRIBE or a
+            // PUBLISH subscription.
+            {
+                let mut aliases = self
+                    .track_alias_map
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?;
+                if aliases.contains_alias(msg.track_alias) {
+                    return Err(SessionError::Duplicate);
+                }
+                aliases
+                    .insert(msg.track_alias, TrackOrigin::Subscribe(msg.id))
+                    .map_err(|_| SessionError::Duplicate)?;
+            }
+
+            // Notify waiting tasks that the alias map has been updated.
+            self.track_alias_notify.notify_waiters();
 
             // Notify the subscribe of the successful subscription
             subscribe.ok(msg.track_alias, history_window)?;
@@ -1826,9 +1827,10 @@ mod tests {
     // docs/g0/blo-22245-sender-inventory.md): every emitter of key 0x40 in fork
     // history writes `NonZeroU64::get()`, so no deployed producer can emit 0.
     #[tokio::test]
-    async fn recv_subscribe_ok_zero_window_is_rejected() {
+    async fn control_dispatch_rejects_zero_window_without_publishing_alias() {
         let mut subscriber = subscriber();
         let observer = subscriber.clone();
+        let pending_requests = observer.pending_requests.clone();
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();
 
@@ -1836,18 +1838,26 @@ mod tests {
         futures::pin_mut!(subscribe);
         assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
 
+        let alias_notify = observer.track_alias_notify.clone();
+        let alias_waiter = alias_notify.notified();
+        futures::pin_mut!(alias_waiter);
+        assert!(matches!(futures::poll!(&mut alias_waiter), Poll::Pending));
+
         let mut params = crate::coding::KeyValuePairs::new();
         params.set_intvalue(crate::coding::SUBGROUP_HISTORY_GROUPS_PARAM, 0);
 
-        let mut receiver = observer.clone();
-        let err = receiver
-            .recv_subscribe_ok(&message::SubscribeOk {
+        let mut receiver = Some(observer.clone());
+        let err = Session::recv_subscribe_ok(
+            &pending_requests,
+            &mut receiver,
+            message::SubscribeOk {
                 id: 0,
                 track_alias: 12,
                 params,
                 track_extensions: Default::default(),
-            })
-            .expect_err("window=0 must be rejected as a protocol violation");
+            },
+        )
+        .expect_err("window=0 must be rejected as a protocol violation");
 
         match err {
             SessionError::ProtocolViolation(reason) => {
@@ -1859,6 +1869,20 @@ mod tests {
             other => panic!("expected ProtocolViolation, got {other:?}"),
         }
 
+        assert_eq!(
+            pending_requests.remove(0).unwrap(),
+            None,
+            "control dispatch must consume the matching pending request"
+        );
+        assert!(
+            !observer.track_alias_map.lock().unwrap().contains_alias(12),
+            "rejected SUBSCRIBE_OK must not publish its alias"
+        );
+        assert!(
+            matches!(futures::poll!(&mut alias_waiter), Poll::Pending),
+            "rejected SUBSCRIBE_OK must not wake alias waiters"
+        );
+
         // The window must NOT have been applied in any form: rejecting is the
         // whole point, so the mirror must not have been quietly left unbounded
         // *and* resolved as a successful subscribe.
@@ -1866,6 +1890,10 @@ mod tests {
             reader.history_window(),
             None,
             "rejected SUBSCRIBE_OK must not have applied a window"
+        );
+        assert!(
+            matches!(futures::poll!(&mut subscribe), Poll::Pending),
+            "rejected SUBSCRIBE_OK must not resolve the subscribe"
         );
 
         drop(subscribe);

@@ -820,7 +820,8 @@ impl Session {
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
-        tokio::select! {
+        let webtransport = self.webtransport.clone();
+        let result = tokio::select! {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_subscribe_namespace_open(self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
@@ -828,7 +829,13 @@ impl Session {
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
+        };
+
+        if let Err(error) = &result {
+            webtransport.close(error.code() as u32, &error.to_string());
         }
+
+        result
     }
 
     /// Processes the outgoing control message queue, and sends queued messages on the control stream sender/writer.
