@@ -91,12 +91,11 @@ COPY --from=builder /usr/local/cargo/bin/moq-* /usr/local/bin
 # Use our publish script
 CMD [ "publish" ]
 
-# Create an image with just the binaries
-FROM debian:bookworm-slim
-
+# Validate image provenance in an independent stage so the contract can be
+# tested without compiling the Rust workspace.
+FROM debian:bookworm-slim AS image-provenance
 ARG SOURCE_REVISION
 ARG BASE_REVISION
-ARG PROFILE_KIND="default"
 
 # BLO-22346: provenance is mandatory, not best-effort. A silent "unknown"
 # default let every published image ship unattributable to any source
@@ -110,14 +109,20 @@ RUN for pair in "SOURCE_REVISION=$SOURCE_REVISION" "BASE_REVISION=$BASE_REVISION
 	fi; \
     done
 
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+LABEL org.opencontainers.image.base.revision=$BASE_REVISION
+
+# Create an image with just the binaries.
+FROM image-provenance
+
+ARG PROFILE_KIND="default"
+
 RUN apt-get update && \
 	apt-get install -y --no-install-recommends ca-certificates curl libssl3 && \
 	rm -rf /var/lib/apt/lists/*
 
 LABEL org.opencontainers.image.source=https://github.com/Blockcast/moq-rs
 LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
-LABEL org.opencontainers.image.revision=$SOURCE_REVISION
-LABEL org.opencontainers.image.base.revision=$BASE_REVISION
 LABEL org.opencontainers.image.description="moq-rs binaries"
 LABEL org.blockcast.profile.kind=$PROFILE_KIND
 
