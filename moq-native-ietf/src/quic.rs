@@ -161,29 +161,44 @@ fn validate_selected_profile(
 }
 
 fn offered_profiles_label(offered: &[String]) -> &'static str {
+    let blockcast = offered.iter().any(|profile| profile == "moqt-blockcast-01");
     let draft19 = offered.iter().any(|profile| profile == "moqt-19");
     let draft16 = offered.iter().any(|profile| profile == "moqt-16");
     let unknown = offered
         .iter()
         .any(|profile| WireProfile::from_name(profile).is_none());
-    match (draft19, draft16, unknown) {
+    if unknown {
+        return if blockcast || draft19 || draft16 {
+            "known+unknown"
+        } else {
+            "unknown"
+        };
+    }
+    match (blockcast, draft19, draft16) {
         (false, false, false) => "none",
-        (true, false, false) => "moqt-19",
-        (false, true, false) => "moqt-16",
-        (true, true, false) => "moqt-19+moqt-16",
-        (false, false, true) => "unknown",
-        _ => "known+unknown",
+        (true, false, false) => "moqt-blockcast-01",
+        (false, true, false) => "moqt-19",
+        (false, false, true) => "moqt-16",
+        (true, true, false) => "moqt-blockcast-01+moqt-19",
+        (true, false, true) => "moqt-blockcast-01+moqt-16",
+        (false, true, true) => "moqt-19+moqt-16",
+        (true, true, true) => "moqt-blockcast-01+moqt-19+moqt-16",
     }
 }
 
 fn supported_profiles_label(supported: &[WireProfile]) -> &'static str {
+    let blockcast = supported.contains(&WireProfile::Blockcast01);
     let draft19 = supported.contains(&WireProfile::Draft19);
     let draft16 = supported.contains(&WireProfile::Draft16);
-    match (draft19, draft16) {
-        (false, false) => "none",
-        (true, false) => "moqt-19",
-        (false, true) => "moqt-16",
-        (true, true) => "moqt-19+moqt-16",
+    match (blockcast, draft19, draft16) {
+        (false, false, false) => "none",
+        (true, false, false) => "moqt-blockcast-01",
+        (false, true, false) => "moqt-19",
+        (false, false, true) => "moqt-16",
+        (true, true, false) => "moqt-blockcast-01+moqt-19",
+        (true, false, true) => "moqt-blockcast-01+moqt-16",
+        (false, true, true) => "moqt-19+moqt-16",
+        (true, true, true) => "moqt-blockcast-01+moqt-19+moqt-16",
     }
 }
 
@@ -1119,6 +1134,40 @@ mod tests {
     }
 
     #[test]
+    fn mixed_profile_role_matrix_requires_exact_negotiation() {
+        let profiles = [
+            WireProfile::Blockcast01,
+            WireProfile::Draft16,
+            WireProfile::Draft19,
+        ];
+
+        for role in ["publisher", "subscriber", "relay"] {
+            for offered in profiles {
+                for supported in profiles {
+                    let selected = select_wire_profile(&[offered.name().to_string()], &[supported]);
+                    let expected = (offered == supported).then_some(offered);
+                    assert_eq!(
+                        selected, expected,
+                        "role={role} offered={offered} supported={supported}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn negotiation_metric_labels_include_blockcast_profile() {
+        assert_eq!(
+            offered_profiles_label(&["moqt-blockcast-01".to_string()]),
+            "moqt-blockcast-01"
+        );
+        assert_eq!(
+            supported_profiles_label(&[WireProfile::Blockcast01, WireProfile::Draft16]),
+            "moqt-blockcast-01+moqt-16"
+        );
+    }
+
+    #[test]
     fn wire_profiles_are_unique_in_preference_order() {
         let config = Config::new("127.0.0.1:0".parse().unwrap(), None, tls_config())
             .unwrap()
@@ -1159,6 +1208,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_quic_selects_exact_blockcast_profile() {
+        let (client, server) = negotiate(
+            "moqt",
+            &[WireProfile::Blockcast01],
+            WireProfile::Blockcast01,
+        )
+        .await;
+        let (_, _, transport, selected) = client.unwrap();
+        assert_eq!(transport, Transport::RawQuic);
+        assert_eq!(selected, WireProfile::Blockcast01);
+        let (_, info) = server.await.unwrap().unwrap();
+        assert_eq!(info.transport, Transport::RawQuic);
+        assert_eq!(info.selected_version, WireProfile::Blockcast01);
+    }
+
+    #[tokio::test]
     async fn native_quic_rejects_moqt_19_to_moqt_16() {
         let (client, server) =
             negotiate("moqt", &[WireProfile::Draft16], WireProfile::Draft19).await;
@@ -1185,6 +1250,24 @@ mod tests {
         assert_eq!(session.protocol(), Some("moqt-19"));
         assert_eq!(info.transport, Transport::WebTransport);
         assert_eq!(info.selected_version, WireProfile::Draft19);
+    }
+
+    #[tokio::test]
+    async fn webtransport_selects_and_echoes_exact_blockcast_profile() {
+        let (client, server) = negotiate(
+            "https",
+            &[WireProfile::Blockcast01],
+            WireProfile::Blockcast01,
+        )
+        .await;
+        let (session, _, transport, selected) = client.unwrap();
+        assert_eq!(session.protocol(), Some("moqt-blockcast-01"));
+        assert_eq!(transport, Transport::WebTransport);
+        assert_eq!(selected, WireProfile::Blockcast01);
+        let (session, info) = server.await.unwrap().unwrap();
+        assert_eq!(session.protocol(), Some("moqt-blockcast-01"));
+        assert_eq!(info.transport, Transport::WebTransport);
+        assert_eq!(info.selected_version, WireProfile::Blockcast01);
     }
 
     #[tokio::test]

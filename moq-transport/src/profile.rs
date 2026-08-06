@@ -14,15 +14,18 @@ pub enum WireProfile {
     #[default]
     Draft16,
     Draft19,
+    /// Blockcast's versioned draft-16 profile with mandatory bounded history.
+    Blockcast01,
 }
 
 impl WireProfile {
-    pub const ALL: [Self; 2] = [Self::Draft19, Self::Draft16];
+    pub const ALL: [Self; 3] = [Self::Blockcast01, Self::Draft19, Self::Draft16];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Draft16 => "moqt-16",
             Self::Draft19 => "moqt-19",
+            Self::Blockcast01 => "moqt-blockcast-01",
         }
     }
 
@@ -42,5 +45,25 @@ impl WireProfile {
 impl std::fmt::Display for WireProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blockcast_profile_has_distinct_exact_negotiation_name() {
+        assert_eq!(WireProfile::Blockcast01.name(), "moqt-blockcast-01");
+        assert_eq!(
+            WireProfile::from_name("moqt-blockcast-01"),
+            Some(WireProfile::Blockcast01)
+        );
+        assert_eq!(
+            WireProfile::from_alpn(b"moqt-blockcast-01"),
+            Some(WireProfile::Blockcast01)
+        );
+        assert_eq!(WireProfile::from_name("moqt-blockcast"), None);
+        assert_eq!(WireProfile::from_name("moqt-blockcast-01-preview"), None);
     }
 }
