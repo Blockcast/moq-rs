@@ -7,18 +7,37 @@ mod file_coordinator;
 use std::sync::Arc;
 use std::{net, path::PathBuf};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use moq_transport::profile::WireProfile;
 use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
 use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WireProfileArg {
+    /// Accept the Blockcast profile requiring bounded subgroup history.
+    Blockcast01,
+}
+
+impl From<WireProfileArg> for WireProfile {
+    fn from(profile: WireProfileArg) -> Self {
+        match profile {
+            WireProfileArg::Blockcast01 => Self::Blockcast01,
+        }
+    }
+}
+
 #[derive(Parser, Clone)]
 pub struct Cli {
     /// Listen on this address
     #[arg(long, default_value = "[::]:443")]
     pub bind: net::SocketAddr,
+
+    /// Accept a non-default MoQT wire profile in addition to the default moqt-16 profile.
+    #[arg(long, value_enum)]
+    wire_profile: Option<WireProfileArg>,
 
     /// The TLS configuration.
     #[command(flatten)]
@@ -166,6 +185,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let media_endpoint = moq_native_ietf::quic::Endpoint::new(
+        moq_native_ietf::quic::Config::new(cli.bind, qlog_dir_for_relay.clone(), tls.clone())?
+            .with_wire_profiles(enabled_wire_profiles(cli.wire_profile)),
+    )?;
+
     // Build the relay URL from the node or bind address
     let relay_url = cli
         .node
@@ -187,8 +211,8 @@ async fn main() -> anyhow::Result<()> {
     // Create a QUIC server for media.
     let relay = Relay::new(RelayConfig {
         tls: tls.clone(),
-        bind: Some(cli.bind),
-        endpoints: vec![],
+        bind: None,
+        endpoints: vec![media_endpoint],
         qlog_dir: qlog_dir_for_relay,
         mlog_dir: mlog_dir_for_relay,
         node: cli.node,
@@ -221,6 +245,14 @@ async fn main() -> anyhow::Result<()> {
     relay.run().await
 }
 
+fn enabled_wire_profiles(wire_profile: Option<WireProfileArg>) -> Vec<WireProfile> {
+    let mut profiles = vec![WireProfile::Draft16];
+    if let Some(profile) = wire_profile {
+        profiles.push(profile.into());
+    }
+    profiles
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +262,21 @@ mod tests {
         let cli = Cli::try_parse_from(["moq-relay-ietf", "--max-request-id", "7"]).unwrap();
 
         assert_eq!(cli.max_request_id, 7);
+    }
+
+    #[test]
+    fn blockcast_profile_is_additive_and_opt_in() {
+        let default = Cli::try_parse_from(["moq-relay-ietf"]).unwrap();
+        assert_eq!(
+            enabled_wire_profiles(default.wire_profile),
+            [WireProfile::Draft16]
+        );
+
+        let enabled =
+            Cli::try_parse_from(["moq-relay-ietf", "--wire-profile", "blockcast01"]).unwrap();
+        assert_eq!(
+            enabled_wire_profiles(enabled.wire_profile),
+            [WireProfile::Draft16, WireProfile::Blockcast01]
+        );
     }
 }

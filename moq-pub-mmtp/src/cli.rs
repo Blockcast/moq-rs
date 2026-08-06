@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use moq_transport::profile::WireProfile;
 use url::Url;
 
 /// Where the publisher reads MMTP packets from.
@@ -10,6 +11,21 @@ pub enum MmtpInput {
     Stdin,
     /// Bound UDP socket — each datagram is one MMTP packet (per RFC 8551 framing).
     Udp,
+}
+
+/// Optional non-default MoQT wire profile selected by the publisher.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WireProfileArg {
+    /// Negotiate the Blockcast profile requiring bounded subgroup history.
+    Blockcast01,
+}
+
+impl From<WireProfileArg> for WireProfile {
+    fn from(profile: WireProfileArg) -> Self {
+        match profile {
+            WireProfileArg::Blockcast01 => Self::Blockcast01,
+        }
+    }
 }
 
 #[derive(Parser, Clone)]
@@ -63,8 +79,46 @@ pub struct Args {
     #[arg(long, default_value = "[::]:0")]
     pub bind: std::net::SocketAddr,
 
+    /// Opt into a non-default MoQT wire profile. When omitted, the existing
+    /// moqt-16 negotiation path is unchanged.
+    #[arg(long, value_enum)]
+    pub wire_profile: Option<WireProfileArg>,
+
     /// TLS configuration shared with moq-pub / moq-relay-ietf:
     /// `--tls-cert`, `--tls-key`, `--tls-root`, `--tls-disable-verify`.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn required_args() -> [&'static str; 6] {
+        [
+            "moq-pub-mmtp",
+            "moqt://localhost:4443",
+            "--name",
+            "example",
+            "--catalog-json",
+            "catalog.json",
+        ]
+    }
+
+    #[test]
+    fn wire_profile_is_opt_in() {
+        let args = Args::try_parse_from(required_args()).unwrap();
+        assert!(args.wire_profile.is_none());
+
+        let args = Args::try_parse_from(
+            required_args()
+                .into_iter()
+                .chain(["--wire-profile", "blockcast01"]),
+        )
+        .unwrap();
+        assert_eq!(
+            args.wire_profile.map(WireProfile::from),
+            Some(WireProfile::Blockcast01)
+        );
+    }
 }
