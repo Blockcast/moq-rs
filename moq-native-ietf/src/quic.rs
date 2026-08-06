@@ -1056,6 +1056,54 @@ mod tests {
         (connected, accept)
     }
 
+    async fn decode_control<T: moq_transport::coding::Decode>(
+        stream: &mut web_transport::RecvStream,
+        buffer: &mut Vec<u8>,
+    ) -> T {
+        loop {
+            let mut cursor = std::io::Cursor::new(buffer.as_slice());
+            let decoded = T::decode(&mut cursor);
+            let consumed = cursor.position() as usize;
+            drop(cursor);
+
+            match decoded {
+                Ok(message) => {
+                    buffer.drain(..consumed);
+                    return message;
+                }
+                Err(moq_transport::coding::DecodeError::More(_)) => {}
+                Err(error) => panic!("failed to decode control message: {error}"),
+            }
+
+            let chunk = stream
+                .read(64 * 1024)
+                .await
+                .expect("control stream read succeeds")
+                .expect("control stream remains open");
+            buffer.extend_from_slice(&chunk);
+        }
+    }
+
+    async fn send_control<T: moq_transport::coding::Encode>(
+        stream: &mut web_transport::SendStream,
+        message: &T,
+    ) {
+        let mut encoded = Vec::new();
+        message
+            .encode(&mut encoded)
+            .expect("control message encodes");
+
+        let mut written = 0;
+        while written < encoded.len() {
+            let size = stream
+                .write(&encoded[written..])
+                .await
+                .expect("control stream write succeeds");
+            assert!(size > 0, "control stream write must make progress");
+            written += size;
+        }
+    }
+
     #[tokio::test]
     async fn production_shred_datagram_fits_initial_quic_mtu() {
         const ENCODED_SHRED_LEN: usize = 1_234;
@@ -1268,6 +1316,98 @@ mod tests {
         assert_eq!(session.protocol(), Some("moqt-blockcast-01"));
         assert_eq!(info.transport, Transport::WebTransport);
         assert_eq!(info.selected_version, WireProfile::Blockcast01);
+    }
+
+    #[tokio::test]
+    async fn invalid_subscribe_ok_closes_webtransport_with_protocol_violation() {
+        use moq_transport::{
+            coding::{KeyValuePairs, TrackNamespace, SUBGROUP_HISTORY_GROUPS_PARAM},
+            message::{Message, SubscribeOk},
+            serve::Track,
+            session::{SessionError, Subscriber},
+            setup,
+        };
+
+        let (connected, accept) = negotiate(
+            "https",
+            &[WireProfile::Blockcast01],
+            WireProfile::Blockcast01,
+        )
+        .await;
+        let (client, ..) = connected.expect("client connects");
+        let (server, ..) = accept.await.unwrap().expect("server accepts");
+
+        let server_task = tokio::spawn(async move {
+            let (mut sender, mut receiver) = server.accept_bi().await.unwrap();
+            let mut buffer = Vec::new();
+
+            let _: setup::Client = decode_control(&mut receiver, &mut buffer).await;
+            let mut params = KeyValuePairs::new();
+            params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
+            send_control(&mut sender, &setup::Server { params }).await;
+
+            let message: Message = decode_control(&mut receiver, &mut buffer).await;
+            let Message::Subscribe(subscribe) = message else {
+                panic!("expected SUBSCRIBE, got {message:?}");
+            };
+
+            let mut params = KeyValuePairs::new();
+            params.set_intvalue(SUBGROUP_HISTORY_GROUPS_PARAM, 0);
+            send_control(
+                &mut sender,
+                &Message::SubscribeOk(SubscribeOk {
+                    id: subscribe.id,
+                    track_alias: 12,
+                    params,
+                    track_extensions: Default::default(),
+                }),
+            )
+            .await;
+
+            server.closed().await
+        });
+
+        let (session, mut subscriber) = Subscriber::connect_negotiated(
+            client,
+            Transport::WebTransport,
+            WireProfile::Blockcast01,
+        )
+        .await
+        .expect("MoQT session connects");
+        let session_task = tokio::spawn(session.run());
+
+        let (writer, _) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "zero-window").produce();
+        let subscribe_task = tokio::spawn(async move { subscriber.subscribe_open(writer).await });
+
+        let session_error = tokio::time::timeout(time::Duration::from_secs(5), session_task)
+            .await
+            .expect("client session terminates")
+            .expect("client session task does not panic")
+            .expect_err("zero history window is rejected");
+        assert!(
+            matches!(session_error, SessionError::ProtocolViolation(ref reason) if reason.contains("subgroup history window 0")),
+            "unexpected client session error: {session_error:?}"
+        );
+
+        let peer_error = tokio::time::timeout(time::Duration::from_secs(5), server_task)
+            .await
+            .expect("server observes session close")
+            .expect("server task does not panic");
+        assert!(
+            matches!(
+                peer_error,
+                web_transport::Error::Session(
+                    web_transport::quinn::SessionError::WebTransportError(
+                        web_transport::quinn::WebTransportError::Closed(0x3, _)
+                    )
+                )
+            ),
+            "peer observed unexpected close: {peer_error:?}"
+        );
+
+        subscribe_task.abort();
+        let _ = subscribe_task.await;
     }
 
     #[tokio::test]
