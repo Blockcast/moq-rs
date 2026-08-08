@@ -32,3 +32,8 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
+
+# Always compiled in; effectively zero-cost when no recorder is installed
+# (same pattern as moq-relay-ietf/src/metrics.rs — the `metrics` crate is a
+# facade, not a Prometheus dependency by itself).
+metrics = "0.24"

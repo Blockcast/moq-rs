@@ -19,6 +19,7 @@ use tokio::io::AsyncWriteExt;
 mod cli;
 mod datagram;
 mod framing;
+mod metrics_endpoint;
 mod mmtp_parse;
 #[cfg(feature = "profiling")]
 mod profiling;
@@ -57,6 +58,11 @@ async fn main() -> Result<()> {
     // No-op unless both the compile feature and the env var are set.
     #[cfg(feature = "profiling")]
     profiling::spawn_if_enabled();
+
+    // Optional Prometheus metrics exporter (feature `metrics-prometheus` +
+    // MOQ_PUB_METRICS_ADDR). No-op unless the env var is set; see
+    // metrics_endpoint.rs for the activation pattern.
+    metrics_endpoint::spawn_if_enabled();
 
     let args = Args::parse();
 

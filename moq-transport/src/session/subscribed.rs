@@ -662,16 +662,29 @@ impl ObjectForwarder {
             let loss_grew =
                 dropped_total > reported_dropped || skipped_too_large > reported_too_large;
             let warn_due = last_loss_warn.is_none_or(|at| at.elapsed() >= LOSS_WARN_INTERVAL);
-            if loss_grew && warn_due {
-                tracing::warn!(
-                    dropped_total,
-                    dropped_delta = dropped_total - reported_dropped,
-                    skipped_too_large,
-                    "datagram subscriber lossy: ring-superseded and/or over-MTU payloads skipped"
-                );
+            if loss_grew {
+                let dropped_delta = dropped_total - reported_dropped;
+                // BLO-22882: dropped_total (and hence this delta) must remain
+                // durably queryable even when the per-interval log line below
+                // is suppressed or evicted from a retained log window — the
+                // counter is the source of truth, the log line is a summary.
+                metrics::counter!("moq_pub_mmtp_dropped_datagrams_total").increment(dropped_delta);
+                if warn_due {
+                    // Demoted from warn! (BLO-22882): at sustained loss this
+                    // line fires every 5s and was crowding out other startup
+                    // diagnostics in the retained log window. The counter
+                    // above is now the durable signal; this stays for local
+                    // debugging.
+                    tracing::debug!(
+                        dropped_total,
+                        dropped_delta,
+                        skipped_too_large,
+                        "datagram subscriber lossy: ring-superseded and/or over-MTU payloads skipped"
+                    );
+                    last_loss_warn = Some(std::time::Instant::now());
+                }
                 reported_dropped = dropped_total;
                 reported_too_large = skipped_too_large;
-                last_loss_warn = Some(std::time::Instant::now());
             }
 
             if !delivery_filter.allows(datagram.group_id, datagram.object_id) {
