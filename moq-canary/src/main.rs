@@ -122,7 +122,11 @@ async fn probe_once(args: &Args, tls: &moq_native_ietf::tls::Config) -> Result<N
         .ok_or_else(|| anyhow!("TracksWriter::create returned None for `{}`", args.track))?;
 
     let probe = async {
-        subscriber
+        // Keep the handle alive until we've read the history window: `Subscribe`
+        // unsubscribes on drop, so discarding it immediately (as opposed to
+        // binding it) would tear down the subscription before SUBSCRIBE_OK's
+        // key 0x40 can be read back off `track_reader`.
+        let _subscribe = subscriber
             .subscribe_open(track_writer)
             .await
             .map_err(|err| anyhow!("SUBSCRIBE failed: {err:?}"))?;

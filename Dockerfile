@@ -12,6 +12,7 @@ WORKDIR /build
 # dependency layer. Dummy targets make every workspace package buildable.
 COPY Cargo.toml Cargo.lock ./
 COPY moq-api/Cargo.toml moq-api/Cargo.toml
+COPY moq-canary/Cargo.toml moq-canary/Cargo.toml
 COPY moq-catalog/Cargo.toml moq-catalog/Cargo.toml
 COPY moq-clock-ietf/Cargo.toml moq-clock-ietf/Cargo.toml
 COPY moq-native-ietf/Cargo.toml moq-native-ietf/Cargo.toml
@@ -25,7 +26,7 @@ COPY moq-test-client/Cargo.toml moq-test-client/Cargo.toml
 COPY moq-transport/Cargo.toml moq-transport/Cargo.toml
 
 RUN mkdir -p \
-      moq-api/src moq-catalog/src moq-clock-ietf/src \
+      moq-api/src moq-canary/src moq-catalog/src moq-clock-ietf/src \
       moq-native-ietf/src moq-pub/src moq-pub-mmtp/src \
       moq-pub-mmtp/vendor/mmt-core/src moq-pub-mmtp/vendor/mmt-core/benches \
       moq-relay-ietf/src/bin/moq-relay-ietf \
@@ -35,7 +36,7 @@ RUN mkdir -p \
     done && \
     echo "" > moq-pub-mmtp/vendor/mmt-core/src/lib.rs && \
     echo "fn main() {}" > moq-pub-mmtp/vendor/mmt-core/benches/header_bench.rs && \
-    for crate in moq-api moq-clock-ietf moq-pub moq-pub-mmtp moq-sub moq-sub-raw moq-test-client; do \
+    for crate in moq-api moq-canary moq-clock-ietf moq-pub moq-pub-mmtp moq-sub moq-sub-raw moq-test-client; do \
       echo "fn main() {}" > "$crate/src/main.rs"; \
     done && \
     echo "fn main() {}" > moq-relay-ietf/src/bin/moq-relay-ietf/main.rs
