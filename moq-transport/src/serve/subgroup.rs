@@ -10,7 +10,7 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{num::NonZeroU64, ops::Deref, sync::Arc};
+use std::{collections::VecDeque, num::NonZeroU64, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
@@ -45,22 +45,19 @@ impl Deref for Subgroups {
 // State shared between the writer and reader.
 struct SubgroupsState {
     // Created subgroups still within the history window, in creation order. Each
-    // reader walks this via its own absolute cursor (SubgroupsReader::read_index),
-    // so every subgroup of a group is delivered — not just the latest. Follows the
-    // same Vec-walked-by-cursor shape as the object-level SubgroupState, but adds
-    // window pruning (`pruned`, below) that the object level does not have.
-    subgroups: Vec<SubgroupReader>,
-    // Count of subgroups pruned off the front by the history window. A reader's
-    // absolute read_index maps to `subgroups[read_index - pruned]`.
-    pruned: usize,
+    // reader walks this via its own immutable creation cursor
+    // (SubgroupsReader::read_index), so every retained subgroup is delivered in
+    // creation order even when window pruning removes entries from the middle.
+    subgroups: VecDeque<(u64, SubgroupReader)>,
+    next_index: u64,
     closed: Result<(), ServeError>,
 }
 
 impl Default for SubgroupsState {
     fn default() -> Self {
         Self {
-            subgroups: Vec::new(),
-            pruned: 0,
+            subgroups: VecDeque::new(),
+            next_index: 0,
             closed: Ok(()),
         }
     }
@@ -136,25 +133,6 @@ impl SubgroupsWriter {
 
     /// Create a new subgroup with the given parameters, inserting it into the track.
     pub fn create(&mut self, subgroup: Subgroup) -> Result<SubgroupWriter, ServeError> {
-        if self.history_window_groups.is_some()
-            && self
-                .newest_group_id
-                .is_some_and(|newest_group_id| subgroup.group_id < newest_group_id)
-        {
-            return Err(ServeError::Duplicate);
-        }
-
-        // The prune loop below assumes prunable subgroups form a contiguous front
-        // prefix, which holds only if group ids are monotonically non-decreasing
-        // (publisher A2). Catch a regression in debug builds rather than silently
-        // mis-pruning a still-needed group.
-        debug_assert!(
-            subgroup.group_id >= self.last_group_id,
-            "subgroup group_id {} regressed below last {}",
-            subgroup.group_id,
-            self.last_group_id
-        );
-
         let subgroup = SubgroupInfo {
             track: self.info.clone(),
             group_id: subgroup.group_id,
@@ -176,7 +154,7 @@ impl SubgroupsWriter {
         if state
             .subgroups
             .iter()
-            .any(|r| r.group_id == writer.group_id && r.subgroup_id == writer.subgroup_id)
+            .any(|(_, r)| r.group_id == writer.group_id && r.subgroup_id == writer.subgroup_id)
         {
             return Err(ServeError::Duplicate);
         }
@@ -187,25 +165,18 @@ impl SubgroupsWriter {
             self.newest_group_id
                 .map_or(writer.group_id, |newest| newest.max(writer.group_id)),
         );
-        state.subgroups.push(reader);
+        let index = state.next_index;
+        state.next_index = state.next_index.saturating_add(1);
+        state.subgroups.push_back((index, reader));
 
         // Bound history to the most recent `window` group ids. Prune any subgroup
-        // whose group is at least `window` groups behind the newest. Group ids are
-        // monotonically non-decreasing (publisher A2), so prunable subgroups form a
-        // contiguous prefix. The additive form avoids unsigned underflow when the
-        // newest group id is smaller than the window.
-        if let Some(window) = self.history_window_groups {
-            let newest = writer.group_id;
-            let mut k = 0;
-            while k < state.subgroups.len()
-                && newest.saturating_sub(state.subgroups[k].group_id) >= window.get()
-            {
-                k += 1;
-            }
-            if k > 0 {
-                state.subgroups.drain(0..k);
-                state.pruned += k;
-            }
+        // whose group is at least `window` groups behind the newest. Received
+        // subgroups may arrive out of order, so prune across the whole queue while
+        // immutable creation indexes keep each reader's cursor stable.
+        if let (Some(window), Some(newest)) = (self.history_window_groups, self.newest_group_id) {
+            state
+                .subgroups
+                .retain(|(_, subgroup)| newest.saturating_sub(subgroup.group_id) < window.get());
         }
 
         Ok(writer)
@@ -237,7 +208,7 @@ pub struct SubgroupsReader {
     state: State<SubgroupsState>,
     // Cursor into SubgroupsState::subgroups. Cloned readers inherit this index
     // but then advance in parallel — each receives every subgroup.
-    read_index: usize,
+    read_index: u64,
 }
 
 impl SubgroupsReader {
@@ -254,16 +225,14 @@ impl SubgroupsReader {
             {
                 let state = self.state.lock();
 
-                // read_index is absolute (counts pruned entries). A reader that
-                // fell behind the prune window skips ahead to the oldest retained
-                // subgroup.
-                if self.read_index < state.pruned {
-                    self.read_index = state.pruned;
-                }
-                let vec_idx = self.read_index - state.pruned;
-                if vec_idx < state.subgroups.len() {
-                    let subgroup = state.subgroups[vec_idx].clone();
-                    self.read_index += 1;
+                if let Some((index, subgroup)) = state
+                    .subgroups
+                    .iter()
+                    .find(|(index, _)| *index >= self.read_index)
+                {
+                    let index = *index;
+                    let subgroup = subgroup.clone();
+                    self.read_index = index.saturating_add(1);
                     return Ok(Some(subgroup));
                 }
 
@@ -282,8 +251,8 @@ impl SubgroupsReader {
         let state = self.state.lock();
         state
             .subgroups
-            .last()
-            .and_then(|group| group.latest().map(|object_id| (group.group_id, object_id)))
+            .back()
+            .and_then(|(_, group)| group.latest().map(|object_id| (group.group_id, object_id)))
     }
 
     /// Check if the subgroups writer has been closed or dropped.
@@ -880,28 +849,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_window_rejects_out_of_order_groups() {
+    async fn history_window_accepts_out_of_order_groups_and_prunes_by_id() {
         let (mut writer, mut reader) = Subgroups { track: track() }.produce();
         writer.set_history_window(3).unwrap();
-        writer
-            .create(Subgroup {
-                group_id: 10,
-                subgroup_id: 0,
-                priority: 0,
-            })
-            .unwrap();
-
-        let out_of_order = writer.create(Subgroup {
-            group_id: 0,
-            subgroup_id: 0,
-            priority: 0,
-        });
-        assert!(matches!(out_of_order, Err(ServeError::Duplicate)));
+        for group_id in [10, 9, 8, 11] {
+            writer
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 0,
+                })
+                .unwrap();
+        }
         drop(writer);
 
-        let retained = reader.next().await.unwrap().expect("newest subgroup");
-        assert_eq!(retained.group_id, 10);
-        assert!(reader.next().await.unwrap().is_none());
+        let mut retained = Vec::new();
+        while let Some(subgroup) = reader.next().await.unwrap() {
+            retained.push(subgroup.group_id);
+        }
+        assert_eq!(retained, vec![10, 9, 11]);
     }
 
     // set_history_window rejects 0 (no panic): the window must retain >= 1 group.
