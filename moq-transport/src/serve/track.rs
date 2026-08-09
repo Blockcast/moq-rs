@@ -113,6 +113,9 @@ impl TrackWriter {
     }
 
     /// Create a subgroup stream with a bounded group-history window.
+    ///
+    /// Groups must be created with non-decreasing IDs. Multiple subgroups may
+    /// still be created within the same group.
     pub fn subgroups_with_history(
         self,
         history_window_groups: NonZeroU64,

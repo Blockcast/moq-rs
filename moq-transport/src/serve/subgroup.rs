@@ -158,6 +158,7 @@ pub struct SubgroupsWriter {
     next_subgroup_id: u64, // Not in the state to avoid a lock
     next_group_id: u64,    // Not in the state to avoid a lock
     last_group_id: u64,    // Not in the state to avoid a lock
+    newest_group_id: Option<u64>,
     history_window_groups: Option<NonZeroU64>,
 }
 
@@ -175,6 +176,7 @@ impl SubgroupsWriter {
             next_subgroup_id: 0,
             next_group_id: 0,
             last_group_id: 0,
+            newest_group_id: None,
             history_window_groups,
         }
     }
@@ -204,10 +206,20 @@ impl SubgroupsWriter {
 
     /// Create a new subgroup with the given parameters, inserting it into the track.
     ///
-    /// Subgroups may be created out of order while their keys are newer than the
-    /// reclamation frontier. Once a key is reclaimed, that key and every older
-    /// ordering key are closed and return [ServeError::Duplicate].
+    /// Unbounded subgroup streams may be created out of order while their keys are
+    /// newer than the reclamation frontier. History-bounded streams require
+    /// non-decreasing group IDs so the configured window remains bounded. Once a
+    /// key is reclaimed, that key and every older ordering key are closed and
+    /// return [ServeError::Duplicate].
     pub fn create(&mut self, subgroup: Subgroup) -> Result<SubgroupWriter, ServeError> {
+        if self.history_window_groups.is_some()
+            && self
+                .newest_group_id
+                .is_some_and(|newest_group_id| subgroup.group_id < newest_group_id)
+        {
+            return Err(ServeError::Duplicate);
+        }
+
         let subgroup = SubgroupInfo {
             track: self.info.clone(),
             group_id: subgroup.group_id,
@@ -241,6 +253,10 @@ impl SubgroupsWriter {
         self.next_subgroup_id = writer.subgroup_id.saturating_add(1);
         self.next_group_id = self.next_group_id.max(writer.group_id.saturating_add(1));
         self.last_group_id = writer.group_id;
+        self.newest_group_id = Some(
+            self.newest_group_id
+                .map_or(writer.group_id, |newest| newest.max(writer.group_id)),
+        );
         state.subgroups.push_back(reader);
         state.prune_consumed();
         if let Some(window) = self.history_window_groups {
@@ -1016,6 +1032,31 @@ mod tests {
         }
 
         assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn history_window_rejects_out_of_order_groups() {
+        let window = NonZeroU64::new(3).unwrap();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(Some(window));
+        writer
+            .create(Subgroup {
+                group_id: 10,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+
+        let out_of_order = writer.create(Subgroup {
+            group_id: 0,
+            subgroup_id: 0,
+            priority: 0,
+        });
+        assert!(matches!(out_of_order, Err(ServeError::Duplicate)));
+        drop(writer);
+
+        let retained = reader.next().await.unwrap().expect("newest subgroup");
+        assert_eq!(retained.group_id, 10);
+        assert!(reader.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
