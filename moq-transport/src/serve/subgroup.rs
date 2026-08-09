@@ -527,6 +527,18 @@ impl SubgroupWriter {
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
         state.objects.push(reader);
 
+        // Keep the test pause inseparable from releasing the state guard: a
+        // regression that publishes state before the frontier will pause in
+        // the stale-frontier window instead of after both writes complete.
+        #[cfg(test)]
+        let publish = |state| {
+            drop(state);
+            if let Some(hook) = &self.publish_hook {
+                hook.published.send(()).expect("test observes publication");
+                hook.resume.recv().expect("test releases publisher");
+            }
+        };
+
         if let Some(largest_location) = &self.largest_location {
             let location = (self.group_id, object_id);
             let mut largest = largest_location
@@ -535,13 +547,11 @@ impl SubgroupWriter {
             *largest = Some(largest.map_or(location, |current| current.max(location)));
         }
 
-        drop(state);
-
         #[cfg(test)]
-        if let Some(hook) = &self.publish_hook {
-            hook.published.send(()).expect("test observes publication");
-            hook.resume.recv().expect("test releases publisher");
-        }
+        publish(state);
+
+        #[cfg(not(test))]
+        drop(state);
 
         Ok(writer)
     }
