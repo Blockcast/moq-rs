@@ -251,8 +251,9 @@ impl SubgroupsReader {
         let state = self.state.lock();
         state
             .subgroups
-            .back()
-            .and_then(|(_, group)| group.latest().map(|object_id| (group.group_id, object_id)))
+            .iter()
+            .filter_map(|(_, group)| group.latest().map(|object_id| (group.group_id, object_id)))
+            .max()
     }
 
     /// Check if the subgroups writer has been closed or dropped.
@@ -868,6 +869,32 @@ mod tests {
             retained.push(subgroup.group_id);
         }
         assert_eq!(retained, vec![10, 9, 11]);
+    }
+
+    #[tokio::test]
+    async fn latest_uses_largest_group_after_out_of_order_create() {
+        let (mut writer, reader) = Subgroups { track: track() }.produce();
+        writer.set_history_window(3).unwrap();
+
+        let mut newest = writer
+            .create(Subgroup {
+                group_id: 11,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        newest.write(Bytes::from_static(b"newest")).unwrap();
+
+        let mut late = writer
+            .create(Subgroup {
+                group_id: 10,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        late.write(Bytes::from_static(b"late")).unwrap();
+
+        assert_eq!(reader.latest(), Some((11, 0)));
     }
 
     // set_history_window rejects 0 (no panic): the window must retain >= 1 group.
