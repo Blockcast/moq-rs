@@ -10,7 +10,7 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{ops::Deref, sync::Arc};
+use std::{num::NonZeroU64, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
@@ -72,10 +72,11 @@ pub struct SubgroupsWriter {
     next_subgroup_id: u64, // Not in the state to avoid a lock
     next_group_id: u64,    // Not in the state to avoid a lock
     last_group_id: u64,    // Not in the state to avoid a lock
+    newest_group_id: Option<u64>,
     // Retain only subgroups of the most recent `history_window_groups` group ids;
     // older groups are pruned on create(). None = retain unbounded (matching the
     // object-level stream). Live publishers MUST set this to bound memory.
-    history_window_groups: Option<u64>,
+    history_window_groups: Option<NonZeroU64>,
 }
 
 impl SubgroupsWriter {
@@ -86,6 +87,7 @@ impl SubgroupsWriter {
             next_subgroup_id: 0,
             next_group_id: 0,
             last_group_id: 0,
+            newest_group_id: None,
             history_window_groups: None,
         }
     }
@@ -100,11 +102,11 @@ impl SubgroupsWriter {
     /// Errors (rather than panics) on `groups == 0`, honoring the repo's
     /// "error on bad init, no panic in the packet path" rule.
     pub fn set_history_window(&mut self, groups: u64) -> Result<(), ServeError> {
-        if groups < 1 {
+        let Some(groups) = NonZeroU64::new(groups) else {
             return Err(ServeError::Internal(
                 "history window must retain at least one group (got 0)".to_string(),
             ));
-        }
+        };
         self.history_window_groups = Some(groups);
         Ok(())
     }
@@ -134,6 +136,14 @@ impl SubgroupsWriter {
 
     /// Create a new subgroup with the given parameters, inserting it into the track.
     pub fn create(&mut self, subgroup: Subgroup) -> Result<SubgroupWriter, ServeError> {
+        if self.history_window_groups.is_some()
+            && self
+                .newest_group_id
+                .is_some_and(|newest_group_id| subgroup.group_id < newest_group_id)
+        {
+            return Err(ServeError::Duplicate);
+        }
+
         // The prune loop below assumes prunable subgroups form a contiguous front
         // prefix, which holds only if group ids are monotonically non-decreasing
         // (publisher A2). Catch a regression in debug builds rather than silently
@@ -170,9 +180,13 @@ impl SubgroupsWriter {
         {
             return Err(ServeError::Duplicate);
         }
-        self.next_subgroup_id = writer.subgroup_id + 1;
-        self.next_group_id = writer.group_id + 1;
+        self.next_subgroup_id = writer.subgroup_id.saturating_add(1);
+        self.next_group_id = writer.group_id.saturating_add(1);
         self.last_group_id = writer.group_id;
+        self.newest_group_id = Some(
+            self.newest_group_id
+                .map_or(writer.group_id, |newest| newest.max(writer.group_id)),
+        );
         state.subgroups.push(reader);
 
         // Bound history to the most recent `window` group ids. Prune any subgroup
@@ -184,7 +198,7 @@ impl SubgroupsWriter {
             let newest = writer.group_id;
             let mut k = 0;
             while k < state.subgroups.len()
-                && state.subgroups[k].group_id.saturating_add(window) <= newest
+                && newest.saturating_sub(state.subgroups[k].group_id) >= window.get()
             {
                 k += 1;
             }
@@ -843,6 +857,51 @@ mod tests {
             vec![(1, 0), (2, 0), (3, 0)],
             "newest=3, window=3 → retain g where 3-g < 3 → groups 1..=3; group 0 pruned"
         );
+    }
+
+    #[tokio::test]
+    async fn history_window_retains_max_group_id() {
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        writer.set_history_window(1).unwrap();
+        for group_id in [u64::MAX - 1, u64::MAX] {
+            writer
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 0,
+                })
+                .unwrap();
+        }
+        drop(writer);
+
+        let retained = reader.next().await.unwrap().expect("newest subgroup");
+        assert_eq!(retained.group_id, u64::MAX);
+        assert!(reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn history_window_rejects_out_of_order_groups() {
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        writer.set_history_window(3).unwrap();
+        writer
+            .create(Subgroup {
+                group_id: 10,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+
+        let out_of_order = writer.create(Subgroup {
+            group_id: 0,
+            subgroup_id: 0,
+            priority: 0,
+        });
+        assert!(matches!(out_of_order, Err(ServeError::Duplicate)));
+        drop(writer);
+
+        let retained = reader.next().await.unwrap().expect("newest subgroup");
+        assert_eq!(retained.group_id, 10);
+        assert!(reader.next().await.unwrap().is_none());
     }
 
     // set_history_window rejects 0 (no panic): the window must retain >= 1 group.
