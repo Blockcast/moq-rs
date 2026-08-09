@@ -115,7 +115,7 @@ impl SubgroupsState {
         let prune_count = self
             .subgroups
             .iter()
-            .take_while(|subgroup| subgroup.group_id.saturating_add(window.get()) <= newest_group)
+            .take_while(|subgroup| newest_group.saturating_sub(subgroup.group_id) >= window.get())
             .count();
         self.prune_front(prune_count);
     }
@@ -1032,6 +1032,26 @@ mod tests {
         }
 
         assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn history_window_retains_max_group_id() {
+        let window = NonZeroU64::new(1).unwrap();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(Some(window));
+        for group_id in [u64::MAX - 1, u64::MAX] {
+            writer
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 0,
+                })
+                .unwrap();
+        }
+        drop(writer);
+
+        let retained = reader.next().await.unwrap().expect("newest subgroup");
+        assert_eq!(retained.group_id, u64::MAX);
+        assert!(reader.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
