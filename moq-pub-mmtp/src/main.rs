@@ -60,6 +60,30 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Optional Prometheus metrics exporter (feature `metrics-prometheus` +
+    // --metrics-addr). Serves whatever the process has already recorded via
+    // the `metrics` facade — notably moq-native-ietf's `moq_negotiation_total`,
+    // emitted on every connect attempt regardless of this flag.
+    #[cfg(feature = "metrics-prometheus")]
+    if let Some(metrics_addr) = args.metrics_addr {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        PrometheusBuilder::new()
+            .with_http_listener(metrics_addr)
+            .install()
+            .expect("failed to install Prometheus metrics exporter");
+        tracing::info!(
+            "metrics exporter listening on http://{}/metrics",
+            metrics_addr
+        );
+    }
+    #[cfg(not(feature = "metrics-prometheus"))]
+    if args.metrics_addr.is_some() {
+        tracing::warn!(
+            "--metrics-addr was provided but the metrics-prometheus feature is not enabled. \
+             Rebuild with --features metrics-prometheus to enable the Prometheus exporter."
+        );
+    }
+
     // ---- catalog ----
 
     let catalog_bytes = tokio::fs::read(&args.catalog_json)
