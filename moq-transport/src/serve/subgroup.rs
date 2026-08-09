@@ -470,6 +470,15 @@ pub struct SubgroupWriter {
 
     // The next object sequence number to use.
     next_object_id: u64,
+
+    #[cfg(test)]
+    publish_hook: Option<PublishHook>,
+}
+
+#[cfg(test)]
+struct PublishHook {
+    published: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl SubgroupWriter {
@@ -483,6 +492,8 @@ impl SubgroupWriter {
             info: group,
             largest_location,
             next_object_id: 0,
+            #[cfg(test)]
+            publish_hook: None,
         }
     }
 
@@ -515,7 +526,6 @@ impl SubgroupWriter {
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
         state.objects.push(reader);
-        drop(state);
 
         if let Some(largest_location) = &self.largest_location {
             let location = (self.group_id, object_id);
@@ -523,6 +533,14 @@ impl SubgroupWriter {
                 .lock()
                 .expect("largest location mutex poisoned");
             *largest = Some(largest.map_or(location, |current| current.max(location)));
+        }
+
+        drop(state);
+
+        #[cfg(test)]
+        if let Some(hook) = &self.publish_hook {
+            hook.published.send(()).expect("test observes publication");
+            hook.resume.recv().expect("test releases publisher");
         }
 
         Ok(writer)
@@ -824,13 +842,68 @@ impl Deref for SubgroupObjectReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::TrackNamespace;
+    use crate::coding::{Location, TrackNamespace};
 
     fn track() -> Arc<Track> {
         Arc::new(Track::new(
             TrackNamespace::from_utf8_path("ns"),
             "t".to_string(),
         ))
+    }
+
+    #[tokio::test]
+    async fn object_wake_publishes_largest_location_atomically() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string()).produce();
+        let mut subgroups = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups
+            .create(Subgroup {
+                group_id: 7,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        let mut subgroup_reader = match track_reader.mode().await.unwrap() {
+            super::super::TrackReaderMode::Subgroups(mut reader) => {
+                reader.next().await.unwrap().expect("created subgroup")
+            }
+            _ => panic!("expected subgroup mode"),
+        };
+
+        let mut next = Box::pin(subgroup_reader.next());
+        assert!(matches!(
+            futures::poll!(&mut next),
+            std::task::Poll::Pending
+        ));
+
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        subgroup_writer.publish_hook = Some(PublishHook {
+            published: published_tx,
+            resume: resume_rx,
+        });
+
+        let publisher = std::thread::spawn(move || subgroup_writer.create(0, None));
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("object publication notifies the blocked reader");
+
+        let object = tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .expect("reader must wake on object publication")
+            .unwrap()
+            .expect("published object");
+        let observed = track_reader.largest_location();
+
+        resume_tx.send(()).expect("release publisher");
+        publisher.join().expect("publisher thread").unwrap();
+
+        assert_eq!(object.object_id, 0);
+        assert_eq!(
+            observed,
+            Some(Location::new(7, 0)),
+            "a reader released by object publication must observe the matching frontier"
+        );
     }
 
     // A group may carry more than one subgroup. The reader MUST deliver every
