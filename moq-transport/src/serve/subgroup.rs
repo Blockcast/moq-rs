@@ -12,6 +12,7 @@
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
 use std::{
     collections::{HashSet, VecDeque},
+    num::NonZeroU64,
     ops::Deref,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -33,11 +34,19 @@ pub struct Subgroups {
 }
 
 impl Subgroups {
-    pub fn produce(self) -> (SubgroupsWriter, SubgroupsReader) {
+    pub fn produce(
+        self,
+        history_window_groups: Option<NonZeroU64>,
+    ) -> (SubgroupsWriter, SubgroupsReader) {
         let (writer, reader) = State::default().split();
         let largest_location = Arc::new(Mutex::new(None));
 
-        let writer = SubgroupsWriter::new(writer, self.track.clone(), largest_location.clone());
+        let writer = SubgroupsWriter::new(
+            writer,
+            self.track.clone(),
+            largest_location.clone(),
+            history_window_groups,
+        );
         let reader = SubgroupsReader::new(reader, self.track, largest_location);
 
         (writer, reader)
@@ -99,22 +108,33 @@ impl SubgroupsState {
             .unwrap_or(end_index)
             .clamp(self.first_index, latest_index);
         let prune_count = retain_from - self.first_index;
-        if prune_count > 0 {
-            for _ in 0..prune_count {
-                let subgroup = self
-                    .subgroups
-                    .pop_front()
-                    .expect("prune count is bounded by the subgroup queue");
-                let key = (subgroup.group_id, subgroup.subgroup_id);
-                let removed = self.retained_keys.remove(&key);
-                debug_assert!(removed, "retained key must mirror subgroup payload");
-                self.retired_through = Some(
-                    self.retired_through
-                        .map_or(key, |frontier| frontier.max(key)),
-                );
-            }
-            self.first_index = retain_from;
+        self.prune_front(prune_count);
+    }
+
+    fn prune_history(&mut self, newest_group: u64, window: NonZeroU64) {
+        let prune_count = self
+            .subgroups
+            .iter()
+            .take_while(|subgroup| subgroup.group_id.saturating_add(window.get()) <= newest_group)
+            .count();
+        self.prune_front(prune_count);
+    }
+
+    fn prune_front(&mut self, prune_count: usize) {
+        for _ in 0..prune_count {
+            let subgroup = self
+                .subgroups
+                .pop_front()
+                .expect("prune count is bounded by the subgroup queue");
+            let key = (subgroup.group_id, subgroup.subgroup_id);
+            let removed = self.retained_keys.remove(&key);
+            debug_assert!(removed, "retained key must mirror subgroup payload");
+            self.retired_through = Some(
+                self.retired_through
+                    .map_or(key, |frontier| frontier.max(key)),
+            );
         }
+        self.first_index += prune_count;
     }
 }
 
@@ -138,6 +158,7 @@ pub struct SubgroupsWriter {
     next_subgroup_id: u64, // Not in the state to avoid a lock
     next_group_id: u64,    // Not in the state to avoid a lock
     last_group_id: u64,    // Not in the state to avoid a lock
+    history_window_groups: Option<NonZeroU64>,
 }
 
 impl SubgroupsWriter {
@@ -145,6 +166,7 @@ impl SubgroupsWriter {
         state: State<SubgroupsState>,
         track: Arc<Track>,
         largest_location: LargestLocation,
+        history_window_groups: Option<NonZeroU64>,
     ) -> Self {
         Self {
             info: track,
@@ -153,6 +175,7 @@ impl SubgroupsWriter {
             next_subgroup_id: 0,
             next_group_id: 0,
             last_group_id: 0,
+            history_window_groups,
         }
     }
 
@@ -220,6 +243,9 @@ impl SubgroupsWriter {
         self.last_group_id = writer.group_id;
         state.subgroups.push_back(reader);
         state.prune_consumed();
+        if let Some(window) = self.history_window_groups {
+            state.prune_history(writer.group_id, window);
+        }
 
         Ok(writer)
     }
@@ -917,7 +943,7 @@ mod tests {
     // created subgroup; latest-wins dropped all but the newest.
     #[tokio::test]
     async fn delivers_all_subgroups_in_one_group() {
-        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(None);
         let _a = writer
             .create(Subgroup {
                 group_id: 0,
@@ -950,7 +976,7 @@ mod tests {
     // reject the duplicate — the API cannot trust arbitrary callers.
     #[tokio::test]
     async fn create_rejects_duplicate_group_subgroup() {
-        let (mut writer, _reader) = Subgroups { track: track() }.produce();
+        let (mut writer, _reader) = Subgroups { track: track() }.produce(None);
         let _first = writer
             .create(Subgroup {
                 group_id: 0,
@@ -970,8 +996,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prunes_subgroups_outside_group_window() {
+        let window = NonZeroU64::new(3).unwrap();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(Some(window));
+        for group_id in 0..=3 {
+            writer
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 0,
+                })
+                .unwrap();
+        }
+        drop(writer);
+
+        let mut got = Vec::new();
+        while let Some(subgroup) = reader.next().await.unwrap() {
+            got.push(subgroup.group_id);
+        }
+
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
     async fn consume_prune_then_recreate_is_duplicate() {
-        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(None);
         let _first = writer
             .create(Subgroup {
                 group_id: 0,
@@ -1009,7 +1058,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_key_behind_retired_frontier() {
-        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(None);
         let _first = writer
             .create(Subgroup {
                 group_id: 5,
@@ -1042,7 +1091,7 @@ mod tests {
     // sequence to every reader.
     #[tokio::test]
     async fn cloned_readers_each_receive_all_subgroups() {
-        let (mut writer, reader) = Subgroups { track: track() }.produce();
+        let (mut writer, reader) = Subgroups { track: track() }.produce(None);
         let _a = writer
             .create(Subgroup {
                 group_id: 0,
@@ -1075,7 +1124,7 @@ mod tests {
     // subgroup 0, all delivered.
     #[tokio::test]
     async fn append_creates_increasing_groups_all_delivered() {
-        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(None);
         let _a = writer.append(0).unwrap();
         let _b = writer.append(0).unwrap();
         drop(writer);
@@ -1089,7 +1138,7 @@ mod tests {
 
     #[tokio::test]
     async fn out_of_order_create_does_not_regress_append_group_id() {
-        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(None);
         let _newer = writer
             .create(Subgroup {
                 group_id: 5,
@@ -1119,7 +1168,7 @@ mod tests {
     async fn bounds_payload_and_identity_retention() {
         const SUBGROUP_COUNT: usize = 4096;
 
-        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(None);
         for group_id in 0..SUBGROUP_COUNT {
             let created = writer.append(0).unwrap();
             assert_eq!(created.group_id, group_id as u64);
@@ -1147,7 +1196,7 @@ mod tests {
     async fn dropping_lagging_reader_releases_its_backlog() {
         const SUBGROUP_COUNT: usize = 4096;
 
-        let (mut writer, mut reader) = Subgroups { track: track() }.produce();
+        let (mut writer, mut reader) = Subgroups { track: track() }.produce(None);
         let lagging = reader.clone();
         for _ in 0..SUBGROUP_COUNT {
             let _subgroup = writer.append(0).unwrap();
