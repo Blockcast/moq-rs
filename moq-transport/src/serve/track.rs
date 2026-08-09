@@ -24,7 +24,7 @@ use super::{
 };
 use crate::coding::{Location, TrackName, TrackNamespace};
 use paste::paste;
-use std::{ops::Deref, sync::Arc};
+use std::{num::NonZeroU64, ops::Deref, sync::Arc};
 
 /// Static information about a track.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,10 +109,28 @@ impl TrackWriter {
     // TODO: rework this whole interface for clarity?
     /// Create a new subgroups stream with the given priority, inserting it into the track.
     pub fn subgroups(self) -> Result<SubgroupsWriter, ServeError> {
+        self.produce_subgroups(None)
+    }
+
+    /// Create a subgroup stream with a bounded group-history window.
+    ///
+    /// Groups must be created with non-decreasing IDs. Multiple subgroups may
+    /// still be created within the same group.
+    pub fn subgroups_with_history(
+        self,
+        history_window_groups: NonZeroU64,
+    ) -> Result<SubgroupsWriter, ServeError> {
+        self.produce_subgroups(Some(history_window_groups))
+    }
+
+    fn produce_subgroups(
+        self,
+        history_window_groups: Option<NonZeroU64>,
+    ) -> Result<SubgroupsWriter, ServeError> {
         let (writer, reader) = Subgroups {
             track: self.info.clone(),
         }
-        .produce();
+        .produce(history_window_groups);
 
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {
