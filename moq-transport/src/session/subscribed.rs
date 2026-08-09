@@ -45,6 +45,17 @@ fn subscribe_ok_params(
     Ok(params)
 }
 
+fn record_datagram_loss_metric(
+    dropped_total: u64,
+    reported_dropped: u64,
+    skipped_too_large: u64,
+    reported_too_large: u64,
+) -> u64 {
+    let loss_delta = (dropped_total - reported_dropped) + (skipped_too_large - reported_too_large);
+    metrics::counter!("moq_pub_mmtp_dropped_datagrams_total").increment(loss_delta);
+    loss_delta
+}
+
 #[derive(Debug)]
 struct ObjectForwarderState {
     largest_location: Option<Location>,
@@ -664,11 +675,17 @@ impl ObjectForwarder {
             let warn_due = last_loss_warn.is_none_or(|at| at.elapsed() >= LOSS_WARN_INTERVAL);
             if loss_grew {
                 let dropped_delta = dropped_total - reported_dropped;
-                // BLO-22882: dropped_total (and hence this delta) must remain
-                // durably queryable even when the per-interval log line below
-                // is suppressed or evicted from a retained log window — the
-                // counter is the source of truth, the log line is a summary.
-                metrics::counter!("moq_pub_mmtp_dropped_datagrams_total").increment(dropped_delta);
+                let skipped_too_large_delta = skipped_too_large - reported_too_large;
+                let loss_delta = record_datagram_loss_metric(
+                    dropped_total,
+                    reported_dropped,
+                    skipped_too_large,
+                    reported_too_large,
+                );
+                // BLO-22882: aggregate loss must remain durably queryable even
+                // when the per-interval log line below is suppressed or evicted
+                // from a retained log window — the counter is the source of
+                // truth, the log line is a summary.
                 if warn_due {
                     // Demoted from warn! (BLO-22882): at sustained loss this
                     // line fires every 5s and was crowding out other startup
@@ -679,6 +696,8 @@ impl ObjectForwarder {
                         dropped_total,
                         dropped_delta,
                         skipped_too_large,
+                        skipped_too_large_delta,
+                        loss_delta,
                         "datagram subscriber lossy: ring-superseded and/or over-MTU payloads skipped"
                     );
                     last_loss_warn = Some(std::time::Instant::now());
@@ -815,7 +834,84 @@ impl ObjectForwarderRecv {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+
+    use metrics::{
+        Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+
     use super::*;
+
+    const DROPPED_DATAGRAMS_METRIC: &str = "moq_pub_mmtp_dropped_datagrams_total";
+
+    #[derive(Default)]
+    struct CounterRecorder {
+        dropped_datagrams: Arc<AtomicU64>,
+    }
+
+    struct AtomicCounter(Arc<AtomicU64>);
+
+    impl CounterFn for AtomicCounter {
+        fn increment(&self, value: u64) {
+            self.0.fetch_add(value, Ordering::Relaxed);
+        }
+
+        fn absolute(&self, value: u64) {
+            self.0.fetch_max(value, Ordering::Relaxed);
+        }
+    }
+
+    impl Recorder for CounterRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            if key.name() == DROPPED_DATAGRAMS_METRIC {
+                Counter::from_arc(Arc::new(AtomicCounter(Arc::clone(&self.dropped_datagrams))))
+            } else {
+                Counter::noop()
+            }
+        }
+
+        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::noop()
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn dropped_datagram_metric_counts_ring_loss() {
+        let recorder = CounterRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || record_datagram_loss_metric(7, 3, 0, 0));
+
+        assert_eq!(recorder.dropped_datagrams.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn dropped_datagram_metric_counts_over_mtu_loss() {
+        let recorder = CounterRecorder::default();
+
+        metrics::with_local_recorder(&recorder, || record_datagram_loss_metric(0, 0, 5, 2));
+
+        assert_eq!(recorder.dropped_datagrams.load(Ordering::Relaxed), 3);
+    }
 
     #[test]
     fn blockcast_profile_requires_publisher_history_window() {

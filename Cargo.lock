@@ -1594,6 +1594,8 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "metrics",
+ "metrics-exporter-prometheus",
  "mmt-core",
  "moq-catalog",
  "moq-native-ietf",
@@ -1693,6 +1695,7 @@ version = "0.16.0"
 dependencies = [
  "bytes",
  "futures",
+ "metrics",
  "paste",
  "serde",
  "serde_json",
