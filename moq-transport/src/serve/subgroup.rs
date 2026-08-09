@@ -470,15 +470,6 @@ pub struct SubgroupWriter {
 
     // The next object sequence number to use.
     next_object_id: u64,
-
-    #[cfg(test)]
-    publish_hook: Option<PublishHook>,
-}
-
-#[cfg(test)]
-struct PublishHook {
-    published: std::sync::mpsc::Sender<()>,
-    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl SubgroupWriter {
@@ -492,8 +483,6 @@ impl SubgroupWriter {
             info: group,
             largest_location,
             next_object_id: 0,
-            #[cfg(test)]
-            publish_hook: None,
         }
     }
 
@@ -527,18 +516,6 @@ impl SubgroupWriter {
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
         state.objects.push(reader);
 
-        // Keep the test pause inseparable from releasing the state guard: a
-        // regression that publishes state before the frontier will pause in
-        // the stale-frontier window instead of after both writes complete.
-        #[cfg(test)]
-        let publish = |state| {
-            drop(state);
-            if let Some(hook) = &self.publish_hook {
-                hook.published.send(()).expect("test observes publication");
-                hook.resume.recv().expect("test releases publisher");
-            }
-        };
-
         if let Some(largest_location) = &self.largest_location {
             let location = (self.group_id, object_id);
             let mut largest = largest_location
@@ -547,10 +524,6 @@ impl SubgroupWriter {
             *largest = Some(largest.map_or(location, |current| current.max(location)));
         }
 
-        #[cfg(test)]
-        publish(state);
-
-        #[cfg(not(test))]
         drop(state);
 
         Ok(writer)
@@ -880,34 +853,58 @@ mod tests {
             _ => panic!("expected subgroup mode"),
         };
 
-        let mut next = Box::pin(subgroup_reader.next());
-        assert!(matches!(
-            futures::poll!(&mut next),
-            std::task::Poll::Pending
-        ));
-
-        let (published_tx, published_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        subgroup_writer.publish_hook = Some(PublishHook {
-            published: published_tx,
-            resume: resume_rx,
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (received_tx, received_rx) = std::sync::mpsc::channel();
+        let reader_track = track_reader.clone();
+        let reader = std::thread::spawn(move || {
+            let mut next = Box::pin(subgroup_reader.next());
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(matches!(
+                std::future::Future::poll(next.as_mut(), &mut context),
+                std::task::Poll::Pending
+            ));
+            waiting_tx.send(()).expect("reader starts waiting");
+            let object = futures::executor::block_on(next)
+                .unwrap()
+                .expect("published object");
+            received_tx
+                .send(object.object_id)
+                .expect("test observes received object");
+            (object, reader_track.largest_location())
         });
-
-        let publisher = std::thread::spawn(move || subgroup_writer.create(0, None));
-        published_rx
+        waiting_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("object publication notifies the blocked reader");
+            .expect("reader thread starts");
 
-        let object = tokio::time::timeout(std::time::Duration::from_secs(1), next)
-            .await
-            .expect("reader must wake on object publication")
-            .unwrap()
-            .expect("published object");
-        let observed = track_reader.largest_location();
+        let largest_location = subgroup_writer
+            .largest_location
+            .as_ref()
+            .expect("track subgroup has a frontier")
+            .clone();
+        let frontier = largest_location
+            .lock()
+            .expect("largest location mutex poisoned");
+        let publisher = std::thread::spawn(move || subgroup_writer.create(0, None));
 
-        resume_tx.send(()).expect("release publisher");
+        let received_while_frontier_blocked = received_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .ok();
+
+        drop(frontier);
         publisher.join().expect("publisher thread").unwrap();
+        let object_id = received_while_frontier_blocked.unwrap_or_else(|| {
+            received_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("reader must wake on object publication")
+        });
+        let (object, observed) = reader.join().expect("reader thread");
 
+        assert!(
+            received_while_frontier_blocked.is_none(),
+            "the object must remain hidden while frontier publication is blocked"
+        );
+        assert_eq!(object_id, 0);
         assert_eq!(object.object_id, 0);
         assert_eq!(
             observed,
