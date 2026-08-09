@@ -515,7 +515,6 @@ impl SubgroupWriter {
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
         state.objects.push(reader);
-        drop(state);
 
         if let Some(largest_location) = &self.largest_location {
             let location = (self.group_id, object_id);
@@ -524,6 +523,8 @@ impl SubgroupWriter {
                 .expect("largest location mutex poisoned");
             *largest = Some(largest.map_or(location, |current| current.max(location)));
         }
+
+        drop(state);
 
         Ok(writer)
     }
@@ -824,13 +825,92 @@ impl Deref for SubgroupObjectReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::TrackNamespace;
+    use crate::coding::{Location, TrackNamespace};
 
     fn track() -> Arc<Track> {
         Arc::new(Track::new(
             TrackNamespace::from_utf8_path("ns"),
             "t".to_string(),
         ))
+    }
+
+    #[tokio::test]
+    async fn object_wake_publishes_largest_location_atomically() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string()).produce();
+        let mut subgroups = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups
+            .create(Subgroup {
+                group_id: 7,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        let mut subgroup_reader = match track_reader.mode().await.unwrap() {
+            super::super::TrackReaderMode::Subgroups(mut reader) => {
+                reader.next().await.unwrap().expect("created subgroup")
+            }
+            _ => panic!("expected subgroup mode"),
+        };
+
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (received_tx, received_rx) = std::sync::mpsc::channel();
+        let reader_track = track_reader.clone();
+        let reader = std::thread::spawn(move || {
+            let mut next = Box::pin(subgroup_reader.next());
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(matches!(
+                std::future::Future::poll(next.as_mut(), &mut context),
+                std::task::Poll::Pending
+            ));
+            waiting_tx.send(()).expect("reader starts waiting");
+            let object = futures::executor::block_on(next)
+                .unwrap()
+                .expect("published object");
+            received_tx
+                .send(object.object_id)
+                .expect("test observes received object");
+            (object, reader_track.largest_location())
+        });
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("reader thread starts");
+
+        let largest_location = subgroup_writer
+            .largest_location
+            .as_ref()
+            .expect("track subgroup has a frontier")
+            .clone();
+        let frontier = largest_location
+            .lock()
+            .expect("largest location mutex poisoned");
+        let publisher = std::thread::spawn(move || subgroup_writer.create(0, None));
+
+        let received_while_frontier_blocked = received_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .ok();
+
+        drop(frontier);
+        publisher.join().expect("publisher thread").unwrap();
+        let object_id = received_while_frontier_blocked.unwrap_or_else(|| {
+            received_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("reader must wake on object publication")
+        });
+        let (object, observed) = reader.join().expect("reader thread");
+
+        assert!(
+            received_while_frontier_blocked.is_none(),
+            "the object must remain hidden while frontier publication is blocked"
+        );
+        assert_eq!(object_id, 0);
+        assert_eq!(object.object_id, 0);
+        assert_eq!(
+            observed,
+            Some(Location::new(7, 0)),
+            "a reader released by object publication must observe the matching frontier"
+        );
     }
 
     // A group may carry more than one subgroup. The reader MUST deliver every
