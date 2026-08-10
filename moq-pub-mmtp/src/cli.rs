@@ -84,6 +84,13 @@ pub struct Args {
     #[arg(long, value_enum)]
     pub wire_profile: Option<WireProfileArg>,
 
+    /// Address to expose Prometheus metrics on (e.g., "127.0.0.1:9090").
+    /// Requires the `metrics-prometheus` feature to be enabled.
+    /// When set, serves metrics — including `moq_negotiation_total`, emitted
+    /// by moq-native-ietf on every connect attempt — at http://<addr>/metrics.
+    #[arg(long)]
+    pub metrics_addr: Option<std::net::SocketAddr>,
+
     /// TLS configuration shared with moq-pub / moq-relay-ietf:
     /// `--tls-cert`, `--tls-key`, `--tls-root`, `--tls-disable-verify`.
     #[command(flatten)]
@@ -120,5 +127,19 @@ mod tests {
             args.wire_profile.map(WireProfile::from),
             Some(WireProfile::Blockcast01)
         );
+    }
+
+    #[test]
+    fn metrics_addr_is_opt_in() {
+        let args = Args::try_parse_from(required_args()).unwrap();
+        assert!(args.metrics_addr.is_none());
+
+        let args = Args::try_parse_from(
+            required_args()
+                .into_iter()
+                .chain(["--metrics-addr", "127.0.0.1:9090"]),
+        )
+        .unwrap();
+        assert_eq!(args.metrics_addr, Some("127.0.0.1:9090".parse().unwrap()));
     }
 }

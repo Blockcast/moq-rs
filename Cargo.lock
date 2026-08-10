@@ -1519,6 +1519,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-canary"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "moq-native-ietf",
+ "moq-transport",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "moq-catalog"
 version = "0.2.3"
 dependencies = [
@@ -1594,6 +1610,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "metrics-exporter-prometheus",
  "mmt-core",
  "moq-catalog",
  "moq-native-ietf",

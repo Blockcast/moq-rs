@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# moq-canary: continuously subscribe under the negotiated Blockcast wire
+# profile (moqt-blockcast-01) and decode SUBSCRIBE_OK key 0x40
+# (SUBGROUP_HISTORY_GROUPS_PARAM) on every cycle. Exists to produce the
+# BLO-22255 verifying signal — a running receipt that every reachable
+# producer class actually negotiates the profile and emits a nonzero bounded
+# history window, not just that the binaries were deployed.
+
+[package]
+name = "moq-canary"
+description = "Blockcast wire-profile negotiation canary for Media over QUIC"
+authors = ["Blockcast"]
+repository = "https://github.com/Blockcast/pim-multicast-gateway"
+license = "MIT OR Apache-2.0"
+
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Off by default, mirroring moq-relay-ietf / moq-pub-mmtp. Without it,
+# --metrics-addr is parsed but only logs a warning.
+metrics-prometheus = ["dep:metrics-exporter-prometheus"]
+
+[dependencies]
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
+moq-transport = { path = "../moq-transport", version = "0.16" }
+
+url = "2"
+tokio = { version = "1", features = ["full"] }
+
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { version = "1", features = ["backtrace"] }
+
+# Metrics — always compiled in; effectively zero-cost with no recorder
+# installed. The metrics-prometheus feature adds the exporter that serves
+# `moq_canary_probe_total` / `moq_canary_history_window_groups`.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", optional = true }

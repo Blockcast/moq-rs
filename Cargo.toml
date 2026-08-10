@@ -10,6 +10,7 @@ members = [
 	"moq-pub-mmtp",
 	"moq-sub",
 	"moq-sub-raw",
+	"moq-canary",
 	"moq-api",
 	"moq-clock-ietf",
 	"moq-native-ietf",

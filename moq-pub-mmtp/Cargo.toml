@@ -30,6 +30,11 @@ heap-profiling = [
 	"dep:tikv-jemallocator",
 	"dep:tikv-jemalloc-ctl",
 ]
+# Off by default. Compiles the Prometheus exporter behind --metrics-addr
+# (installed in main.rs). Without this feature, --metrics-addr is parsed but
+# produces a startup warning instead of serving anything — the shipped
+# binary otherwise never links metrics-exporter-prometheus.
+metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 
 [dependencies]
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
@@ -54,6 +59,13 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { version = "1", features = ["backtrace"] }
 serde_json = "1"
+
+# Metrics — moq-native-ietf (a dependency) already emits
+# `moq_negotiation_total` via the `metrics` facade on every connect attempt,
+# recorded by whatever global recorder is installed process-wide. This crate
+# only needs the exporter that installs one; it never calls `metrics::`
+# macros itself, so the `metrics` crate is not a direct dependency here.
+metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 # --- feature "profiling" only ---
 # On-demand CPU profiler: SIGPROF/ITIMER_PROF userspace sampling (no
