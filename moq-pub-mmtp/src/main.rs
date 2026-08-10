@@ -66,6 +66,30 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Optional Prometheus metrics exporter (feature `metrics-prometheus` +
+    // --metrics-addr). Serves whatever the process has already recorded via
+    // the `metrics` facade — notably moq-native-ietf's `moq_negotiation_total`,
+    // emitted on every connect attempt regardless of this flag.
+    #[cfg(feature = "metrics-prometheus")]
+    if let Some(metrics_addr) = args.metrics_addr {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        PrometheusBuilder::new()
+            .with_http_listener(metrics_addr)
+            .install()
+            .expect("failed to install Prometheus metrics exporter");
+        tracing::info!(
+            "metrics exporter listening on http://{}/metrics",
+            metrics_addr
+        );
+    }
+    #[cfg(not(feature = "metrics-prometheus"))]
+    if args.metrics_addr.is_some() {
+        tracing::warn!(
+            "--metrics-addr was provided but the metrics-prometheus feature is not enabled. \
+             Rebuild with --features metrics-prometheus to enable the Prometheus exporter."
+        );
+    }
+
     // ---- catalog ----
 
     let catalog_bytes = tokio::fs::read(&args.catalog_json)
@@ -285,7 +309,7 @@ fn build_state_map(
                 })
                 .unwrap_or(1);
 
-            let mut track_writer = tracks_writer.create(&track_ref.name).ok_or_else(|| {
+            let track_writer = tracks_writer.create(&track_ref.name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "TracksWriter::create returned None for `{}` (broadcast already closed?)",
                     track_ref.name
@@ -296,13 +320,8 @@ fn build_state_map(
             // per MFU), so retained history must remain bounded. Retention is a
             // fixed publisher policy because it is not part of the MSF schema.
             let history_window = PUBLISHER_HISTORY_WINDOW;
-            // Set on the Track BEFORE `.subgroups()` consumes it: `subgroups()`
-            // inherits the window to bound local pruning, AND the publisher
-            // session advertises it in SUBSCRIBE_OK (BLO-10339) so a downstream
-            // relay mirror bounds its own retention to the same window.
-            track_writer.set_history_window(history_window)?;
             let subgroups = track_writer
-                .subgroups()
+                .subgroups_with_history(history_window)
                 .with_context(|| format!("track `{}`: subgroups() failed", track_ref.name))?;
 
             let repair = if let Some(fec) = &catalog_track.fec {
@@ -314,16 +333,14 @@ fn build_state_map(
                 let priority = repair_track
                     .priority
                     .expect("Root::validate requires repair priority");
-                let mut repair_writer =
-                    tracks_writer.create(&fec.repair_track).ok_or_else(|| {
-                        anyhow::anyhow!(
+                let repair_writer = tracks_writer.create(&fec.repair_track).ok_or_else(|| {
+                    anyhow::anyhow!(
                         "TracksWriter::create returned None for `{}` (broadcast already closed?)",
                         fec.repair_track
                     )
-                    })?;
-                repair_writer.set_history_window(history_window)?;
+                })?;
                 let repair_subgroups = repair_writer
-                    .subgroups()
+                    .subgroups_with_history(history_window)
                     .with_context(|| format!("track `{}`: subgroups() failed", fec.repair_track))?;
                 Some(RepairSink {
                     sink: repair_subgroups,

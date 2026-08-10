@@ -56,6 +56,7 @@ path = [
   ".markdownlintignore",
   ".planning/**",
   "graphify-out/**",
+  "moq-canary/**",
   "moq-pub-mmtp/**",
   "moq-sub-raw/**",
   "moq-catalog/src/multicast.rs",

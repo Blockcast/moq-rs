@@ -163,6 +163,18 @@ impl TrackWriter {
         Ok(writer)
     }
 
+    /// Create a subgroup stream with a bounded group-history window.
+    ///
+    /// The window is also persisted on the track so sessions and downstream
+    /// relays can advertise it in SUBSCRIBE_OK.
+    pub fn subgroups_with_history(
+        mut self,
+        history_window_groups: NonZeroU64,
+    ) -> Result<SubgroupsWriter, ServeError> {
+        self.set_history_window(history_window_groups)?;
+        self.subgroups()
+    }
+
     pub fn datagrams(self) -> Result<DatagramsWriter, ServeError> {
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {
@@ -407,12 +419,12 @@ mod tests {
     #[tokio::test]
     async fn subgroups_inherits_track_history_window_and_prunes() {
         let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
-        let (mut writer, reader) = track.produce();
-
-        writer
-            .set_history_window(NonZeroU64::new(1).unwrap())
-            .unwrap();
-        let mut subgroups = writer.subgroups().expect("subgroups transition");
+        let (writer, reader) = track.produce();
+        let window = NonZeroU64::new(1).unwrap();
+        let mut subgroups = writer
+            .subgroups_with_history(window)
+            .expect("subgroups transition");
+        assert_eq!(reader.history_window(), Some(window));
         for g in 0..=1u64 {
             subgroups
                 .create(Subgroup {
