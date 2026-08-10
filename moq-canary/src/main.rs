@@ -53,13 +53,16 @@ async fn main() -> Result<()> {
 
     loop {
         let cycle_started = tokio::time::Instant::now();
-        let outcome = match tokio::time::timeout(probe_timeout, probe_once(&args, &tls)).await {
-            Ok(inner) => inner,
-            Err(_elapsed) => Err(anyhow!(
-                "probe did not complete within {}s",
-                args.probe_timeout_seconds
-            )),
-        };
+        let outcome = await_probe_task(
+            probe_timeout,
+            args.probe_timeout_seconds,
+            tokio::spawn({
+                let args = args.clone();
+                let tls = tls.clone();
+                async move { probe_once(&args, &tls).await }
+            }),
+        )
+        .await;
 
         match &outcome {
             Ok(window) => {
@@ -91,6 +94,30 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Await one owned probe task. On deadline expiry, abort and join it before a
+/// later cycle begins so its session cannot survive as detached background work.
+async fn await_probe_task<T>(
+    probe_timeout: Duration,
+    timeout_seconds: u64,
+    mut probe_task: tokio::task::JoinHandle<Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(probe_timeout, &mut probe_task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_err)) => Err(anyhow!("probe task terminated abnormally: {join_err}")),
+        Err(_elapsed) => {
+            probe_task.abort();
+            match probe_task.await {
+                Ok(_) => {}
+                Err(join_err) if join_err.is_cancelled() => {}
+                Err(join_err) => {
+                    return Err(anyhow!("probe task terminated abnormally: {join_err}"))
+                }
+            }
+            Err(anyhow!("probe did not complete within {timeout_seconds}s"))
+        }
+    }
+}
+
 /// Run one connect → SUBSCRIBE → decode cycle. Every cycle opens a fresh
 /// connection so a 24h run is evidence of repeated negotiation, not one
 /// long-lived session that happened to negotiate the profile once.
@@ -111,9 +138,6 @@ async fn probe_once(args: &Args, tls: &moq_native_ietf::tls::Config) -> Result<N
         Subscriber::connect_negotiated(session, transport, selected_version)
             .await
             .context("failed to create MoQ Transport subscriber session")?;
-
-    let mut session_task =
-        tokio::spawn(async move { session.run().await.context("session error") });
 
     let namespace = TrackNamespace::from_utf8_path(&args.name);
     let (mut tracks_writer, _request, mut tracks_reader) = Tracks::new(namespace.clone()).produce();
@@ -147,14 +171,12 @@ async fn probe_once(args: &Args, tls: &moq_native_ietf::tls::Config) -> Result<N
 
     let result = tokio::select! {
         r = probe => r,
-        r = &mut session_task => match r {
-            Ok(Ok(())) => Err(anyhow!("session ended before SUBSCRIBE_OK arrived")),
-            Ok(Err(err)) => Err(err.context("session task failed while probe was pending")),
-            Err(join_err) => Err(anyhow!("session task terminated abnormally: {join_err}")),
+        r = session.run() => match r {
+            Ok(()) => Err(anyhow!("session ended before SUBSCRIBE_OK arrived")),
+            Err(err) => Err(anyhow!("session failed while probe was pending: {err}")),
         },
     };
 
-    session_task.abort();
     result
 }
 
@@ -181,6 +203,39 @@ fn probe_error_outcome(err: &anyhow::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_aborts_and_awaits_the_owned_task() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<Result<NonZeroU64>>().await
+        });
+        started_rx
+            .await
+            .expect("probe task starts before its deadline");
+
+        let err = await_probe_task(Duration::from_millis(10), 1, task)
+            .await
+            .expect_err("pending probe times out");
+        assert!(err.to_string().contains("did not complete within 1s"));
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("aborted task is awaited")
+            .expect("task drop guard ran");
+    }
 
     #[test]
     fn probe_error_outcome_classifies_known_failure_modes() {
