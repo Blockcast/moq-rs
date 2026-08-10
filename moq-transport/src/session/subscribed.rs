@@ -804,6 +804,19 @@ impl ObjectForwarder {
             datagram_count += 1;
         }
 
+        // The final input can be over the datagram limit. The loop normally
+        // accounts for that loss at its next iteration, so flush it when EOF
+        // arrives directly after the skip.
+        let dropped_total = datagrams.dropped();
+        if dropped_total > reported_dropped || skipped_too_large > reported_too_large {
+            record_datagram_loss_metric(
+                dropped_total,
+                reported_dropped,
+                skipped_too_large,
+                reported_too_large,
+            );
+        }
+
         tracing::info!(
             "[PUBLISHER] serve_datagrams: completed ({} datagrams sent, {} skipped over-MTU)",
             datagram_count,
@@ -911,6 +924,17 @@ mod tests {
         metrics::with_local_recorder(&recorder, || record_datagram_loss_metric(0, 0, 5, 2));
 
         assert_eq!(recorder.dropped_datagrams.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn dropped_datagram_metric_flushes_a_final_over_mtu_loss() {
+        let recorder = CounterRecorder::default();
+
+        // This is the EOF path: the final over-MTU packet has no following
+        // loop iteration to report its accumulated loss.
+        metrics::with_local_recorder(&recorder, || record_datagram_loss_metric(0, 0, 1, 0));
+
+        assert_eq!(recorder.dropped_datagrams.load(Ordering::Relaxed), 1);
     }
 
     #[test]
