@@ -43,7 +43,7 @@ RUN mkdir -p \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release
+    cargo build --release --features moq-pub-mmtp/metrics-prometheus
 
 COPY . ./
 
@@ -52,10 +52,17 @@ COPY . ./
 # There's also issues with the cache mount since it builds into /usr/local/cargo/bin
 # We can't mount that without clobbering cargo itself.
 # We instead we build the binaries and copy them to the cargo bin directory.
+#
+# moq-pub-mmtp/metrics-prometheus (BLO-22882): compiled in by default so the
+# MOQ_PUB_METRICS_ADDR env var (set via Helm) is live without a separate
+# opt-in image variant — unlike profiling/heap-profiling below, the exporter
+# itself stays inert (no listener bound) until that env var is set, so this
+# does not change default runtime behavior.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     find . -path '*/src/*.rs' -o -path '*/src/**/*.rs' | xargs touch && \
-    cargo build --release && cp /build/target/release/moq-* /usr/local/cargo/bin
+    cargo build --release --features moq-pub-mmtp/metrics-prometheus && \
+    cp /build/target/release/moq-* /usr/local/cargo/bin
 
 # Optional: overwrite moq-pub-mmtp with a profiling-enabled build. CPU profiling
 # uses PROFILING=1; retained-allocation profiling uses HEAP_PROFILING=1 and the
@@ -68,11 +75,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     if [ -n "$HEAP_PROFILING" ]; then \
       JEMALLOC_SYS_WITH_MALLOC_CONF="prof:true,prof_active:false,lg_prof_sample:19" \
         RUSTFLAGS="-C force-frame-pointers=yes" \
-        cargo rustc --release -p moq-pub-mmtp --features heap-profiling -- \
+        cargo rustc --release -p moq-pub-mmtp --features heap-profiling,metrics-prometheus -- \
           -C link-arg=-no-pie && \
       cp /build/target/release/moq-pub-mmtp /usr/local/cargo/bin/moq-pub-mmtp; \
     elif [ -n "$PROFILING" ]; then \
-      cargo build --release -p moq-pub-mmtp --features profiling && \
+      cargo build --release -p moq-pub-mmtp --features profiling,metrics-prometheus && \
       cp /build/target/release/moq-pub-mmtp /usr/local/cargo/bin/moq-pub-mmtp; \
     fi
 

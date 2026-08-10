@@ -30,10 +30,12 @@ heap-profiling = [
 	"dep:tikv-jemallocator",
 	"dep:tikv-jemalloc-ctl",
 ]
-# Off by default. Compiles the Prometheus exporter behind --metrics-addr
-# (installed in main.rs). Without this feature, --metrics-addr is parsed but
-# produces a startup warning instead of serving anything — the shipped
-# binary otherwise never links metrics-exporter-prometheus.
+# Off by default. Adds the Prometheus HTTP exporter for the `metrics` crate
+# facade (src/metrics_endpoint.rs), mirroring moq-relay-ietf's wiring. The
+# facade itself is always compiled in (see the `metrics` dependency below);
+# this feature only adds the exporter, which is ADDITIONALLY runtime-gated by
+# the MOQ_PUB_METRICS_ADDR env var (same activation pattern as
+# MOQ_PUB_PROFILE_ADDR in profiling.rs).
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 
 [dependencies]
@@ -60,11 +62,10 @@ tracing-subscriber = { workspace = true }
 anyhow = { version = "1", features = ["backtrace"] }
 serde_json = "1"
 
-# Metrics — moq-native-ietf (a dependency) already emits
-# `moq_negotiation_total` via the `metrics` facade on every connect attempt,
-# recorded by whatever global recorder is installed process-wide. This crate
-# only needs the exporter that installs one; it never calls `metrics::`
-# macros itself, so the `metrics` crate is not a direct dependency here.
+# Always compiled in; near-zero overhead with no recorder installed (same
+# facade-vs-exporter split as moq-relay-ietf/src/metrics.rs). The optional
+# metrics-prometheus feature above adds the HTTP exporter.
+metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 # --- feature "profiling" only ---
