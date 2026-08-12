@@ -18,7 +18,12 @@
 // |------|-------------|
 // | `moq_pub_mmtp_dropped_datagrams_total` | Datagrams dropped by the publisher-side ring buffer (ring-superseded by a lagging subscriber, or over-MTU payloads skipped) — see moq-transport/src/session/subscribed.rs |
 
-/// Register metric descriptions (Prometheus `# HELP` text).
+/// Register metric descriptions (Prometheus `# HELP` text). Only called from
+/// the `metrics-prometheus`-gated install paths below, so it must share
+/// their cfg — otherwise a default (feature-off) build sees it as dead code
+/// under `-D warnings` (pre-existing since #71; caught while fixing
+/// BLO-26174, whose CI run this blocked).
+#[cfg(feature = "metrics-prometheus")]
 pub fn describe_metrics() {
     metrics::describe_counter!(
         "moq_pub_mmtp_dropped_datagrams_total",
