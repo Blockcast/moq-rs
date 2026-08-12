@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -105,28 +106,34 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("catalog validation failed: {e}"))?;
     check_namespace_consistency(&catalog, &args.name)?;
 
-    // ---- moq-transport session ----
-
     let namespace = TrackNamespace::from_utf8_path(&args.name);
-    let (mut tracks_writer, _request, tracks_reader) = Tracks::new(namespace).produce();
 
-    // Select the publisher router from the catalog's track packaging: MMTP
-    // (per-packet_id MPU/MFU dispatch) or opaque datagram pass-through.
-    let router = build_router(&mut tracks_writer, &catalog)?;
-    tracing::info!(
-        router = router.kind(),
-        "built publisher router from catalog"
-    );
+    // ---- input source ----
+    //
+    // Opened ONCE and held here for the life of the process — every relay
+    // reconnect below only ever *borrows* it. For --mmtp-input=udp this is
+    // what keeps the SSM `(S,G)` join alive across a relay session loss
+    // (BLO-26173): the join is a property of the socket, not of the
+    // moq-transport session, so a reconnect that rebuilds the session never
+    // touches it.
+    let udp_socket = match args.mmtp_input {
+        MmtpInput::Udp => {
+            let socket = udp::open_udp_socket(
+                args.mmtp_udp_bind,
+                args.mmtp_udp_source,
+                args.mmtp_udp_iface,
+            )
+            .await?;
+            tracing::info!(addr = %socket.local_addr()?, "listening for datagrams");
+            Some(socket)
+        }
+        MmtpInput::Stdin => None,
+    };
+    let mut stdin = matches!(args.mmtp_input, MmtpInput::Stdin).then(tokio::io::stdin);
+    let mut input_buf = vec![0u8; 65_536];
+    let mut packet_count: u64 = 0;
 
-    // Publish the catalog JSON on the canonical track. The returned writer is
-    // retained for the session lifetime so subscribers do not observe a closed
-    // catalog track.
-    let _catalog_subgroups = publish_catalog_track(&mut tracks_writer, &catalog_bytes)?;
-    tracing::info!(
-        bytes = catalog_bytes.len(),
-        tracks = ?CATALOG_TRACK_NAMES,
-        "posted catalog on catalog tracks"
-    );
+    // ---- moq-transport session, retried with backoff on relay session loss ----
 
     let tls = args.tls.load()?;
     let mut quic_config = quic::Config::new(args.bind, None, tls.clone())?;
@@ -136,85 +143,236 @@ async fn main() -> Result<()> {
     }
     let quic_endpoint = quic::Endpoint::new(quic_config)?;
 
-    tracing::info!(url = %args.url, "connecting to relay");
-    let (session, connection_id, transport, selected_version) = match wire_profile {
-        Some(profile) => {
-            quic_endpoint
-                .client
-                .connect_with_profile(&args.url, None, profile)
-                .await?
-        }
-        None => quic_endpoint.client.connect(&args.url, None).await?,
-    };
-    tracing::info!(%connection_id, "connected to relay");
+    let backoff_min = Duration::from_millis(args.reconnect_backoff_min_ms);
+    let backoff_max = Duration::from_millis(args.reconnect_backoff_max_ms);
+    let mut attempt: u32 = 0;
 
-    let (session, mut publisher) =
-        Publisher::connect_negotiated(session, transport, selected_version)
+    loop {
+        tracing::info!(url = %args.url, attempt, "connecting to relay");
+        let connected = match wire_profile {
+            Some(profile) => {
+                quic_endpoint
+                    .client
+                    .connect_with_profile(&args.url, None, profile)
+                    .await
+            }
+            None => quic_endpoint.client.connect(&args.url, None).await,
+        };
+        let (session, connection_id, transport, selected_version) = match connected {
+            Ok(v) => v,
+            Err(error) => {
+                reconnect_after_failure(
+                    SessionLost {
+                        task: "connect",
+                        error: Some(error),
+                    },
+                    &mut attempt,
+                    backoff_min,
+                    backoff_max,
+                )
+                .await;
+                continue;
+            }
+        };
+        let negotiated = Publisher::connect_negotiated(session, transport, selected_version)
             .await
-            .context("failed to create MoQ Transport publisher")?;
+            .context("failed to create MoQ Transport publisher");
+        let (session, mut publisher) = match negotiated {
+            Ok(v) => v,
+            Err(error) => {
+                reconnect_after_failure(
+                    SessionLost {
+                        task: "connect",
+                        error: Some(error),
+                    },
+                    &mut attempt,
+                    backoff_min,
+                    backoff_max,
+                )
+                .await;
+                continue;
+            }
+        };
+        tracing::info!(%connection_id, attempt, "connected to relay");
 
-    // Run the three long-lived halves on SEPARATE tokio tasks rather than as
-    // three branches of one `select!`. A single `select!` is one future = one
-    // task, and tokio never parallelizes one task across workers — so ingest
-    // (run_publisher: recv_from -> route -> create_group/put_object) and egress
-    // (publisher.publish_namespace -> serve_subgroup: open_uni -> encode ->
-    // quinn write) serialize on ONE core (the ~0.97-core, 90%-userspace ceiling
-    // that gates the publish-latency floor; raising the CPU limit only removed
-    // CFS throttling because the work was one task, not because it needed more
-    // workers). Spawning lets the multi-thread runtime place ingest and egress
-    // on different workers. They already communicate through the Arc-backed
-    // `watch::State` behind SubgroupsWriter/SubgroupsReader, so the wire output
-    // (objects, groups, subgroups, framing, ordering) is byte-identical — the
-    // relay is unaffected. run_publisher stays a SINGLE task, so the monotonic
-    // group_id assignment (datagram.rs) remains a single ordered point.
-    //
-    // Teardown is preserved: race the three JoinHandles and propagate the first
-    // to finish (Ok or Err) exactly as the old `select!` did, so the first error
-    // still returns immediately and the external watchdog respawns us. The other
-    // tasks are aborted (the process is exiting regardless).
-    let mmtp_input = args.mmtp_input;
-    let udp_bind = args.mmtp_udp_bind;
-    let udp_source = args.mmtp_udp_source;
-    let udp_iface = args.mmtp_udp_iface;
+        // A MoQ session's TracksReader is single-use (handed to exactly one
+        // Publisher::publish_namespace call), so the catalog-derived router
+        // and catalog-track writers are rebuilt fresh every reconnect. This
+        // is pure, catalog-only construction with no I/O — the catalog was
+        // already validated once above, so a failure here would be a
+        // catalog/schema defect rather than a transient network condition,
+        // and is treated as fatal rather than retried.
+        let (mut tracks_writer, _request, tracks_reader) = Tracks::new(namespace.clone()).produce();
+        let mut router = build_router(&mut tracks_writer, &catalog)?;
+        tracing::info!(
+            router = router.kind(),
+            attempt,
+            "built publisher router from catalog"
+        );
+        let _catalog_subgroups = publish_catalog_track(&mut tracks_writer, &catalog_bytes)?;
 
-    let mut session_task =
-        tokio::spawn(async move { session.run().await.context("session error") });
-    let mut publish_namespace_task = tokio::spawn(async move {
-        publisher
-            .publish_namespace(tracks_reader)
-            .await
-            .context("publisher error")
-    });
-    let mut publish_task = tokio::spawn(async move {
-        run_publisher(
-            mmtp_input,
-            udp_bind,
-            udp_source,
-            udp_iface,
-            router,
-            tracks_writer,
-        )
-        .await
-        .context("publisher loop error")
-    });
+        // Run the session and namespace-publish halves on separate tokio
+        // tasks (see historical note: this keeps ingest and egress off a
+        // single core). Packet ingest is driven inline below via
+        // `next_input_event` so the input source stays owned by this
+        // function across every reconnect instead of being consumed by a
+        // per-session task.
+        let mut session_task =
+            tokio::spawn(async move { session.run().await.context("session error") });
+        let mut publish_namespace_task = tokio::spawn(async move {
+            publisher
+                .publish_namespace(tracks_reader)
+                .await
+                .context("publisher error")
+        });
 
-    let first = tokio::select! {
-        r = &mut session_task => r,
-        r = &mut publish_namespace_task => r,
-        r = &mut publish_task => r,
-    };
-    session_task.abort();
-    publish_namespace_task.abort();
-    publish_task.abort();
-
-    // Unwrap the JoinHandle layer: a JoinError (panic/abort of the winning task)
-    // is itself fatal and must drive respawn, same as any branch error would.
-    match first {
-        Ok(inner) => inner?,
-        Err(join_err) => bail!("publisher task terminated abnormally: {join_err}"),
+        let lost = loop {
+            tokio::select! {
+                r = &mut session_task => break describe_task_end("session", r),
+                r = &mut publish_namespace_task => break describe_task_end("publish_namespace", r),
+                event = next_input_event(udp_socket.as_ref(), stdin.as_mut(), &mut input_buf) => {
+                    match event? {
+                        InputEvent::Packet(packet) => {
+                            router.handle(packet)?;
+                            packet_count = packet_count.wrapping_add(1);
+                            // `% ==` kept over `u64::is_multiple_of` (stable
+                            // only since Rust 1.87) to honor the repo's 1.70+ MSRV.
+                            #[allow(clippy::manual_is_multiple_of)]
+                            if packet_count % 1000 == 0 {
+                                tracing::debug!(packet_count, "packets dispatched");
+                            }
+                        }
+                        InputEvent::Skip => {}
+                        InputEvent::Exhausted => {
+                            // Clean stdin EOF: the finite input is done, not
+                            // the relay session — exit the whole process
+                            // successfully rather than reconnecting forever.
+                            // Flush a final ack so any wrappers know we're done.
+                            let _ = tokio::io::stdout().flush().await;
+                            session_task.abort();
+                            publish_namespace_task.abort();
+                            tracing::info!(packet_count, "input exhausted — publisher done");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        };
+        session_task.abort();
+        publish_namespace_task.abort();
+        drop(router);
+        drop(_catalog_subgroups);
+        drop(tracks_writer);
+        reconnect_after_failure(lost, &mut attempt, backoff_min, backoff_max).await;
     }
+}
 
-    Ok(())
+/// Which task ended a session attempt, and why. `error: None` means the task
+/// finished without an `Err` (e.g. the relay closed the session cleanly) —
+/// still a reason to reconnect, just not a failure worth escalating past
+/// `info`.
+struct SessionLost {
+    task: &'static str,
+    error: Option<anyhow::Error>,
+}
+
+fn describe_task_end(
+    task: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> SessionLost {
+    match result {
+        Ok(Ok(())) => SessionLost { task, error: None },
+        Ok(Err(error)) => SessionLost {
+            task,
+            error: Some(error),
+        },
+        Err(join_error) => SessionLost {
+            task,
+            error: Some(anyhow::anyhow!("task terminated abnormally: {join_error}")),
+        },
+    }
+}
+
+/// Exponential backoff before the next reconnect attempt: doubles from
+/// `min` on each consecutive loss, capped at `max`.
+fn backoff_duration(attempt: u32, min: Duration, max: Duration) -> Duration {
+    let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    min.checked_mul(factor).unwrap_or(max).min(max)
+}
+
+/// Record, log, and sleep out a lost session before the caller retries.
+///
+/// The `moq_pub_session_reconnect_total` counter (via the `metrics` facade —
+/// same pattern as moq-native-ietf's unconditional `moq_negotiation_total`)
+/// plus this log line are what make a reconnect storm distinguishable from a
+/// healthy long session, per BLO-26173's acceptance criteria.
+async fn reconnect_after_failure(
+    lost: SessionLost,
+    attempt: &mut u32,
+    backoff_min: Duration,
+    backoff_max: Duration,
+) {
+    metrics::counter!("moq_pub_session_reconnect_total", "task" => lost.task).increment(1);
+    let backoff = backoff_duration(*attempt, backoff_min, backoff_max);
+    match &lost.error {
+        Some(error) => tracing::warn!(
+            task = lost.task,
+            %error,
+            attempt = *attempt,
+            backoff_ms = backoff.as_millis() as u64,
+            "relay session lost; reconnecting"
+        ),
+        None => tracing::info!(
+            task = lost.task,
+            attempt = *attempt,
+            backoff_ms = backoff.as_millis() as u64,
+            "relay session ended; reconnecting"
+        ),
+    }
+    tokio::time::sleep(backoff).await;
+    *attempt = attempt.saturating_add(1);
+}
+
+/// One event yielded by the configured input source (UDP socket or stdin).
+enum InputEvent {
+    /// One MMTP packet/datagram ready to route.
+    Packet(Bytes),
+    /// A benign zero-length UDP datagram — caller should just poll again.
+    Skip,
+    /// The finite input (stdin) reached clean EOF. UDP never yields this.
+    Exhausted,
+}
+
+/// Poll the configured input source for the next packet.
+///
+/// Exactly one of `udp_socket`/`stdin` is `Some`, matching `--mmtp-input`.
+/// Callers hold the source in their own scope across reconnects rather than
+/// handing it to a per-session task — see the `udp_socket` comment in
+/// `main`.
+async fn next_input_event<R: tokio::io::AsyncRead + Unpin>(
+    udp_socket: Option<&tokio::net::UdpSocket>,
+    stdin: Option<&mut R>,
+    buf: &mut [u8],
+) -> Result<InputEvent> {
+    match (udp_socket, stdin) {
+        (Some(socket), None) => {
+            let (n, _addr) = socket.recv_from(buf).await.context("UDP recv_from error")?;
+            if n == 0 {
+                return Ok(InputEvent::Skip);
+            }
+            Ok(InputEvent::Packet(Bytes::copy_from_slice(&buf[..n])))
+        }
+        (None, Some(stdin)) => {
+            match framing::read_one_frame(stdin)
+                .await
+                .context("stdin framing error")?
+            {
+                Some(frame) => Ok(InputEvent::Packet(Bytes::from(frame))),
+                None => Ok(InputEvent::Exhausted),
+            }
+        }
+        _ => unreachable!("exactly one input source is configured, matching --mmtp-input"),
+    }
 }
 
 /// Build per-track state from the catalog's `multicast.endpoints[].tracks[]`.
@@ -535,92 +693,6 @@ fn build_datagram_state(
 
     // Datagram source objects retain their existing priority-0 policy.
     Ok(DatagramState::new(track.name.clone(), 0, datagrams))
-}
-
-/// Drive the publisher loop until the input ends.
-///
-/// `tracks_writer` is held here only to keep the broadcast alive — once
-/// dropped, TracksReader (held by `publisher.announce`) would see "done"
-/// and close the session early.
-async fn run_publisher(
-    input: MmtpInput,
-    udp_bind: std::net::SocketAddr,
-    udp_source: Option<std::net::Ipv4Addr>,
-    udp_iface: Option<std::net::Ipv4Addr>,
-    mut router: Router,
-    _tracks_writer: TracksWriter,
-) -> Result<()> {
-    match input {
-        MmtpInput::Stdin => run_stdin_loop(&mut router).await,
-        MmtpInput::Udp => run_udp_loop(udp_bind, udp_source, udp_iface, &mut router).await,
-    }
-}
-
-/// Drive the publisher loop reading one packet/datagram per UDP datagram.
-/// Per T4: the datagram boundary IS the framing — no length prefix. The
-/// `Router` interprets each datagram per the catalog's packaging.
-async fn run_udp_loop(
-    bind: std::net::SocketAddr,
-    source: Option<std::net::Ipv4Addr>,
-    iface: Option<std::net::Ipv4Addr>,
-    router: &mut Router,
-) -> Result<()> {
-    // open_udp_socket binds + (for multicast targets) joins the group
-    // and enables loopback so cast/ffmpeg's multicast emission via
-    // `moqenc_mmt` lands here without a separate flag. `source` selects a
-    // source-specific (S,G) join for SSM groups (232.0.0.0/8); `iface`
-    // (or a matching route) pins the join to the multicast-bearing NIC.
-    let socket = udp::open_udp_socket(bind, source, iface).await?;
-    tracing::info!(addr = %socket.local_addr()?, "listening for datagrams");
-    // 65536 covers any IPv4/IPv6 MTU; oversized datagrams get truncated.
-    let mut buf = vec![0u8; 65_536];
-    let mut packet_count: u64 = 0;
-    loop {
-        recv_one_udp_packet(&socket, router, &mut buf).await?;
-        packet_count = packet_count.wrapping_add(1);
-        // `% == 0` is kept over `u64::is_multiple_of` (stable only since Rust
-        // 1.87) to honor the repo's documented 1.70+ MSRV — same rationale as
-        // moq-catalog's group-duration exactness check.
-        #[allow(clippy::manual_is_multiple_of)]
-        if packet_count % 1000 == 0 {
-            tracing::debug!(packet_count, "UDP packets dispatched");
-        }
-    }
-}
-
-/// Receive one UDP datagram and hand it to the router. Extracted from the
-/// loop body so unit tests can drive it with a single synthetic packet
-/// rather than spawning the full loop.
-async fn recv_one_udp_packet(
-    socket: &tokio::net::UdpSocket,
-    router: &mut Router,
-    buf: &mut [u8],
-) -> Result<()> {
-    let (n, _addr) = socket.recv_from(buf).await.context("UDP recv_from error")?;
-    if n == 0 {
-        return Ok(());
-    }
-    router.handle(Bytes::copy_from_slice(&buf[..n]))?;
-    Ok(())
-}
-
-async fn run_stdin_loop(router: &mut Router) -> Result<()> {
-    let mut stdin = tokio::io::stdin();
-    let mut packet_count: u64 = 0;
-    loop {
-        let frame = framing::read_one_frame(&mut stdin)
-            .await
-            .context("stdin framing error")?;
-        let Some(packet) = frame else {
-            // Clean EOF — flush a final ack so any wrappers know we're done.
-            let _ = tokio::io::stdout().flush().await;
-            tracing::info!(packet_count, "stdin EOF — publisher loop done");
-            return Ok(());
-        };
-        // Move the frame body into Bytes so SubgroupWriter::write avoids a copy.
-        router.handle(Bytes::from(packet))?;
-        packet_count += 1;
-    }
 }
 
 #[cfg(test)]
@@ -980,9 +1052,10 @@ mod tests {
 
     #[tokio::test]
     async fn udp_recv_dispatches_one_packet() {
-        // T4: each UDP datagram is one MMTP packet (no length prefix —
-        // the datagram boundary IS the packet boundary). recv_one_udp_packet
-        // must read one datagram and pass it through to dispatch.
+        // T4: each UDP datagram is one MMTP packet (no length prefix — the
+        // datagram boundary IS the packet boundary). next_input_event must
+        // read one datagram and hand it to the caller for dispatch (the
+        // production loop then calls Router::handle, exercised here too).
         let cat = catalog_with(
             vec![track("v", Some(TrackPackaging::Mmtp))],
             Some(MulticastConfig {
@@ -1003,9 +1076,13 @@ mod tests {
         send_sock.send_to(&pkt, recv_addr).await.unwrap();
 
         let mut buf = vec![0u8; 65_536];
-        recv_one_udp_packet(&recv_sock, &mut router, &mut buf)
+        let event = next_input_event::<tokio::io::Stdin>(Some(&recv_sock), None, &mut buf)
             .await
             .unwrap();
+        let InputEvent::Packet(packet) = event else {
+            panic!("expected InputEvent::Packet for a non-empty UDP datagram");
+        };
+        router.handle(packet).unwrap();
 
         let Router::Mmtp(state_map) = &router else {
             panic!("expected Mmtp router");
@@ -1017,6 +1094,70 @@ mod tests {
             Some(0),
             "MPU sequence 42 must not be copied into the formula-derived Group"
         );
+    }
+
+    #[tokio::test]
+    async fn stdin_input_reports_exhausted_on_clean_eof() {
+        // An empty Cursor mimics stdin closed with zero bytes — next_input_event
+        // must distinguish this cleanly from a packet or a framing error so
+        // main() can exit(0) instead of reconnecting.
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let mut buf = vec![0u8; 64];
+        let event = next_input_event::<std::io::Cursor<Vec<u8>>>(None, Some(&mut empty), &mut buf)
+            .await
+            .unwrap();
+        assert!(matches!(event, InputEvent::Exhausted));
+    }
+
+    #[tokio::test]
+    async fn stdin_input_yields_packet_for_one_frame() {
+        let payload = b"mmtp-frame";
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        wire.extend_from_slice(payload);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut buf = vec![0u8; 64];
+        let event = next_input_event::<std::io::Cursor<Vec<u8>>>(None, Some(&mut reader), &mut buf)
+            .await
+            .unwrap();
+        let InputEvent::Packet(packet) = event else {
+            panic!("expected InputEvent::Packet for one length-prefixed frame");
+        };
+        assert_eq!(&packet[..], payload);
+    }
+
+    #[test]
+    fn backoff_duration_doubles_and_caps() {
+        let min = Duration::from_millis(500);
+        let max = Duration::from_millis(30_000);
+        assert_eq!(backoff_duration(0, min, max), Duration::from_millis(500));
+        assert_eq!(backoff_duration(1, min, max), Duration::from_millis(1_000));
+        assert_eq!(backoff_duration(2, min, max), Duration::from_millis(2_000));
+        assert_eq!(backoff_duration(6, min, max), Duration::from_millis(30_000));
+        // Cap holds even for attempt counts far past where 2^attempt would
+        // overflow a u32 shift.
+        assert_eq!(backoff_duration(1_000, min, max), max);
+    }
+
+    #[tokio::test]
+    async fn describe_task_end_distinguishes_clean_end_from_error_and_panic() {
+        let clean = describe_task_end("session", Ok(Ok(())));
+        assert_eq!(clean.task, "session");
+        assert!(clean.error.is_none());
+
+        let errored = describe_task_end("session", Ok(Err(anyhow::anyhow!("boom"))));
+        assert!(errored.error.is_some());
+
+        // A JoinError can't be constructed directly outside tokio internals;
+        // exercise it via an aborted task instead.
+        let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        handle.abort();
+        let join_result = handle.await;
+        let aborted = describe_task_end("session", join_result);
+        assert!(aborted.error.is_some());
     }
 
     #[tokio::test]

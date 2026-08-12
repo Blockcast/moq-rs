@@ -64,7 +64,10 @@ serde_json = "1"
 
 # Always compiled in; near-zero overhead with no recorder installed (same
 # facade-vs-exporter split as moq-relay-ietf/src/metrics.rs). The optional
-# metrics-prometheus feature above adds the HTTP exporter.
+# metrics-prometheus feature above adds the HTTP exporter. Consumers today:
+# metrics_endpoint.rs's `moq_pub_mmtp_dropped_datagrams_total` and main.rs's
+# `moq_pub_session_reconnect_total` (BLO-26173: relay session loss/reconnect
+# must be observable, not just logged).
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 

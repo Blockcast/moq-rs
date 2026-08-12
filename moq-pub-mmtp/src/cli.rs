@@ -91,6 +91,18 @@ pub struct Args {
     #[arg(long)]
     pub metrics_addr: Option<std::net::SocketAddr>,
 
+    /// Minimum backoff before the first reconnect attempt after the relay
+    /// session is lost. Doubles on each consecutive loss up to
+    /// --reconnect-backoff-max-ms (BLO-26173: the publisher reconnects
+    /// in-process instead of exiting on relay session timeout).
+    #[arg(long = "reconnect-backoff-min-ms", default_value_t = 500)]
+    pub reconnect_backoff_min_ms: u64,
+
+    /// Reconnect backoff ceiling — consecutive relay session losses never
+    /// wait longer than this between attempts.
+    #[arg(long = "reconnect-backoff-max-ms", default_value_t = 30_000)]
+    pub reconnect_backoff_max_ms: u64,
+
     /// TLS configuration shared with moq-pub / moq-relay-ietf:
     /// `--tls-cert`, `--tls-key`, `--tls-root`, `--tls-disable-verify`.
     #[command(flatten)]
@@ -141,5 +153,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.metrics_addr, Some("127.0.0.1:9090".parse().unwrap()));
+    }
+
+    #[test]
+    fn reconnect_backoff_has_sane_defaults_and_is_overridable() {
+        let args = Args::try_parse_from(required_args()).unwrap();
+        assert_eq!(args.reconnect_backoff_min_ms, 500);
+        assert_eq!(args.reconnect_backoff_max_ms, 30_000);
+
+        let args = Args::try_parse_from(required_args().into_iter().chain([
+            "--reconnect-backoff-min-ms",
+            "100",
+            "--reconnect-backoff-max-ms",
+            "5000",
+        ]))
+        .unwrap();
+        assert_eq!(args.reconnect_backoff_min_ms, 100);
+        assert_eq!(args.reconnect_backoff_max_ms, 5000);
     }
 }
