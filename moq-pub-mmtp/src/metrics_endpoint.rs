@@ -28,8 +28,11 @@
 /// so the cfg stopped suppressing a warning and started breaking the build:
 /// `cargo test -p moq-pub-mmtp` failed to compile at 54d855f with
 /// `cannot find function describe_metrics`, because the default (feature-off)
-/// test profile reached the call with no definition in scope. Release builds
-/// stayed green, which is why CI missed it.
+/// test profile reached the call with no definition in scope. CI did not catch
+/// it because the call was hoisted out of the gated block in the squash-merge
+/// commit itself: #77's tested head (9582b153) had the call inside the block
+/// and its `build` job was green, and `pr.yml` runs only on `pull_request`, so
+/// no job ever built the merged tree — 54d855f has zero check runs.
 ///
 /// Safe unconditionally: `metrics` is an unconditional dependency and only
 /// `metrics-exporter-prometheus` is optional, so `describe_counter!` compiles

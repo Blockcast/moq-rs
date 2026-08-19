@@ -1174,10 +1174,7 @@ mod tests {
         // A session that outlived the backoff ceiling clears the streak, so the
         // next recovery starts from backoff_min instead of the accumulated cap.
         assert_eq!(attempt_after_session(6, max, max), 0);
-        assert_eq!(
-            attempt_after_session(6, Duration::from_secs(3_600), max),
-            0
-        );
+        assert_eq!(attempt_after_session(6, Duration::from_secs(3_600), max), 0);
         // Boundary: `healthy_after` itself counts as healthy.
         assert_eq!(attempt_after_session(3, max, max), 0);
 
@@ -1204,6 +1201,63 @@ mod tests {
         // blip, however far apart those blips were.
         let attempt = attempt_after_session(6, Duration::from_secs(3_600), max);
         assert_eq!(backoff_duration(attempt, min, max), min);
+    }
+
+    /// Pins the ordering that the reset's payoff depends on.
+    ///
+    /// `reconnect_after_failure` binds `backoff` from `*attempt` at the top of
+    /// the function and increments only after sleeping, which is precisely why
+    /// resetting `attempt` to 0 yields a `backoff_min` sleep on the next loss.
+    /// Hoisting the increment above that binding turns `backoff_duration(0)`
+    /// into `backoff_duration(1)` and silently restores the stall this change
+    /// fixes — the tests above would not notice, because they call
+    /// `backoff_duration` directly and never observe the ordering.
+    ///
+    /// Note the seam is the increment's position relative to the *binding*, not
+    /// relative to the sleep: swapping `sleep` and the increment is inert, since
+    /// `backoff` is already bound by then. Verified by mutation — the swap keeps
+    /// this test green, the hoist fails it with `left: 1s, right: 500ms`.
+    ///
+    /// Time is paused, so the assertion is on virtual elapsed time and the test
+    /// costs no wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_sleeps_the_current_attempt_then_increments() {
+        let min = Duration::from_millis(500);
+        let max = Duration::from_millis(30_000);
+
+        let mut attempt = 0;
+        let start = tokio::time::Instant::now();
+        reconnect_after_failure(
+            SessionLost {
+                task: "session",
+                error: None,
+            },
+            &mut attempt,
+            min,
+            max,
+        )
+        .await;
+        assert_eq!(
+            start.elapsed(),
+            min,
+            "a reset attempt must sleep backoff_min, not the next step"
+        );
+        assert_eq!(attempt, 1, "attempt must increment after the sleep");
+
+        // And the step after that is the doubled one, not the one just slept.
+        let start = tokio::time::Instant::now();
+        reconnect_after_failure(
+            SessionLost {
+                task: "session",
+                error: None,
+            },
+            &mut attempt,
+            min,
+            max,
+        )
+        .await;
+        assert_eq!(start.elapsed(), backoff_duration(1, min, max));
+        assert_eq!(attempt, 2);
     }
 
     #[tokio::test]

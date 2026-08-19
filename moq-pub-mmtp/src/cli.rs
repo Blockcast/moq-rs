@@ -107,6 +107,13 @@ pub struct Args {
 
     /// Reconnect backoff ceiling — consecutive relay session losses never
     /// wait longer than this between attempts.
+    ///
+    /// Doubles as the "healthy session" threshold: a session that stays up at
+    /// least this long clears the consecutive-failure streak, so the next loss
+    /// backs off from the floor again (see `attempt_after_session`). Raising
+    /// this to be gentler on the relay therefore also raises the bar for what
+    /// counts as healthy — the two are deliberately coupled today, but they are
+    /// conceptually independent and may be split later.
     #[arg(long = "reconnect-backoff-max-ms", default_value_t = 30_000)]
     pub reconnect_backoff_max_ms: u64,
 
