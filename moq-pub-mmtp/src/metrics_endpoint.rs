@@ -35,6 +35,13 @@ pub fn spawn_if_enabled() {
         return;
     };
 
+    // Registered whenever an exporter address is configured, independent of
+    // whether the metrics-prometheus feature was compiled in: describe_counter!
+    // is a no-op against the facade when no recorder is installed, and calling
+    // it here (rather than only from the feature-gated install-success arm
+    // below) keeps this function reachable under every feature combination.
+    describe_metrics();
+
     #[cfg(feature = "metrics-prometheus")]
     {
         let parsed: Result<std::net::SocketAddr, _> = addr.parse();
@@ -45,7 +52,6 @@ pub fn spawn_if_enabled() {
                     .install()
                 {
                     Ok(()) => {
-                        describe_metrics();
                         tracing::info!(
                             addr = %socket_addr,
                             "metrics exporter listening on http://{socket_addr}/metrics"
