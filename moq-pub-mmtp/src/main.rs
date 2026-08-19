@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
             }
         };
         tracing::info!(%connection_id, attempt, "connected to relay");
+        let connected_at = Instant::now();
 
         // A MoQ session's TracksReader is single-use (handed to exactly one
         // Publisher::publish_namespace call), so the catalog-derived router
@@ -249,6 +250,20 @@ async fn main() -> Result<()> {
         drop(router);
         drop(_catalog_subgroups);
         drop(tracks_writer);
+        // Fold this session's uptime into the streak before backing off, so
+        // `attempt` stays a count of *consecutive* failures rather than a
+        // lifetime total. See `attempt_after_session`.
+        let uptime = connected_at.elapsed();
+        let recovered = attempt_after_session(attempt, uptime, backoff_max);
+        if recovered != attempt {
+            tracing::info!(
+                previous_attempt = attempt,
+                uptime_ms = uptime.as_millis() as u64,
+                healthy_after_ms = backoff_max.as_millis() as u64,
+                "session outlived the backoff ceiling; resetting reconnect streak"
+            );
+        }
+        attempt = recovered;
         reconnect_after_failure(lost, &mut attempt, backoff_min, backoff_max).await;
     }
 }
@@ -284,6 +299,33 @@ fn describe_task_end(
 fn backoff_duration(attempt: u32, min: Duration, max: Duration) -> Duration {
     let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
     min.checked_mul(factor).unwrap_or(max).min(max)
+}
+
+/// The attempt counter to carry into the next reconnect, given how long the
+/// session that just ended stayed up.
+///
+/// `backoff_duration` doubles on `attempt`, so the counter must describe a
+/// *consecutive* failure streak. Without this, `attempt` only ever rises: a
+/// publisher that reconnects, streams cleanly for hours, then drops again
+/// resumes with the accumulated backoff, and after six lifetime losses —
+/// however far apart — every later recovery stalls the full `backoff_max`.
+/// The input source is drained only inside the session `select!`, so that
+/// sleep is unread UDP, turning an instantly-recoverable blip into a visible
+/// outage.
+///
+/// A session that stayed up for at least `healthy_after` is evidence the prior
+/// streak is not predictive, so the streak resets. Resetting on the *connect*
+/// path instead would be the shorter change, but it reintroduces hot-looping
+/// when a session dies immediately after connecting — precisely what the
+/// backoff exists to damp. `backoff_max` is the natural threshold: a session
+/// that outlived the longest backoff was not part of the storm the backoff is
+/// there to slow.
+fn attempt_after_session(attempt: u32, uptime: Duration, healthy_after: Duration) -> u32 {
+    if uptime >= healthy_after {
+        0
+    } else {
+        attempt
+    }
 }
 
 /// Record, log, and sleep out a lost session before the caller retries.
@@ -1123,6 +1165,45 @@ mod tests {
         // Cap holds even for attempt counts far past where 2^attempt would
         // overflow a u32 shift.
         assert_eq!(backoff_duration(1_000, min, max), max);
+    }
+
+    #[test]
+    fn healthy_session_resets_the_reconnect_streak() {
+        let max = Duration::from_millis(30_000);
+
+        // A session that outlived the backoff ceiling clears the streak, so the
+        // next recovery starts from backoff_min instead of the accumulated cap.
+        assert_eq!(attempt_after_session(6, max, max), 0);
+        assert_eq!(
+            attempt_after_session(6, Duration::from_secs(3_600), max),
+            0
+        );
+        // Boundary: `healthy_after` itself counts as healthy.
+        assert_eq!(attempt_after_session(3, max, max), 0);
+
+        // A session that died inside the ceiling is part of the same storm, so
+        // the streak carries and the backoff keeps doubling.
+        assert_eq!(
+            attempt_after_session(3, Duration::from_millis(29_999), max),
+            3
+        );
+        assert_eq!(attempt_after_session(1, Duration::ZERO, max), 1);
+    }
+
+    #[test]
+    fn reconnect_backoff_recovers_after_a_healthy_session() {
+        let min = Duration::from_millis(500);
+        let max = Duration::from_millis(30_000);
+
+        // Six consecutive losses pin the backoff at the ceiling.
+        assert_eq!(backoff_duration(6, min, max), max);
+
+        // One healthy session is enough to return the next recovery to
+        // backoff_min — the regression this guards is a publisher that has
+        // dropped six times over its lifetime stalling 30s on every later
+        // blip, however far apart those blips were.
+        let attempt = attempt_after_session(6, Duration::from_secs(3_600), max);
+        assert_eq!(backoff_duration(attempt, min, max), min);
     }
 
     #[tokio::test]
