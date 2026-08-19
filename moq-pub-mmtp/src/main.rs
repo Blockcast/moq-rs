@@ -62,34 +62,20 @@ async fn main() -> Result<()> {
 
     // Optional Prometheus metrics exporter (feature `metrics-prometheus` +
     // MOQ_PUB_METRICS_ADDR). No-op unless the env var is set; see
-    // metrics_endpoint.rs for the activation pattern.
-    metrics_endpoint::spawn_if_enabled();
+    // metrics_endpoint.rs for the activation pattern. Runs before
+    // Args::parse() so this path always gets first claim on the
+    // process-global recorder — see install_flag_exporter_if_needed below
+    // and the precedence note on Args::metrics_addr in cli.rs (BLO-26174).
+    let env_metrics_addr = metrics_endpoint::spawn_if_enabled();
 
     let args = Args::parse();
 
-    // Optional Prometheus metrics exporter (feature `metrics-prometheus` +
-    // --metrics-addr). Serves whatever the process has already recorded via
-    // the `metrics` facade — notably moq-native-ietf's `moq_negotiation_total`,
-    // emitted on every connect attempt regardless of this flag.
-    #[cfg(feature = "metrics-prometheus")]
-    if let Some(metrics_addr) = args.metrics_addr {
-        use metrics_exporter_prometheus::PrometheusBuilder;
-        PrometheusBuilder::new()
-            .with_http_listener(metrics_addr)
-            .install()
-            .expect("failed to install Prometheus metrics exporter");
-        tracing::info!(
-            "metrics exporter listening on http://{}/metrics",
-            metrics_addr
-        );
-    }
-    #[cfg(not(feature = "metrics-prometheus"))]
-    if args.metrics_addr.is_some() {
-        tracing::warn!(
-            "--metrics-addr was provided but the metrics-prometheus feature is not enabled. \
-             Rebuild with --features metrics-prometheus to enable the Prometheus exporter."
-        );
-    }
+    // Reconcile the legacy --metrics-addr flag against whatever the env-var
+    // path above already did. Serves whatever the process has already
+    // recorded via the `metrics` facade — notably moq-native-ietf's
+    // `moq_negotiation_total`, emitted on every connect attempt regardless of
+    // this flag. Never panics: see metrics_endpoint::install_flag_exporter_if_needed.
+    metrics_endpoint::install_flag_exporter_if_needed(args.metrics_addr, env_metrics_addr);
 
     // ---- catalog ----
 

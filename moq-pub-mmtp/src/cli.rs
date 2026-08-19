@@ -88,6 +88,13 @@ pub struct Args {
     /// Requires the `metrics-prometheus` feature to be enabled.
     /// When set, serves metrics — including `moq_negotiation_total`, emitted
     /// by moq-native-ietf on every connect attempt — at http://<addr>/metrics.
+    ///
+    /// Precedence vs. `MOQ_PUB_METRICS_ADDR` (BLO-26174): the env var is read
+    /// before this flag is even parsed, and the Prometheus recorder can only
+    /// be installed once per process. If `MOQ_PUB_METRICS_ADDR` is set, it
+    /// always wins — this flag is logged as ignored, not attempted, and the
+    /// process keeps running on the env-var listener. Set only this flag (no
+    /// env var) to use it. See metrics_endpoint::install_flag_exporter_if_needed.
     #[arg(long)]
     pub metrics_addr: Option<std::net::SocketAddr>,
 
