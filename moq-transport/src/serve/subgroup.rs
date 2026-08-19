@@ -225,11 +225,23 @@ impl SubgroupsReader {
             {
                 let state = self.state.lock();
 
-                if let Some((index, subgroup)) = state
+                // `subgroups` is always sorted ascending by index: entries are
+                // pushed with a monotonically increasing `next_index`, and
+                // window pruning uses `retain`, which preserves relative
+                // order. So the first entry at or past this reader's cursor is
+                // a binary-search boundary, not something to scan for — which
+                // matters because the scan ran per read, per reader, over the
+                // whole retained window.
+                //
+                // Deliberately NOT arithmetic indexing
+                // (`subgroups[read_index - front]`): pruning drops entries from
+                // the MIDDLE of the queue, so position stops tracking index.
+                // That is exactly why the original `Vec` + `pruned` offset
+                // scheme could not survive the move to a group-window prune.
+                let pos = state
                     .subgroups
-                    .iter()
-                    .find(|(index, _)| *index >= self.read_index)
-                {
+                    .partition_point(|(index, _)| *index < self.read_index);
+                if let Some((index, subgroup)) = state.subgroups.get(pos) {
                     let index = *index;
                     let subgroup = subgroup.clone();
                     self.read_index = index.saturating_add(1);
