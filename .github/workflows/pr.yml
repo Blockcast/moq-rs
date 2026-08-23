@@ -6,7 +6,12 @@ name: pr
 
 on:
   pull_request:
-    branches: ["main"]
+    # `release/**` covers pinned-baseline backport lanes (e.g.
+    # release/pinned-live-edge-21006781, the commit production's shred
+    # pub/relay pair is digest-pinned to). Without it a PR based on such a
+    # branch gets ZERO check runs and merges unbuilt — the exact trap that
+    # let 54d855f ship a tree that failed `cargo test -p moq-pub-mmtp`.
+    branches: ["main", "release/**"]
 
 env:
   CARGO_TERM_COLOR: always
