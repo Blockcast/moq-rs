@@ -63,8 +63,62 @@ pub struct Args {
     #[arg(long, default_value = "[::]:0")]
     pub bind: std::net::SocketAddr,
 
+    /// Minimum backoff before the first reconnect attempt after the relay
+    /// session is lost. Doubles on each consecutive loss up to
+    /// --reconnect-backoff-max-ms (BLO-26173: the publisher reconnects
+    /// in-process instead of exiting on relay session timeout).
+    #[arg(long = "reconnect-backoff-min-ms", default_value_t = 500)]
+    pub reconnect_backoff_min_ms: u64,
+
+    /// Reconnect backoff ceiling — consecutive relay session losses never
+    /// wait longer than this between attempts.
+    ///
+    /// Doubles as the "healthy session" threshold: a session that stays up at
+    /// least this long clears the consecutive-failure streak, so the next loss
+    /// backs off from the floor again (see `attempt_after_session`). Raising
+    /// this to be gentler on the relay therefore also raises the bar for what
+    /// counts as healthy — the two are deliberately coupled today, but they are
+    /// conceptually independent and may be split later.
+    #[arg(long = "reconnect-backoff-max-ms", default_value_t = 30_000)]
+    pub reconnect_backoff_max_ms: u64,
+
     /// TLS configuration shared with moq-pub / moq-relay-ietf:
     /// `--tls-cert`, `--tls-key`, `--tls-root`, `--tls-disable-verify`.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The minimum argv that satisfies clap: the positional URL plus the two
+    /// required flags. Everything else under test here has a default.
+    fn required_args() -> Vec<&'static str> {
+        vec![
+            "moq-pub-mmtp",
+            "https://localhost:4443",
+            "--name",
+            "test-broadcast",
+            "--catalog-json",
+            "/tmp/catalog.json",
+        ]
+    }
+
+    #[test]
+    fn reconnect_backoff_has_sane_defaults_and_is_overridable() {
+        let args = Args::try_parse_from(required_args()).unwrap();
+        assert_eq!(args.reconnect_backoff_min_ms, 500);
+        assert_eq!(args.reconnect_backoff_max_ms, 30_000);
+
+        let args = Args::try_parse_from(required_args().into_iter().chain([
+            "--reconnect-backoff-min-ms",
+            "100",
+            "--reconnect-backoff-max-ms",
+            "5000",
+        ]))
+        .unwrap();
+        assert_eq!(args.reconnect_backoff_min_ms, 100);
+        assert_eq!(args.reconnect_backoff_max_ms, 5000);
+    }
 }
