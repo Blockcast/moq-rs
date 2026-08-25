@@ -14,7 +14,8 @@ use moq_transport::{
     serve::{DatagramsWriter, SubgroupsWriter, Tracks, TracksWriter},
     session::Publisher,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 mod cli;
 mod datagram;
@@ -43,6 +44,11 @@ const PUBLISHER_HISTORY_WINDOW: NonZeroU64 = match NonZeroU64::new(32) {
     Some(value) => value,
     None => panic!("publisher history window must be nonzero"),
 };
+
+// Keep input ingestion independent of relay reconnects. The bounded queue
+// preserves stdin backpressure and gives UDP a finite handoff buffer without
+// allowing an unbounded burst to grow publisher memory.
+const INPUT_CHANNEL_CAPACITY: usize = 256;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -79,34 +85,27 @@ async fn main() -> Result<()> {
 
     // ---- input source ----
     //
-    // Opened ONCE and held here for the life of the process — every relay
-    // reconnect below only ever *borrows* it. For --mmtp-input=udp this is
-    // what keeps the SSM `(S,G)` join alive across a relay session loss
-    // (BLO-26173): the join is a property of the socket, not of the
-    // moq-transport session, so a reconnect that rebuilds the session never
-    // touches it.
-    let udp_socket = match args.mmtp_input {
-        MmtpInput::Udp => {
-            let socket = udp::open_udp_socket(
-                args.mmtp_udp_bind,
-                args.mmtp_udp_source,
-                args.mmtp_udp_iface,
-            )
-            .await?;
-            tracing::info!(addr = %socket.local_addr()?, "listening for datagrams");
-            Some(socket)
-        }
-        MmtpInput::Stdin => None,
-    };
-    let mut stdin = matches!(args.mmtp_input, MmtpInput::Stdin).then(tokio::io::stdin);
-    // 65536 covers any IPv4/IPv6 MTU; oversized datagrams get truncated.
-    let mut input_buf = vec![0u8; 65_536];
+    // The reader is spawned once and owns the source for the process lifetime.
+    // In particular, a stdin frame read must not live in the reconnect
+    // select!: dropping it between the length prefix and body would consume
+    // part of the next frame and make every later reconnect mis-framed. The
+    // UDP socket also remains owned by this task, so an SSM (S,G) join survives
+    // relay session replacement.
     let mut packet_count: u64 = 0;
 
     // ---- moq-transport session, retried with backoff on relay session loss ----
 
     let tls = args.tls.load()?;
     let quic_endpoint = quic::Endpoint::new(quic::Config::new(args.bind, None, tls.clone())?)?;
+
+    let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+    let input_task = tokio::spawn(read_input(
+        args.mmtp_input,
+        args.mmtp_udp_bind,
+        args.mmtp_udp_source,
+        args.mmtp_udp_iface,
+        input_tx,
+    ));
 
     let backoff_min = Duration::from_millis(args.reconnect_backoff_min_ms);
     let backoff_max = Duration::from_millis(args.reconnect_backoff_max_ms);
@@ -189,11 +188,9 @@ async fn main() -> Result<()> {
         // groups, subgroups, framing, ordering) is byte-identical — the relay
         // is unaffected.
         //
-        // Packet ingest is driven inline below via `next_input_event` rather
-        // than in a third spawned task, so the input source stays owned by
-        // this function across every reconnect instead of being consumed by a
-        // per-session task. Ingest remains a SINGLE flow, so the monotonic
-        // group_id assignment (datagram.rs) is still a single ordered point.
+        // Packet dispatch remains in this task, so the monotonic group_id
+        // assignment (datagram.rs) is still a single ordered point. Complete
+        // input events arrive from the process-lifetime reader task below.
         let mut session_task =
             tokio::spawn(async move { session.run().await.context("session error") });
         let mut publish_namespace_task = tokio::spawn(async move {
@@ -207,8 +204,23 @@ async fn main() -> Result<()> {
             tokio::select! {
                 r = &mut session_task => break describe_task_end("session", r),
                 r = &mut publish_namespace_task => break describe_task_end("publish_namespace", r),
-                event = next_input_event(udp_socket.as_ref(), stdin.as_mut(), &mut input_buf) => {
-                    match event? {
+                event = input_rx.recv() => {
+                    let event = match event {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => {
+                            session_task.abort();
+                            publish_namespace_task.abort();
+                            input_task.abort();
+                            return Err(error);
+                        }
+                        None => {
+                            session_task.abort();
+                            publish_namespace_task.abort();
+                            input_task.abort();
+                            return Err(anyhow::anyhow!("input reader stopped unexpectedly"));
+                        }
+                    };
+                    match event {
                         InputEvent::Packet(packet) => {
                             router.handle(packet)?;
                             packet_count = packet_count.wrapping_add(1);
@@ -229,6 +241,7 @@ async fn main() -> Result<()> {
                             let _ = tokio::io::stdout().flush().await;
                             session_task.abort();
                             publish_namespace_task.abort();
+                            input_task.abort();
                             tracing::info!(packet_count, "input exhausted — publisher done");
                             return Ok(());
                         }
@@ -692,16 +705,13 @@ enum InputEvent {
     Exhausted,
 }
 
-/// Poll the configured input source for the next packet.
+/// Read one event from the configured input source.
 ///
-/// Exactly one of `udp_socket`/`stdin` is `Some`, matching `--mmtp-input`.
-/// Callers hold the source in their own scope across reconnects rather than
-/// handing it to a per-session task — see the `udp_socket` comment in
-/// `main`. Per T4: for UDP the datagram boundary IS the framing (no length
-/// prefix); the `Router` interprets each datagram per the catalog's
-/// packaging. `open_udp_socket` (called once in `main`) binds and, for
-/// multicast targets, issues the source-specific (S,G) join — that join
-/// therefore survives every reconnect, which is the point.
+/// Per T4, a UDP datagram is one MMTP packet (there is no length prefix); the
+/// router interprets the datagram according to the catalog packaging. Stdin
+/// uses the length-prefixed framing in `framing.rs`. The process-lifetime
+/// reader below is the only production caller, so this future is never placed
+/// in the relay reconnect `select!`.
 async fn next_input_event<R: tokio::io::AsyncRead + Unpin>(
     udp_socket: Option<&tokio::net::UdpSocket>,
     stdin: Option<&mut R>,
@@ -726,6 +736,76 @@ async fn next_input_event<R: tokio::io::AsyncRead + Unpin>(
             }
         }
         _ => unreachable!("exactly one input source is configured, matching --mmtp-input"),
+    }
+}
+
+/// Drain a framed reader until clean EOF, sending complete events to the
+/// process-lifetime input channel. Keeping the reader and the framing future
+/// in this task is what makes a partially delivered stdin frame survive a
+/// relay reconnect.
+async fn read_framed_input<R>(reader: R, input_tx: mpsc::Sender<Result<InputEvent>>) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut reader = reader;
+    let mut input_buf = vec![0u8; 65_536];
+    loop {
+        let event = next_input_event(None, Some(&mut reader), &mut input_buf)
+            .await
+            .context("stdin framing error")?;
+        let exhausted = matches!(event, InputEvent::Exhausted);
+        if input_tx.send(Ok(event)).await.is_err() {
+            return Ok(());
+        }
+        if exhausted {
+            return Ok(());
+        }
+    }
+}
+
+/// Own the configured input source for the lifetime of the publisher and
+/// forward only complete packets to the reconnect loop.
+async fn read_input(
+    input: MmtpInput,
+    udp_bind: std::net::SocketAddr,
+    udp_source: Option<std::net::Ipv4Addr>,
+    udp_iface: Option<std::net::Ipv4Addr>,
+    input_tx: mpsc::Sender<Result<InputEvent>>,
+) {
+    let result = match input {
+        MmtpInput::Stdin => read_framed_input(tokio::io::stdin(), input_tx.clone()).await,
+        MmtpInput::Udp => {
+            let result = udp::open_udp_socket(udp_bind, udp_source, udp_iface).await;
+            let socket = match result {
+                Ok(socket) => socket,
+                Err(error) => {
+                    let _ = input_tx.send(Err(error)).await;
+                    return;
+                }
+            };
+            match socket.local_addr() {
+                Ok(addr) => tracing::info!(%addr, "listening for datagrams"),
+                Err(error) => tracing::warn!(%error, "could not determine UDP listen address"),
+            }
+
+            let mut input_buf = vec![0u8; 65_536];
+            loop {
+                match next_input_event::<tokio::io::Stdin>(Some(&socket), None, &mut input_buf)
+                    .await
+                {
+                    Ok(event) => {
+                        if input_tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => break Err(error.context("UDP input error")),
+                }
+            }
+        }
+    };
+
+    if let Err(error) = result {
+        let _ = input_tx.send(Err(error)).await;
     }
 }
 
@@ -1158,6 +1238,53 @@ mod tests {
             panic!("expected InputEvent::Packet for one length-prefixed frame");
         };
         assert_eq!(&packet[..], payload);
+    }
+
+    #[tokio::test]
+    async fn framed_reader_preserves_a_frame_split_across_reads() {
+        // A reconnect must not cancel the read after it has consumed only
+        // part of the prefix. The dedicated reader task remains pending until
+        // the rest of the frame arrives, then emits exactly one packet.
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+        let reader_task = tokio::spawn(read_framed_input(reader, input_tx));
+        let payload = b"fragmented-mmtp-frame";
+        let prefix = (payload.len() as u32).to_be_bytes();
+
+        writer.write_all(&prefix[..1]).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            input_rx.try_recv().is_err(),
+            "a partial prefix must not produce an event"
+        );
+
+        writer.write_all(&prefix[1..]).await.unwrap();
+        writer.write_all(&payload[..7]).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            input_rx.try_recv().is_err(),
+            "a partial body must not produce an event"
+        );
+        writer.write_all(&payload[7..]).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), input_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let InputEvent::Packet(packet) = event else {
+            panic!("expected one packet after the complete frame arrived");
+        };
+        assert_eq!(&packet[..], payload);
+
+        drop(writer);
+        let eof = tokio::time::timeout(Duration::from_secs(1), input_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(eof, InputEvent::Exhausted));
+        reader_task.await.unwrap().unwrap();
     }
 
     #[test]
