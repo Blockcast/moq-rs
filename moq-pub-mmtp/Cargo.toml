@@ -77,3 +77,8 @@ test = true
 name = "reassembler_vectors"
 path = "examples/reassembler_vectors.rs"
 test = true
+
+[dev-dependencies]
+# tokio "full" does not include test-util; time::pause() needs it explicitly.
+# Features are additive, so this layers onto the main tokio dependency.
+tokio = { version = "1", features = ["test-util"] }

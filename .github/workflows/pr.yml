@@ -6,7 +6,12 @@ name: pr
 
 on:
   pull_request:
-    branches: ["main"]
+    # `release/**` covers pinned-baseline backport lanes (e.g.
+    # release/pinned-live-edge-21006781, the commit production's shred
+    # pub/relay pair is digest-pinned to). Without it a PR based on such a
+    # branch gets ZERO check runs and merges unbuilt — the exact trap that
+    # let 54d855f ship a tree that failed `cargo test -p moq-pub-mmtp`.
+    branches: ["main", "release/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,7 +46,17 @@ jobs:
         run: |
           cargo build -p moq-relay-ietf -p moq-pub-mmtp -p moq-sub-raw
           bash moq-pub-mmtp/tests/shred-datagram-e2e.sh
-      - run: cargo clippy --no-deps
+      # Release branches are intentionally pinned to an older protocol
+      # baseline. Keep this lane focused on the package changed by the
+      # backport: the baseline's unrelated moq-transport clippy warnings must
+      # not make a targeted publisher fix unmergeable. Main retains the full
+      # workspace lint gate.
+      - name: Clippy changed publisher package on release baselines
+        if: startsWith(github.base_ref, 'release/')
+        run: cargo clippy -p moq-pub-mmtp --no-deps
+      - name: Clippy workspace
+        if: startsWith(github.base_ref, 'release/') == false
+        run: cargo clippy --no-deps
       - run: cargo fmt --check
 
       # Check for unused dependencies. bnjbvr/cargo-machete@main installs its
