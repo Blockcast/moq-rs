@@ -1,0 +1,8 @@
+# The CI lint gate and the shipped image must compile with the same rustc.
+# Dockerfile pins rust:1.96-bookworm; without this file the pr workflow's
+# setup-rust-toolchain resolves floating stable, so every stable release turns
+# a clippy or type change into a surprise break that the image never sees
+# (#81 was one). Bump this and the Dockerfile FROM line together.
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]
