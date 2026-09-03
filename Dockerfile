@@ -8,6 +8,41 @@ FROM rust:1.96-bookworm AS builder
 
 WORKDIR /build
 
+# sccache: object-level compile cache in the cluster's ceph RGW, mirroring
+# packages/dual-stack-relay/Dockerfile:17-33 in the parent repository
+# (Blockcast/pim-multicast-gateway), which builds this image.
+#
+# The three cargo steps below already use BuildKit `--mount=type=cache` for the
+# registry and target/ dir, and on a warm daemon those make this a no-op. But
+# they are LOCAL STATE ON ONE BUILDKIT DAEMON, and this image is built against
+# two persistent daemons holding separate RWO caches -- a random pick
+# cold-missed ~50% of builds, which is why the parent's docker-build.yml pins a
+# daemon per service (`pin-key`). sccache is keyed on the compilation itself
+# and its objects live in shared object storage, so it is the fallback for
+# exactly the builds where the pin flipped to the peer daemon or the mount was
+# evicted. Tail-risk insurance, not a steady-state speedup.
+#
+# The scripts are vendored under .github/scripts/ rather than COPY'd from the
+# parent because this image is built with `context: moq-rs` -- see the header
+# in each script for the source of truth and the drift check.
+#
+# Both fail open: no credentials, no endpoint, an unreachable RGW, or a failed
+# sccache download all compile exactly as before. That is what keeps this repo's
+# own `docker build` (.github/workflows/pr.yml, heap-profile-image.yml), which
+# passes none of these, byte-for-byte unchanged in behaviour. A cache is not a
+# dependency.
+COPY .github/scripts/sccache-install.sh .github/scripts/sccache-env.sh /usr/local/bin/
+RUN /usr/local/bin/sccache-install.sh
+
+# Empty for local builds, which then compile without sccache exactly as before.
+# The parent's .github/scripts/docker-buildx-with-session-retry.sh:83-99 appends
+# this build-arg and the two ceph_s3_* BuildKit secrets to every buildx
+# invocation in the build-images job, so no workflow change is needed.
+ARG SCCACHE_RGW_ENDPOINT=
+ARG SCCACHE_BUCKET=pim-rust-sccache
+ENV SCCACHE_RGW_ENDPOINT=${SCCACHE_RGW_ENDPOINT} \
+    SCCACHE_BUCKET=${SCCACHE_BUCKET}
+
 # Copy only manifests first so application source changes retain the compiled
 # dependency layer. Dummy targets make every workspace package buildable.
 COPY Cargo.toml Cargo.lock ./
@@ -43,6 +78,9 @@ RUN mkdir -p \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=secret,id=ceph_s3_key \
+    --mount=type=secret,id=ceph_s3_secret \
+    . /usr/local/bin/sccache-env.sh; \
     cargo build --release --features moq-pub-mmtp/metrics-prometheus
 
 COPY . ./
@@ -60,6 +98,9 @@ COPY . ./
 # does not change default runtime behavior.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=secret,id=ceph_s3_key \
+    --mount=type=secret,id=ceph_s3_secret \
+    . /usr/local/bin/sccache-env.sh; \
     find . -path '*/src/*.rs' -o -path '*/src/**/*.rs' | xargs touch && \
     cargo build --release --features moq-pub-mmtp/metrics-prometheus && \
     cp /build/target/release/moq-* /usr/local/cargo/bin
@@ -72,6 +113,9 @@ ARG PROFILING=""
 ARG HEAP_PROFILING=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=secret,id=ceph_s3_key \
+    --mount=type=secret,id=ceph_s3_secret \
+    . /usr/local/bin/sccache-env.sh; \
     if [ -n "$HEAP_PROFILING" ]; then \
       JEMALLOC_SYS_WITH_MALLOC_CONF="prof:true,prof_active:false,lg_prof_sample:19" \
         RUSTFLAGS="-C force-frame-pointers=yes" \
