@@ -220,6 +220,9 @@ async fn main() -> anyhow::Result<()> {
         coordinator,
         session: SessionConfig {
             max_request_id: cli.max_request_id,
+            // The relay forwards whatever catalog its upstream publisher
+            // delivers; it declares no capabilities of its own (BLO-22575).
+            ..SessionConfig::default()
         },
         // No connection tagger: the default binary treats every inbound
         // connection as a public client. Embedders that run relay-to-relay

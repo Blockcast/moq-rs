@@ -107,12 +107,20 @@ const SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT: std::time::Duration = std::time::Durat
 pub struct SessionConfig {
     /// Maximum request ID plus one that we advertise to the peer.
     pub max_request_id: u64,
+
+    /// Optional CatalogSubscriptionCapabilities declaration body to send in
+    /// CLIENT_SETUP (BLO-22575). `None` sends no declaration, leaving the peer
+    /// on its undeclared default — so only a publisher that actually delivers
+    /// its catalog the declared way should set this. See
+    /// [`setup::RETAINED_CATALOG_CAPABILITIES`].
+    pub catalog_capabilities: Option<&'static [u8]>,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_request_id: DEFAULT_MAX_REQUEST_ID,
+            catalog_capabilities: None,
         }
     }
 }
@@ -650,6 +658,16 @@ impl Session {
             setup::ParameterType::MaxRequestId.into(),
             our_max_request_id,
         );
+
+        // BLO-22575: declare how our catalog track is delivered, so the peer
+        // selects the matching SUBSCRIBE filter from an explicit declaration
+        // rather than from a negotiated draft version or a deployment env var.
+        if let Some(declaration) = config.catalog_capabilities {
+            params.set_bytesvalue(
+                setup::CATALOG_SUBSCRIPTION_CAPABILITIES,
+                declaration.to_vec(),
+            );
+        }
 
         let client = setup::Client { params };
 

@@ -13,7 +13,8 @@ use moq_transport::{
     coding::TrackNamespace,
     profile::WireProfile,
     serve::{DatagramsWriter, SubgroupsWriter, Tracks, TracksWriter},
-    session::Publisher,
+    session::{Publisher, SessionConfig},
+    setup,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -160,9 +161,23 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let negotiated = Publisher::connect_negotiated(session, transport, selected_version)
-            .await
-            .context("failed to create MoQ Transport publisher");
+        let negotiated = Publisher::connect_negotiated_with_config(
+            session,
+            transport,
+            selected_version,
+            SessionConfig {
+                // BLO-22575: `publish_catalog_track` below writes the catalog
+                // once at group 0 / object 0 and holds the writer open for the
+                // session, so this publisher is RetainedAtOrigin. Declaring it
+                // is what makes the relay pick AbsoluteStart(0,0) for its
+                // catalog SUBSCRIBE; without it the relay falls back to
+                // LargestObject and never delivers the retained object.
+                catalog_capabilities: Some(setup::RETAINED_CATALOG_CAPABILITIES),
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .context("failed to create MoQ Transport publisher");
         let (session, mut publisher) = match negotiated {
             Ok(v) => v,
             Err(error) => {
