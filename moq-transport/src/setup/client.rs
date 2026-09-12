@@ -63,7 +63,9 @@ impl Encode for Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::{ParameterType, Version};
+    use crate::setup::{
+        ParameterType, Version, CATALOG_SUBSCRIPTION_CAPABILITIES, RETAINED_CATALOG_CAPABILITIES,
+    };
     use bytes::BytesMut;
 
     #[test]
@@ -113,6 +115,41 @@ mod tests {
 
         let decoded = Client::decode(&mut buf).unwrap();
         assert!(decoded.params.0.is_empty());
+    }
+
+    /// BLO-22575: the exact CLIENT_SETUP bytes `moq-pub-mmtp` puts on the
+    /// wire, asserted against the golden vector the relay-side decode test in
+    /// `pim-multicast-gateway` consumes. Both sides must be updated together;
+    /// a silent change here is a silent catalog outage on the relay.
+    #[test]
+    fn client_setup_with_retained_catalog_declaration() {
+        let mut params = KeyValuePairs::default();
+        // Same two parameters `Session::connect_setup` sends over
+        // WebTransport (PATH/AUTHORITY are native-QUIC only).
+        params.set_intvalue(ParameterType::MaxRequestId.into(), 100);
+        params.set_bytesvalue(
+            CATALOG_SUBSCRIPTION_CAPABILITIES,
+            RETAINED_CATALOG_CAPABILITIES.to_vec(),
+        );
+
+        let mut buf = BytesMut::new();
+        Client { params }.encode(&mut buf).unwrap();
+
+        assert_eq!(
+            buf.to_vec(),
+            vec![
+                0x20, // CLIENT_SETUP
+                0x00, 0x0e, // payload length = 14
+                0x02, // 2 parameters
+                0x02, // delta=2 → MAX_REQUEST_ID (even → varint)
+                0x40, 0x64, // 100
+                // delta = 0x4243 - 2 = 0x4241 = 16961, past the 2-byte varint
+                // ceiling (16383), so it takes the 4-byte form.
+                0x80, 0x00, 0x42, 0x41, // → key 0x4243 (odd → bytes)
+                0x05, // length = 5
+                1, 1, 2, 2, 3, // contract=1, retained, filters [2, 3]
+            ]
+        );
     }
 
     #[test]
