@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Blockcast Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # The CI lint gate and the shipped image must compile with the same rustc.
 # Dockerfile pins rust:1.96-bookworm; without this file the pr workflow's
 # setup-rust-toolchain resolves floating stable, so every stable release turns
