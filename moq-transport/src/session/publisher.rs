@@ -202,14 +202,24 @@ impl Publisher {
         transport: super::Transport,
         selected_version: WireProfile,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::connect_with_profile(
+        Self::connect_negotiated_with_config(
             session,
-            None,
             transport,
             selected_version,
             SessionConfig::default(),
         )
-        .await?;
+        .await
+    }
+
+    pub async fn connect_negotiated_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        selected_version: WireProfile,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher), SessionError> {
+        let (session, publisher, _) =
+            Session::connect_with_profile(session, None, transport, selected_version, config)
+                .await?;
         Ok((session, publisher))
     }
 
