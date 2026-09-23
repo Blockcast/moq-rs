@@ -11,9 +11,9 @@ use moq_catalog::{Root, TrackPackaging};
 use moq_native_ietf::quic;
 use moq_transport::{
     coding::TrackNamespace,
-    profile::WireProfile,
+    profile::{draft19::Setup as Draft19Setup, WireProfile},
     serve::{DatagramsWriter, SubgroupsWriter, Tracks, TracksWriter},
-    session::{Publisher, SessionConfig},
+    session::{Draft19Session, Draft19SessionRole, Publisher, SessionConfig},
     setup,
 };
 use tokio::io::AsyncWriteExt;
@@ -161,6 +161,32 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        if selected_version == WireProfile::Draft19 {
+            // Draft-19 framing is control plane only in this repo: there is no
+            // draft-19 Publisher, so there is nothing to carry MMTP over.
+            // Complete the SETUP exchange so the negotiated profile is
+            // observable, then stop. Retrying would loop on a permanent
+            // condition, and falling through would put draft-16 bytes on a
+            // moqt-19 connection.
+            let established = Draft19Session::establish(
+                session,
+                Draft19SessionRole::Client,
+                WireProfile::Draft19,
+                Draft19Setup::default(),
+            )
+            .await
+            .context("failed to establish draft-19 session")?;
+            tracing::info!(
+                %connection_id,
+                selected_version = %established.selected_version(),
+                "draft-19 session established; MMTP publish over draft-19 is not implemented"
+            );
+            anyhow::bail!(
+                "negotiated {}, but MMTP publish is draft-16 only",
+                established.selected_version()
+            );
+        }
+
         let negotiated = Publisher::connect_negotiated_with_config(
             session,
             transport,

@@ -601,6 +601,20 @@ impl Session {
             .await
     }
 
+    /// Reject a negotiated profile whose framing this session does not speak.
+    ///
+    /// Draft-19 carries SETUP type 0x2f00 over two unidirectional control
+    /// streams. This session type only speaks draft-16's single bidirectional
+    /// control stream, so accepting a draft-19 negotiation here would report
+    /// `selected_version() == moqt-19` while putting draft-16 bytes on the
+    /// wire. Callers that negotiated draft-19 must use [`Draft19Session`].
+    fn reject_unframed_profile(selected_version: WireProfile) -> Result<(), SessionError> {
+        match selected_version {
+            WireProfile::Draft16 | WireProfile::Blockcast01 => Ok(()),
+            WireProfile::Draft19 => Err(SessionError::ProfileFramingMismatch(selected_version)),
+        }
+    }
+
     /// Create an outbound connection with a transport-verified wire profile.
     pub async fn connect_with_profile(
         session: web_transport::Session,
@@ -609,6 +623,8 @@ impl Session {
         selected_version: WireProfile,
         config: SessionConfig,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::reject_unframed_profile(selected_version)?;
+
         let url = session.url().clone();
         let url_path = url.path();
         let path = Self::normalize_connection_path(url_path)?;
@@ -748,6 +764,8 @@ impl Session {
         selected_version: WireProfile,
         config: SessionConfig,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        Self::reject_unframed_profile(selected_version)?;
+
         let mut mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
@@ -1364,6 +1382,26 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // reject_unframed_profile
+    // ========================================================================
+
+    #[test]
+    fn draft16_session_refuses_to_frame_draft19() {
+        // Every draft-16 entry point routes through this guard, so no caller can
+        // report selected_version == moqt-19 while writing draft-16 setup bytes.
+        Session::reject_unframed_profile(WireProfile::Draft16).unwrap();
+        Session::reject_unframed_profile(WireProfile::Blockcast01).unwrap();
+
+        let error = Session::reject_unframed_profile(WireProfile::Draft19).unwrap_err();
+        assert!(matches!(
+            error,
+            SessionError::ProfileFramingMismatch(WireProfile::Draft19)
+        ));
+        // PROTOCOL_VIOLATION
+        assert_eq!(error.code(), 0x3);
+    }
 
     // ========================================================================
     // normalize_connection_path

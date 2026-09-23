@@ -19,12 +19,17 @@ use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebCon
 enum WireProfileArg {
     /// Accept the Blockcast profile requiring bounded subgroup history.
     Blockcast01,
+    /// Accept draft-19 (ALPN moqt-19). CONTROL PLANE ONLY: the relay performs
+    /// the draft-19 SETUP exchange and GOAWAY handling, and refuses every other
+    /// draft-19 control message. Media routing over draft-19 is not implemented.
+    Draft19,
 }
 
 impl From<WireProfileArg> for WireProfile {
     fn from(profile: WireProfileArg) -> Self {
         match profile {
             WireProfileArg::Blockcast01 => Self::Blockcast01,
+            WireProfileArg::Draft19 => Self::Draft19,
         }
     }
 }
@@ -281,5 +286,15 @@ mod tests {
             enabled_wire_profiles(enabled.wire_profile),
             [WireProfile::Draft16, WireProfile::Blockcast01]
         );
+    }
+
+    #[test]
+    fn draft19_profile_is_additive_and_opt_in() {
+        let enabled = Cli::try_parse_from(["moq-relay-ietf", "--wire-profile", "draft19"]).unwrap();
+        assert_eq!(
+            enabled_wire_profiles(enabled.wire_profile),
+            [WireProfile::Draft16, WireProfile::Draft19]
+        );
+        assert_eq!(WireProfile::Draft19.name(), "moqt-19");
     }
 }

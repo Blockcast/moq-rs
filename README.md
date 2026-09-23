@@ -31,6 +31,35 @@ This repository provides:
 - SUBSCRIBE_NAMESPACE (Soon)
 - FETCH (Not Soon)
 
+### Wire Profiles
+
+Transport negotiation selects an exact wire profile: the profile name is the
+ALPN on native QUIC, and the same value travels in
+WT-Available-Protocols / WT-Protocol on WebTransport. `moqt-16` is the default
+and is always offered. `moq-relay-ietf` and `moq-pub-mmtp` take
+`--wire-profile <name>` to additively offer one more:
+
+| Profile | ALPN | Status |
+| --- | --- | --- |
+| draft-16 | `moqt-16` | Default. Full media publish/subscribe/relay. |
+| `blockcast01` | `moqt-blockcast-01` | Draft-16 framing with mandatory bounded subgroup history. Full media path. |
+| `draft19` | `moqt-19` | **Control plane only.** |
+
+Draft-19 is a different wire from draft-16: two unidirectional control streams
+instead of one bidirectional, and SETUP type `0x2f00` with delta-coded
+`SetupOptions` instead of `CLIENT_SETUP`/`SERVER_SETUP`. The implementation
+covers SETUP, GOAWAY (New Session URI plus millisecond timeout), and request
+stream lifecycle. It has **no draft-19 publisher or subscriber**, so:
+
+- `moq-relay-ietf --wire-profile draft19` completes the draft-19 handshake and
+  then refuses every other control message out loud. It routes no media.
+- `moq-pub-mmtp --wire-profile draft19` completes the handshake, logs the
+  negotiated profile, and exits. MMTP publish is draft-16 only.
+
+A draft-16 session refuses a draft-19 negotiation with a typed
+`SessionError::ProfileFramingMismatch`, so no session can report
+`selected_version() == moqt-19` while writing draft-16 bytes.
+
 ## Interoperability
 
 A public relay instance running the latest `main` branch is available for interop testing at:

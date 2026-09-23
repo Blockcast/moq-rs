@@ -7,6 +7,7 @@ use anyhow::Context;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
+use moq_transport::profile::WireProfile;
 use moq_transport::session::SessionConfig;
 use url::Url;
 
@@ -326,6 +327,17 @@ impl Relay {
                             // error code if scope resolution fails after the MoQ handshake.
                             let raw_conn = conn.clone();
 
+                            // Draft-19 is a different wire (two unidirectional
+                            // control streams, SETUP 0x2f00) and the relay's
+                            // media routing is draft-16 only. Serve the control
+                            // plane and say so, rather than handing the
+                            // connection to a session that would misframe it.
+                            if selected_version == WireProfile::Draft19 {
+                                serve_draft19_control_plane(conn).await;
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                return Ok(());
+                            }
+
                             // Create the MoQ session over the connection (setup handshake etc)
                             let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_profile(conn, mlog_path, transport, selected_version, session_config).await {
                                 Ok(session) => session,
@@ -459,5 +471,52 @@ impl Relay {
 
         remotes.shutdown().await;
         run_result
+    }
+}
+
+/// Serve a draft-19 session's control plane, and only that.
+///
+/// The relay routes media through the draft-16 `Publisher`/`Subscriber` pair,
+/// which has no draft-19 counterpart. A draft-19 connection therefore gets a
+/// conformant SETUP exchange and GOAWAY handling, and every other control
+/// message is refused out loud. Media routing over draft-19 is out of scope;
+/// see the `--wire-profile` help text.
+async fn serve_draft19_control_plane(conn: web_transport::Session) {
+    use moq_transport::profile::draft19::Setup;
+    use moq_transport::session::{Draft19Session, Draft19SessionRole};
+
+    let mut session = match Draft19Session::establish(
+        conn,
+        Draft19SessionRole::Server,
+        WireProfile::Draft19,
+        Setup::default(),
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to establish draft-19 session");
+            metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept")
+                .increment(1);
+            return;
+        }
+    };
+
+    tracing::info!(
+        selected_version = %session.selected_version(),
+        "draft-19 session established: control plane only, relay media routing is not implemented"
+    );
+
+    loop {
+        match session.receive_control().await {
+            Ok(frame) => tracing::warn!(
+                message_type = frame.message_type,
+                "refusing draft-19 control message: relay media routing is not implemented"
+            ),
+            Err(err) => {
+                tracing::info!(error = %err, "draft-19 session closed");
+                return;
+            }
+        }
     }
 }
