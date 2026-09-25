@@ -51,6 +51,16 @@ pub enum SessionError {
     /// Draft-16 §3.4 PROTOCOL_VIOLATION (0x3): peer violated a MUST rule.
     #[error("protocol violation: {0}")]
     ProtocolViolation(String),
+
+    /// The transport negotiated a wire profile this session does not frame.
+    ///
+    /// The draft-16 `Session` speaks one bidirectional control stream carrying
+    /// `setup::Client`/`setup::Server`. Draft-19 speaks two unidirectional
+    /// control streams carrying SETUP type 0x2f00. Running one over the other's
+    /// ALPN would report a `selected_version` the bytes on the wire contradict,
+    /// so the mismatch fails closed here instead.
+    #[error("wire profile {0} is not framed by the draft-16 session")]
+    ProfileFramingMismatch(crate::profile::WireProfile),
 }
 
 // Session Termination Error Codes from draft-ietf-moq-transport-14 Section 13.1.1
@@ -78,6 +88,7 @@ impl SessionError {
             Self::TooManyRequests => 0x7,
             // PROTOCOL_VIOLATION (0x3)
             Self::ProtocolViolation(_) => 0x3,
+            Self::ProfileFramingMismatch(_) => 0x3,
             // Delegate to ServeError for per-request error codes
             Self::Serve(err) => err.code(),
         }

@@ -424,3 +424,45 @@ fn draft19_error_registries_use_draft19_values() {
     assert_eq!(StreamErrorCode::UnknownObjectStatus as u64, 0x06);
     assert_eq!(StreamErrorCode::MalformedTrack as u64, 0x12);
 }
+
+#[test]
+fn draft19_relay_role_emits_0x2f00_setup_and_never_moqt16_client_setup() {
+    // What moq-relay-ietf writes on its unidirectional control stream once ALPN
+    // selected moqt-19: SETUP type 0x2f00, never draft-16 CLIENT_SETUP (0x20).
+    let relay_setup = encode(&Setup::default());
+    let mut typed = Bytes::from(relay_setup.clone());
+    assert_eq!(Vi64::decode(&mut typed).unwrap().into_inner(), 0x2f00);
+    assert_ne!(relay_setup[0], 0x20);
+
+    // Only draft-19 can build the paired unidirectional control streams the
+    // relay runs its draft-19 sessions over.
+    let mut pair = ControlStreamPair::new(WireProfile::Draft19).unwrap();
+    pair.sent_setup().unwrap();
+    pair.received_setup().unwrap();
+    assert!(pair.is_ready());
+    assert!(ControlStreamPair::new(WireProfile::Draft16).is_err());
+
+    // A draft-16 CLIENT_SETUP reaching a draft-19 relay session is refused as a
+    // typed decode error rather than being reinterpreted as draft-19 SETUP.
+    let client = moq_transport::setup::Client {
+        params: Default::default(),
+    };
+    let mut client_wire = Bytes::from(encode(&client));
+    assert!(matches!(
+        Setup::decode(&mut client_wire),
+        Err(moq_transport::coding::DecodeError::InvalidMessage(0x20))
+    ));
+
+    // The relay is the server, so it must reject a peer GOAWAY that carries a
+    // New Session URI.
+    let redirect = GoAway {
+        new_session_uri: SessionUri("moqt://elsewhere.example".into()),
+        timeout_ms: 1_000,
+    };
+    assert_eq!(
+        Draft19SessionRole::Server
+            .validate_received_goaway(&redirect)
+            .unwrap_err(),
+        StreamProtocolError::ServerGoAwayWithNewSessionUri
+    );
+}

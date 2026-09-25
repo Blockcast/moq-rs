@@ -18,12 +18,17 @@ pub enum MmtpInput {
 pub enum WireProfileArg {
     /// Negotiate the Blockcast profile requiring bounded subgroup history.
     Blockcast01,
+    /// Negotiate draft-19 (ALPN moqt-19). HANDSHAKE ONLY: the publisher
+    /// completes the draft-19 SETUP exchange, reports the negotiated profile,
+    /// and exits. MMTP publish is draft-16 only.
+    Draft19,
 }
 
 impl From<WireProfileArg> for WireProfile {
     fn from(profile: WireProfileArg) -> Self {
         match profile {
             WireProfileArg::Blockcast01 => Self::Blockcast01,
+            WireProfileArg::Draft19 => Self::Draft19,
         }
     }
 }
