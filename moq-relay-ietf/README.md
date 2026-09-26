@@ -2,7 +2,7 @@
 
 A server that connects publishing clients to subscribing clients.
 SUBSCRIBE requests are deduplicated and cached, so that a single publisher can serve many subscribers.
-Standalone FETCH requests are never deduplicated. With `--fetch-retention-groups N` the relay retains the Objects of the N most recently arrived groups of every track it receives, and answers a FETCH from them when it holds every Object of the range; otherwise it creates a fresh upstream FETCH for the part it does not hold. The group count does not bound memory, so retention also requires `--fetch-retention-track-bytes` (Object Payload bytes per track) and `--fetch-retention-bytes` (Object Payload bytes across all tracks); size retention by these budgets. To stay within them the relay drops whole groups, least recently arrived first, and does not retain an Object that still does not fit.
+Standalone FETCH requests are never deduplicated. With `--fetch-retention-groups N` the relay retains the Objects of the N most recently arrived groups of every track it receives, and answers a FETCH from them when it holds every Object of the range; otherwise it creates a fresh upstream FETCH for the part it does not hold. The group count does not bound memory, so retention also requires `--fetch-retention-track-bytes` (bytes per track) and `--fetch-retention-bytes` (bytes across all tracks), which count each retained Object's payload, extension headers and per-Object overhead; size retention by these budgets. To stay within them the relay drops whole groups, least recently arrived first; an Object that does not fit even then is not retained and drops nothing.
 
 ## Usage
 

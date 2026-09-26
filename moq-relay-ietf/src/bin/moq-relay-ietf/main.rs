@@ -73,12 +73,14 @@ pub struct Cli {
     )]
     pub fetch_retention_groups: Option<std::num::NonZeroU64>,
 
-    /// Most Object Payload bytes retained for one track. Older groups are
-    /// dropped to make room; an Object that still does not fit is not retained.
+    /// Most bytes retained for one track, counting each Object's payload,
+    /// extension headers and per-Object overhead. Older groups are dropped to
+    /// make room; an Object that does not fit even then is not retained.
     #[arg(long, requires = "fetch_retention_groups")]
     pub fetch_retention_track_bytes: Option<std::num::NonZeroUsize>,
 
-    /// Most Object Payload bytes retained across all tracks.
+    /// Most bytes retained across all tracks, counted as for
+    /// --fetch-retention-track-bytes.
     #[arg(long, requires = "fetch_retention_groups")]
     pub fetch_retention_bytes: Option<std::num::NonZeroUsize>,
 
@@ -280,7 +282,11 @@ async fn main() -> anyhow::Result<()> {
         (Some(groups), Some(track_bytes), Some(total_bytes)) => relay.with_fetch_retention(
             moq_relay_ietf::FetchRetention::new(groups, track_bytes, total_bytes),
         ),
-        _ => relay,
+        (None, None, None) => relay,
+        _ => anyhow::bail!(
+            "--fetch-retention-groups, --fetch-retention-track-bytes and \
+             --fetch-retention-bytes must be set together"
+        ),
     };
     relay.run().await
 }
