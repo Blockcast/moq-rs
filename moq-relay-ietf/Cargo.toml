@@ -78,6 +78,8 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { workspace = true }
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
+# Payload chunks in FETCH retention tests.
+bytes = "1"
 
 [features]
 default = []

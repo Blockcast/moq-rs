@@ -33,6 +33,7 @@
 //! | `moq_relay_upstream_errors_total` | `stage` | Upstream connection failures (stage: connect, session) |
 //! | `moq_relay_namespace_transition_timeouts_total` | - | Namespace pull streams reset after graceful transition timeout |
 //! | `moq_relay_cache_idle_evictions_total` | `source` | Unwatched cache entries evicted, releasing an upstream subscription (source: local, remote) |
+//! | `moq_relay_fetch_responses_total` | `source` | Standalone FETCH responses by where their Objects came from (source: retained, retained_then_upstream, upstream, retained_then_unknown) |
 //! | `moq_relay_change_channel_lagged_total` | `channel` | Change notifications skipped by a lagging receiver, forcing a resync (channel: namespace, track) |
 //! | `moq_relay_lease_registry_lock_poisoned_total` | `operation` | Upstream namespace lease registry lock found poisoned (operation: acquire, release) |
 //!
@@ -127,6 +128,10 @@ pub fn describe_metrics() {
     describe_counter!(
         "moq_relay_cache_idle_evictions_total",
         "Unwatched cache entries evicted, releasing an upstream subscription, by source (local, remote)"
+    );
+    describe_counter!(
+        "moq_relay_fetch_responses_total",
+        "Standalone FETCH responses by where their Objects came from (retained, retained_then_upstream, upstream, retained_then_unknown)"
     );
     describe_counter!(
         "moq_relay_change_channel_lagged_total",

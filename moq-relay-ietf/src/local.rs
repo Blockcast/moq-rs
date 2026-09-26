@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::interest::{TrackInterest, TrackInterestGuard};
 use crate::metrics::GaugeGuard;
+use crate::retention::{FetchRetention, RetainedTrack, RetentionGuard};
 
 /// Scope key for the outer level of the two-level registry.
 ///
@@ -300,6 +301,9 @@ struct TrackEntry {
     /// Locally published tracks are already established by the time they are
     /// registered, so there is nothing to wait for.
     upstream: Option<UpstreamReady>,
+
+    /// Retention of this track's recent groups for FETCH, while the entry lives.
+    _retention: Option<RetentionGuard>,
 }
 
 /// A track resolved from the relay-local registry, with the handles a caller must
@@ -370,6 +374,9 @@ pub struct Locals {
     /// How long an unwatched pull-through cache entry is retained before its
     /// upstream subscription is released. Zero disables eviction.
     cache_idle_timeout: Duration,
+
+    /// Which groups of each registered track are retained for FETCH.
+    fetch_retention: FetchRetention,
 }
 
 impl Default for Locals {
@@ -396,7 +403,24 @@ impl Locals {
             namespace_changes,
             track_changes,
             cache_idle_timeout,
+            fetch_retention: FetchRetention::disabled(),
         }
+    }
+
+    /// Retain the recent groups of every track registered from now on, so a
+    /// standalone FETCH for them can be answered locally.
+    pub fn with_fetch_retention(mut self, fetch_retention: FetchRetention) -> Self {
+        self.fetch_retention = fetch_retention;
+        self
+    }
+
+    /// The retained groups of a track registered in `scope`, if any.
+    pub(crate) fn retained_track(
+        &self,
+        scope: Option<&str>,
+        full_name: &FullTrackName,
+    ) -> Option<Arc<RetainedTrack>> {
+        self.fetch_retention.lookup(scope, full_name)
     }
 
     pub fn subscribe_namespace_changes(&self) -> broadcast::Receiver<NamespaceChange> {
@@ -669,6 +693,7 @@ impl Locals {
                 // nothing to wait for before accepting a downstream SUBSCRIBE.
                 interest: None,
                 upstream: None,
+                _retention: self.fetch_retention.retain(scope, &track),
             }),
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
         };
@@ -877,6 +902,7 @@ impl Locals {
                     source: TrackSource::Cache,
                     interest: Some(interest.clone()),
                     upstream: Some(upstream.clone()),
+                    _retention: self.fetch_retention.retain(scope, &reader),
                 },
             );
             (

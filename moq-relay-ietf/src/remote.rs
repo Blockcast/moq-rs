@@ -19,6 +19,7 @@ use url::Url;
 
 use crate::interest::{TrackInterest, TrackInterestGuard};
 use crate::local::DEFAULT_CACHE_IDLE_TIMEOUT;
+use crate::retention::{FetchRetention, RetentionGuard};
 use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, RelayInfo, SessionContext};
 
 /// Cache key for upstream relay-to-relay connections.
@@ -47,6 +48,9 @@ struct CachedTrack {
     /// Interest in this cached reader. When it goes idle for the configured
     /// grace period the upstream subscription to the peer relay is released.
     interest: TrackInterest,
+
+    /// Retention of this track's recent groups for FETCH, while it is cached.
+    _retention: Option<Arc<RetentionGuard>>,
 }
 
 /// Manages connections to remote relays.
@@ -64,6 +68,10 @@ pub struct RemoteManager {
     /// How long an unwatched cross-relay cache entry is retained before its
     /// upstream subscription is released. Zero disables eviction.
     cache_idle_timeout: Duration,
+
+    /// Which groups of each track pulled from a peer relay are retained for
+    /// FETCH.
+    fetch_retention: FetchRetention,
 }
 
 #[cfg(test)]
@@ -451,6 +459,7 @@ mod tests {
         let slot: TrackSlot = Arc::new(Mutex::new(Some(CachedTrack {
             reader,
             interest: interest.clone(),
+            _retention: None,
         })));
         (slot, interest)
     }
@@ -503,6 +512,7 @@ mod tests {
             *cached = Some(CachedTrack {
                 reader,
                 interest: replacement_interest.clone(),
+                _retention: None,
             });
         }
 
@@ -549,7 +559,15 @@ impl RemoteManager {
             session_config,
             remotes: Arc::new(Mutex::new(HashMap::new())),
             cache_idle_timeout: DEFAULT_CACHE_IDLE_TIMEOUT,
+            fetch_retention: FetchRetention::disabled(),
         }
+    }
+
+    /// Retain the recent groups of every track pulled from a peer relay from
+    /// now on, so a standalone FETCH for them can be answered locally.
+    pub fn with_fetch_retention(mut self, fetch_retention: FetchRetention) -> Self {
+        self.fetch_retention = fetch_retention;
+        self
     }
 
     /// Override how long an unwatched cross-relay cache entry is retained before
@@ -605,7 +623,10 @@ impl RemoteManager {
 
         let span = remote.span.clone();
         async {
-            match remote.subscribe(namespace.clone(), track_name).await {
+            match remote
+                .subscribe(scope, &self.fetch_retention, namespace.clone(), track_name)
+                .await
+            {
                 Ok(reader) => Ok(reader),
                 Err(err) => {
                     tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
@@ -1103,6 +1124,8 @@ impl Remote {
     /// Subscribe to a track on this remote relay.
     async fn subscribe(
         &self,
+        scope: Option<&str>,
+        fetch_retention: &FetchRetention,
         namespace: TrackNamespace,
         track_name: TrackName,
     ) -> anyhow::Result<Option<(TrackReader, TrackInterestGuard)>> {
@@ -1152,6 +1175,8 @@ impl Remote {
             tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+            // Start retaining before the peer can send anything on the track.
+            let retention = fetch_retention.retain(scope, &reader).map(Arc::new);
             let subscribe_result = tokio::select! {
                 result = subscriber.subscribe_open(writer) => result,
                 _ = cancel.cancelled() => {
@@ -1185,6 +1210,7 @@ impl Remote {
             *cached = Some(CachedTrack {
                 reader: reader.clone(),
                 interest: interest.clone(),
+                _retention: retention,
             });
             drop(cached);
 
