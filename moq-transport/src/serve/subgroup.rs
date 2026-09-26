@@ -290,8 +290,9 @@ pub struct SubgroupWriter {
     // Immutable stream state.
     pub info: Arc<SubgroupInfo>,
 
-    // The next object sequence number to use.
-    next_object_id: u64,
+    // The smallest Object ID the next object may use. `None` once an object
+    // used the largest representable ID, since nothing may follow it.
+    next_object_id: Option<u64>,
 }
 
 impl SubgroupWriter {
@@ -299,7 +300,7 @@ impl SubgroupWriter {
         Self {
             state,
             info: group,
-            next_object_id: 0,
+            next_object_id: Some(0),
         }
     }
 
@@ -318,16 +319,38 @@ impl SubgroupWriter {
         size: usize,
         extension_headers: Option<crate::data::ExtensionHeaders>,
     ) -> Result<SubgroupObjectWriter, ServeError> {
+        let object_id = self.next_object_id.ok_or(ServeError::Duplicate)?;
+        self.create_with_id(object_id, size, extension_headers)
+    }
+
+    /// Write an object with an explicit Object ID, such as one decoded from a
+    /// subgroup stream.
+    ///
+    /// Object IDs within a subgroup strictly increase: draft-16 §10.4.2 encodes
+    /// each as a non-negative delta from the previous one. An ID at or below the
+    /// previous object's is rejected with [`ServeError::Duplicate`]. IDs may skip
+    /// values; a gap says nothing about whether the skipped objects exist.
+    pub fn create_with_id(
+        &mut self,
+        object_id: u64,
+        size: usize,
+        extension_headers: Option<crate::data::ExtensionHeaders>,
+    ) -> Result<SubgroupObjectWriter, ServeError> {
+        match self.next_object_id {
+            Some(next) if object_id >= next => {}
+            _ => return Err(ServeError::Duplicate),
+        }
+
         let (writer, reader) = SubgroupObject {
             group: self.info.clone(),
-            object_id: self.next_object_id,
+            object_id,
             status: ObjectStatus::NormalObject,
             size,
             extension_headers: extension_headers.unwrap_or_default(),
         }
         .produce();
 
-        self.next_object_id += 1;
+        self.next_object_id = object_id.checked_add(1);
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
         state.objects.push(reader);
@@ -1020,5 +1043,52 @@ mod tests {
 
         assert_eq!(data1, data2);
         assert_eq!(data1.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn create_with_id_preserves_sparse_object_ids() {
+        let (mut writer, mut reader) = make_subgroups();
+
+        let mut sg = writer.append(0).unwrap();
+        for oid in [3u64, 4, 9] {
+            let mut object = sg.create_with_id(oid, 1, None).unwrap();
+            object.write(Bytes::from_static(b"x")).unwrap();
+        }
+        // create() continues after the largest explicit ID.
+        sg.write(Bytes::from_static(b"y")).unwrap();
+        drop(sg);
+
+        let mut sub = reader.next().await.unwrap().unwrap();
+        let mut ids = Vec::new();
+        while let Some(object) = sub.next().await.unwrap() {
+            ids.push(object.object_id);
+        }
+        assert_eq!(ids, vec![3, 4, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn create_with_id_rejects_non_increasing_object_ids() {
+        let (mut writer, _reader) = make_subgroups();
+        let mut sg = writer.append(0).unwrap();
+
+        sg.create_with_id(5, 0, None).unwrap();
+        assert!(matches!(
+            sg.create_with_id(5, 0, None),
+            Err(ServeError::Duplicate)
+        ));
+        assert!(matches!(
+            sg.create_with_id(4, 0, None),
+            Err(ServeError::Duplicate)
+        ));
+        assert_eq!(sg.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nothing_follows_the_largest_object_id() {
+        let (mut writer, _reader) = make_subgroups();
+        let mut sg = writer.append(0).unwrap();
+
+        sg.create_with_id(u64::MAX, 0, None).unwrap();
+        assert!(matches!(sg.create(0, None), Err(ServeError::Duplicate)));
     }
 }
