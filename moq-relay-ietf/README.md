@@ -2,7 +2,7 @@
 
 A server that connects publishing clients to subscribing clients.
 SUBSCRIBE requests are deduplicated and cached, so that a single publisher can serve many subscribers.
-Standalone FETCH requests are never deduplicated. With `--fetch-retention-groups N` the relay retains the Objects of the N most recent groups of every track it receives, and answers a FETCH from them when it holds every Object of the range; otherwise it creates a fresh upstream FETCH for the part it does not hold.
+Standalone FETCH requests are never deduplicated. With `--fetch-retention-groups N --fetch-retention-bytes B` the relay retains the Objects of the N most recent groups of every track it receives, holding at most B bytes of them per track, and answers a FETCH from them when it holds every Object of the range; otherwise it creates a fresh upstream FETCH for the part it does not hold.
 
 ## Usage
 

@@ -4,7 +4,7 @@
 mod api_coordinator;
 mod file_coordinator;
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::{net, path::PathBuf};
 
@@ -49,9 +49,17 @@ pub struct Cli {
     /// Retain the Objects of this many most recent groups of every track the
     /// relay receives, and answer a standalone FETCH from them when every
     /// Object of its range is retained. Without this flag nothing is retained
-    /// and every FETCH is forwarded upstream.
-    #[arg(long)]
+    /// and every FETCH is forwarded upstream. Requires
+    /// --fetch-retention-bytes.
+    #[arg(long, requires = "fetch_retention_bytes")]
     pub fetch_retention_groups: Option<NonZeroU64>,
+
+    /// The most memory, in bytes, retained Objects may hold per track. When a
+    /// track exceeds it the oldest groups are evicted, and an Object that does
+    /// not fit beside the newer groups is not retained. Requires
+    /// --fetch-retention-groups.
+    #[arg(long, requires = "fetch_retention_groups")]
+    pub fetch_retention_bytes: Option<NonZeroUsize>,
 
     /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
     /// If not provided, the relay accepts every unique namespace publish.
@@ -205,9 +213,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
-    let fetch_retention = match cli.fetch_retention_groups {
-        Some(groups) => FetchRetention::groups(groups),
-        None => FetchRetention::disabled(),
+    let fetch_retention = match (cli.fetch_retention_groups, cli.fetch_retention_bytes) {
+        (Some(groups), Some(bytes)) => FetchRetention::new(groups, bytes),
+        _ => FetchRetention::disabled(),
     };
     let relay = Relay::new_with_fetch_retention(
         RelayConfig {

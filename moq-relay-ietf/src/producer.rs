@@ -1928,7 +1928,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     mod retained_fetch {
-        use std::num::NonZeroU64;
+        use std::num::{NonZeroU64, NonZeroUsize};
 
         use bytes::Bytes;
         use moq_transport::{
@@ -1944,8 +1944,9 @@ mod tests {
         const REPAIR_PRIORITY: u8 = 240;
 
         fn retaining_locals() -> Locals {
-            Locals::new().with_fetch_retention(FetchRetention::groups(
+            Locals::new().with_fetch_retention(FetchRetention::new(
                 NonZeroU64::new(RETAINED_GROUPS).unwrap(),
+                NonZeroUsize::MAX,
             ))
         }
 

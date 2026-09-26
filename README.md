@@ -29,7 +29,7 @@ This repository provides:
 - PUBLISH / PUBLISH_OK / PUBLISH_DONE
 - SUBSCRIBE
 - SUBSCRIBE_NAMESPACE
-- Standalone FETCH: passthrough for local and remote PUBLISH_NAMESPACE origins, and answers from retained groups with `--fetch-retention-groups`
+- Standalone FETCH: passthrough for local and remote PUBLISH_NAMESPACE origins, and answers from retained groups with `--fetch-retention-groups` and `--fetch-retention-bytes`
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
 
