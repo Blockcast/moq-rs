@@ -31,9 +31,9 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 # The artifact attests source_commit, so a dirty tree would emit a commit that
-# did not build these binaries. The workflow checks out clean, so this only
-# catches a local run.
-git -C "$REPO_ROOT" diff --quiet HEAD || {
+# did not build these binaries. `--porcelain` so an untracked source file counts
+# too. The workflow checks out clean, so this only catches a local run.
+[ -z "$(git -C "$REPO_ROOT" status --porcelain)" ] || {
   echo "working tree is dirty; $SOURCE_COMMIT would not describe these binaries" >&2; exit 1
 }
 BIN_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
@@ -118,6 +118,11 @@ for _ in $(seq 1 8); do
   # then refuses to put draft-16 MMTP bytes on a moqt-19 connection.
   RUST_LOG=info "$BIN_DIR/moq-pub-mmtp" "${PUB_ARGS[@]}" >"$WORK/pub.log" 2>&1 || true
   strip_ansi <"$WORK/pub.log" | grep -F "negotiated moqt-19, but MMTP publish is draft-16 only" >/dev/null || {
+    # The relay is only exercised by this connection, so a relay that dies does
+    # so during the run above and takes the publisher's negotiation down with
+    # it. Rule that out before blaming the publisher, or a dead relay reports
+    # as a negotiation regression with only `pub.log` to read.
+    kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.log" >&2; echo "relay exited early" >&2; exit 1; }
     cat "$WORK/pub.log" >&2; echo "publisher did not report a moqt-19 negotiation" >&2; exit 1
   }
   for _ in $(seq 1 10); do
@@ -130,7 +135,7 @@ for _ in $(seq 1 8); do
 done
 [ -n "$EVIDENCE" ] || {
   cat "$EVIDENCE_LOG" >&2
-  echo "no draft-19 establishment line for role $ROLE" >&2; exit 1
+  echo "no draft-19 establishment line for role $ROLE after 8 attempts" >&2; exit 1
 }
 
 # Fail closed rather than attesting a version the binary did not report.
