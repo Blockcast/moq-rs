@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock, Weak};
 use moq_transport::{
     coding::{TrackNamespace, TrackNamespacePrefix},
     serve::{FullTrackName, ServeError, Track, TrackReader, TrackWriter},
+    session::Subscriber,
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -37,6 +38,7 @@ const TRACK_CHANGE_CHANNEL_CAPACITY: usize = 1024;
 #[derive(Clone)]
 struct NamespaceSource {
     requests: mpsc::Sender<TrackWriter>,
+    fetch: Option<Subscriber>,
 }
 
 struct NamespaceEntry {
@@ -221,6 +223,25 @@ impl Locals {
         scope: Option<&str>,
         namespace: TrackNamespace,
     ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackWriter>)> {
+        self.register_namespace_inner(scope, namespace, None).await
+    }
+
+    pub(crate) async fn register_namespace_with_fetch(
+        &mut self,
+        scope: Option<&str>,
+        namespace: TrackNamespace,
+        fetch: Subscriber,
+    ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackWriter>)> {
+        self.register_namespace_inner(scope, namespace, Some(fetch))
+            .await
+    }
+
+    async fn register_namespace_inner(
+        &mut self,
+        scope: Option<&str>,
+        namespace: TrackNamespace,
+        fetch: Option<Subscriber>,
+    ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackWriter>)> {
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
         let (tx, rx) = mpsc::channel(NAMESPACE_REQUEST_CHANNEL_CAPACITY);
 
@@ -233,7 +254,10 @@ impl Locals {
             match bucket.entry(namespace.clone()) {
                 hash_map::Entry::Vacant(entry) => {
                     entry.insert(NamespaceEntry {
-                        local: Some(NamespaceSource { requests: tx }),
+                        local: Some(NamespaceSource {
+                            requests: tx,
+                            fetch,
+                        }),
                         remote: Weak::new(),
                     });
                     true
@@ -242,7 +266,10 @@ impl Locals {
                     if entry.get().local.is_some() {
                         return Err(ServeError::Duplicate.into());
                     }
-                    entry.get_mut().local = Some(NamespaceSource { requests: tx });
+                    entry.get_mut().local = Some(NamespaceSource {
+                        requests: tx,
+                        fetch,
+                    });
                     false
                 }
             }
@@ -264,6 +291,14 @@ impl Locals {
         }
 
         Ok((registration, rx))
+    }
+
+    pub(crate) fn fetch_source(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+    ) -> Option<Subscriber> {
+        self.route_namespace(scope, namespace)?.fetch
     }
 
     /// Register remote discovery metadata for one exact namespace.

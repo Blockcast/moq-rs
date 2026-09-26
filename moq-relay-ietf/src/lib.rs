@@ -43,6 +43,8 @@ mod producer;
 mod relay;
 mod remote;
 mod session;
+#[cfg(test)]
+mod test;
 mod upstream_namespaces;
 mod web;
 

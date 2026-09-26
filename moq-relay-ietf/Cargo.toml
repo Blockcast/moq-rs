@@ -70,6 +70,11 @@ thiserror = "2.0.17"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
+[dev-dependencies]
+# Self-signed localhost certificates for the FETCH relay tests.
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+
 [features]
 default = []
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
