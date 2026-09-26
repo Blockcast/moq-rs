@@ -19,8 +19,9 @@
 //! retained; otherwise [`RetainedTrack::plan`] reports where the unknown part
 //! begins.
 
-use std::collections::{BTreeMap, HashMap};
-use std::num::NonZeroU64;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -47,8 +48,35 @@ pub struct FetchRetention {
 }
 
 struct Registry {
-    groups: NonZeroU64,
+    limits: Arc<Limits>,
     tracks: Mutex<HashMap<RetentionKey, Weak<RetainedTrack>>>,
+}
+
+/// What the relay may retain. The group count alone does not bound memory, so
+/// the Object Payload bytes are bounded per track and across all tracks.
+struct Limits {
+    groups: NonZeroU64,
+    track_bytes: NonZeroUsize,
+    total_bytes: NonZeroUsize,
+    /// Object Payload bytes retained across all tracks.
+    used_bytes: AtomicUsize,
+}
+
+impl Limits {
+    /// Take `bytes` from the registry-wide budget, or leave it unchanged and
+    /// return false when they do not fit.
+    fn reserve(&self, bytes: usize) -> bool {
+        self.used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|used| *used <= self.total_bytes.get())
+            })
+            .is_ok()
+    }
+
+    fn release(&self, bytes: usize) {
+        self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
 }
 
 type RetentionKey = (String, FullTrackName);
@@ -59,11 +87,20 @@ impl FetchRetention {
         Self { inner: None }
     }
 
-    /// Retain the Objects of the `groups` most recent Group IDs of each track.
-    pub fn groups(groups: NonZeroU64) -> Self {
+    /// Retain the Objects of the `groups` most recently arrived groups of each
+    /// track, holding at most `track_bytes` of Object Payload per track and
+    /// `total_bytes` across all tracks. To make room the relay drops whole
+    /// groups, least recently arrived first; an Object that still does not fit
+    /// is not retained.
+    pub fn new(groups: NonZeroU64, track_bytes: NonZeroUsize, total_bytes: NonZeroUsize) -> Self {
         Self {
             inner: Some(Arc::new(Registry {
-                groups,
+                limits: Arc::new(Limits {
+                    groups,
+                    track_bytes,
+                    total_bytes,
+                    used_bytes: AtomicUsize::new(0),
+                }),
                 tracks: Mutex::default(),
             })),
         }
@@ -71,7 +108,7 @@ impl FetchRetention {
 
     /// The configured number of groups, or `None` when retention is disabled.
     pub fn retained_groups(&self) -> Option<NonZeroU64> {
-        self.inner.as_ref().map(|registry| registry.groups)
+        self.inner.as_ref().map(|registry| registry.limits.groups)
     }
 
     /// Start retaining `reader`'s Objects for FETCH requests in `scope`.
@@ -94,7 +131,7 @@ impl FetchRetention {
         );
         let track = Arc::new(RetainedTrack {
             reader: reader.clone(),
-            window: registry.groups,
+            limits: registry.limits.clone(),
             groups: Mutex::default(),
         });
         registry
@@ -164,14 +201,52 @@ impl Drop for RetentionGuard {
 pub(crate) struct RetainedTrack {
     /// The live track, for its Largest Location.
     reader: TrackReader,
-    window: NonZeroU64,
+    limits: Arc<Limits>,
     groups: Mutex<RetainedGroups>,
+}
+
+impl Drop for RetainedTrack {
+    fn drop(&mut self) {
+        let bytes = self
+            .groups
+            .get_mut()
+            .map_or_else(|poisoned| poisoned.into_inner().bytes, |state| state.bytes);
+        self.limits.release(bytes);
+    }
 }
 
 #[derive(Default)]
 struct RetainedGroups {
     /// Retained Objects by Group ID, then Object ID.
     groups: BTreeMap<u64, BTreeMap<u64, FetchResponseObject>>,
+    /// Retained Group IDs, least recently arrived first. Group ID is
+    /// peer-supplied, so eviction follows arrival: an outlier Group ID ages out
+    /// like any other group instead of pinning the window.
+    arrival: VecDeque<u64>,
+    /// Object Payload bytes retained for this track.
+    bytes: usize,
+}
+
+impl RetainedGroups {
+    /// Drop the least recently arrived group other than `keep`, returning its
+    /// bytes to `limits`. False when `keep` is the only retained group.
+    fn evict_oldest_except(&mut self, keep: u64, limits: &Limits) -> bool {
+        let Some(index) = self.arrival.iter().position(|group_id| *group_id != keep) else {
+            return false;
+        };
+        let Some(group_id) = self.arrival.remove(index) else {
+            return false;
+        };
+        let freed: usize = self.groups.remove(&group_id).map_or(0, |objects| {
+            objects
+                .values()
+                .map(|object| object.object.payload_length)
+                .sum()
+        });
+        self.bytes -= freed;
+        limits.release(freed);
+        true
+    }
 }
 
 /// How a FETCH range relates to what the relay retains.
@@ -206,23 +281,57 @@ impl RetainedTrack {
             return;
         };
         let group_id = object.object.group_id;
-        let newest = state
+        let object_id = object.object.object_id;
+        // §8.1: a relay MAY ignore a later copy of an Object it already holds.
+        if state
             .groups
-            .last_key_value()
-            .map_or(group_id, |(newest, _)| (*newest).max(group_id));
-        // The window holds the `window` most recent Group IDs up to the newest.
-        let oldest_kept = newest.saturating_sub(self.window.get() - 1);
-        if group_id < oldest_kept {
+            .get(&group_id)
+            .is_some_and(|objects| objects.contains_key(&object_id))
+        {
             return;
         }
-        // §8.1: a relay MAY ignore a later copy of an Object it already holds.
+
+        // Make room within both byte budgets by dropping other groups. An
+        // Object that does not fit beside its own group is not retained, so
+        // its Location stays unknown and a FETCH for it goes upstream.
+        let bytes = object.object.payload_length;
+        loop {
+            let fits_track = state
+                .bytes
+                .checked_add(bytes)
+                .is_some_and(|total| total <= self.limits.track_bytes.get());
+            if fits_track && self.limits.reserve(bytes) {
+                break;
+            }
+            if !state.evict_oldest_except(group_id, &self.limits) {
+                tracing::debug!(
+                    namespace = %self.reader.namespace,
+                    track = %self.reader.name,
+                    group_id,
+                    object_id,
+                    bytes,
+                    "object exceeds the fetch retention byte budget; not retained"
+                );
+                return;
+            }
+        }
+
+        if !state.groups.contains_key(&group_id) {
+            state.arrival.push_back(group_id);
+        }
         state
             .groups
             .entry(group_id)
             .or_default()
-            .entry(object.object.object_id)
-            .or_insert(object);
-        state.groups = state.groups.split_off(&oldest_kept);
+            .insert(object_id, object);
+        state.bytes += bytes;
+
+        // The window holds the `groups` most recently arrived groups.
+        while state.groups.len() as u64 > self.limits.groups.get() {
+            if !state.evict_oldest_except(group_id, &self.limits) {
+                break;
+            }
+        }
     }
 
     /// The Largest Location the relay knows of: the live track's, or a later
@@ -440,15 +549,62 @@ mod tests {
 
     const WINDOW: u64 = 3;
 
-    fn track() -> (TrackWriter, Arc<RetainedTrack>) {
+    /// Every test object's payload, `g{group}o{object}` with one-digit IDs.
+    const OBJECT_BYTES: usize = 4;
+
+    fn limits(track_bytes: NonZeroUsize, total_bytes: NonZeroUsize) -> Arc<Limits> {
+        Arc::new(Limits {
+            groups: NonZeroU64::new(WINDOW).unwrap(),
+            track_bytes,
+            total_bytes,
+            used_bytes: AtomicUsize::new(0),
+        })
+    }
+
+    fn unbounded() -> Arc<Limits> {
+        limits(NonZeroUsize::MAX, NonZeroUsize::MAX)
+    }
+
+    fn track_with(limits: Arc<Limits>) -> (TrackWriter, Arc<RetainedTrack>) {
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "repair").produce();
         let track = Arc::new(RetainedTrack {
             reader,
-            window: NonZeroU64::new(WINDOW).unwrap(),
+            limits,
             groups: Mutex::default(),
         });
         (writer, track)
+    }
+
+    fn track() -> (TrackWriter, Arc<RetainedTrack>) {
+        track_with(unbounded())
+    }
+
+    fn bytes(objects: usize) -> NonZeroUsize {
+        NonZeroUsize::new(objects * OBJECT_BYTES).unwrap()
+    }
+
+    fn is_complete(track: &RetainedTrack, group_id: u64, objects: u64) -> bool {
+        matches!(
+            track.plan(
+                Location::new(group_id, 0),
+                Location::new(group_id, objects),
+                GroupOrder::Ascending
+            ),
+            FetchPlan::Complete { .. }
+        )
+    }
+
+    fn is_absent(track: &RetainedTrack, group_id: u64) -> bool {
+        matches!(
+            track.plan(
+                Location::new(group_id, 0),
+                Location::new(group_id, 1),
+                GroupOrder::Ascending
+            ),
+            FetchPlan::Partial { ref objects, first_unknown, .. }
+                if objects.is_empty() && first_unknown == Location::new(group_id, 0)
+        )
     }
 
     fn object(group_id: u64, object_id: u64) -> FetchResponseObject {
@@ -671,16 +827,93 @@ mod tests {
             ),
             FetchPlan::Complete { .. }
         ));
-        // A late object of an evicted group is not retained again.
+        // Eviction follows arrival, not Group ID: a late object of an evicted
+        // group arrives last, so the least recently arrived group, 3, goes.
         track.insert(object(1, 0));
+        assert!(is_complete(&track, 1, 1));
+        assert!(is_absent(&track, 3));
+        assert!(is_complete(&track, 4, 2));
+        assert!(is_complete(&track, 5, 2));
+    }
+
+    #[test]
+    fn an_outlier_group_id_ages_out_instead_of_disabling_retention() {
+        let (_writer, track) = track();
+        let outlier = VarInt::MAX.into_inner();
+        track.insert(object(outlier, 0));
+        for group_id in 1..=4 {
+            retain(&track, group_id, 0..2);
+        }
+
+        assert!(is_complete(&track, 3, 2));
+        assert!(is_complete(&track, 4, 2));
+        // The outlier arrived first and was evicted, so it is no longer the
+        // Largest Location either.
         assert!(matches!(
             track.plan(
-                Location::new(1, 0),
-                Location::new(1, 1),
+                Location::new(outlier, 0),
+                Location::new(outlier, 1),
                 GroupOrder::Ascending
             ),
-            FetchPlan::Partial { ref objects, .. } if objects.is_empty()
+            FetchPlan::BeyondLargest
         ));
+    }
+
+    #[test]
+    fn a_group_that_never_ends_is_bounded_by_the_track_byte_budget() {
+        let (_writer, track) = track_with(limits(bytes(4), NonZeroUsize::MAX));
+        retain(&track, 1, 0..2);
+        // Group 2 grows past the budget: group 1 goes first, then Objects that
+        // do not fit beside the rest of group 2 are not retained.
+        retain(&track, 2, 0..6);
+
+        assert!(is_absent(&track, 1));
+        // Nothing records Objects 4 and 5 (there is no live track here), so the
+        // retained Largest Location, {2, 3}, ends the range (§9.16.3).
+        let FetchPlan::Complete {
+            objects,
+            end_location,
+        } = track.plan(
+            Location::new(2, 0),
+            Location::new(2, 6),
+            GroupOrder::Ascending,
+        )
+        else {
+            panic!("expected a complete plan");
+        };
+        assert_eq!(locations(&objects), vec![(2, 0), (2, 1), (2, 2), (2, 3)]);
+        assert_eq!(end_location, Location::new(2, 4));
+        assert_eq!(
+            track.limits.used_bytes.load(Ordering::Acquire),
+            4 * OBJECT_BYTES
+        );
+    }
+
+    #[test]
+    fn the_total_byte_budget_is_shared_and_released_when_a_track_drops() {
+        let shared = limits(bytes(2), bytes(2));
+        let (_first_writer, first) = track_with(shared.clone());
+        let (_second_writer, second) = track_with(shared.clone());
+
+        retain(&first, 1, 0..2);
+        // The first track holds the whole budget and the second has nothing of
+        // its own to evict, so its Object is not retained.
+        second.insert(object(7, 0));
+        assert!(matches!(
+            second.plan(
+                Location::new(7, 0),
+                Location::new(7, 1),
+                GroupOrder::Ascending
+            ),
+            FetchPlan::NothingPublished
+        ));
+        assert!(is_complete(&first, 1, 2));
+
+        drop(first);
+        assert_eq!(shared.used_bytes.load(Ordering::Acquire), 0);
+        second.insert(object(7, 0));
+        assert!(is_complete(&second, 7, 1));
+        assert_eq!(shared.used_bytes.load(Ordering::Acquire), OBJECT_BYTES);
     }
 
     #[test]
@@ -733,7 +966,11 @@ mod tests {
 
     #[tokio::test]
     async fn retain_feeds_objects_from_the_live_track_until_the_guard_drops() {
-        let retention = FetchRetention::groups(NonZeroU64::new(WINDOW).unwrap());
+        let retention = FetchRetention::new(
+            NonZeroU64::new(WINDOW).unwrap(),
+            NonZeroUsize::MAX,
+            NonZeroUsize::MAX,
+        );
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "repair").produce();
         let name = FullTrackName {
@@ -777,7 +1014,11 @@ mod tests {
 
     #[tokio::test]
     async fn retain_keeps_datagram_objects() {
-        let retention = FetchRetention::groups(NonZeroU64::new(WINDOW).unwrap());
+        let retention = FetchRetention::new(
+            NonZeroU64::new(WINDOW).unwrap(),
+            NonZeroUsize::MAX,
+            NonZeroUsize::MAX,
+        );
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "repair").produce();
         let name = FullTrackName {
@@ -826,7 +1067,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_newer_registration_replaces_the_older_one() {
-        let retention = FetchRetention::groups(NonZeroU64::new(WINDOW).unwrap());
+        let retention = FetchRetention::new(
+            NonZeroU64::new(WINDOW).unwrap(),
+            NonZeroUsize::MAX,
+            NonZeroUsize::MAX,
+        );
         let (_first_writer, first) =
             Track::new(TrackNamespace::from_utf8_path("test"), "repair").produce();
         let (_second_writer, second) =

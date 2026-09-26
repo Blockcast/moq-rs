@@ -1856,8 +1856,10 @@ mod tests {
         const REPAIR_PRIORITY: u8 = 240;
 
         fn retaining_locals() -> Locals {
-            Locals::new().with_fetch_retention(FetchRetention::groups(
+            Locals::new().with_fetch_retention(FetchRetention::new(
                 NonZeroU64::new(RETAINED_GROUPS).unwrap(),
+                std::num::NonZeroUsize::MAX,
+                std::num::NonZeroUsize::MAX,
             ))
         }
 

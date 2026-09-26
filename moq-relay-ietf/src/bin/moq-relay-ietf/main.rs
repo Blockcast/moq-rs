@@ -60,12 +60,27 @@ pub struct Cli {
     #[arg(long, default_value_t = 100)]
     pub max_request_id: u64,
 
-    /// Retain the Objects of this many most recent groups of every track the
-    /// relay receives, and answer a standalone FETCH from them when every
-    /// Object of its range is retained. Without this flag nothing is retained
-    /// and every FETCH is forwarded upstream.
-    #[arg(long)]
+    /// Retain the Objects of this many most recently arrived groups of every
+    /// track the relay receives, and answer a standalone FETCH from them when
+    /// every Object of its range is retained. Memory is bounded by
+    /// --fetch-retention-track-bytes and --fetch-retention-bytes, which are
+    /// required with it. Without this flag nothing is retained and every FETCH
+    /// is forwarded upstream.
+    #[arg(
+        long,
+        requires = "fetch_retention_track_bytes",
+        requires = "fetch_retention_bytes"
+    )]
     pub fetch_retention_groups: Option<std::num::NonZeroU64>,
+
+    /// Most Object Payload bytes retained for one track. Older groups are
+    /// dropped to make room; an Object that still does not fit is not retained.
+    #[arg(long, requires = "fetch_retention_groups")]
+    pub fetch_retention_track_bytes: Option<std::num::NonZeroUsize>,
+
+    /// Most Object Payload bytes retained across all tracks.
+    #[arg(long, requires = "fetch_retention_groups")]
+    pub fetch_retention_bytes: Option<std::num::NonZeroUsize>,
 
     /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
     /// If not provided, the relay accepts every unique namespace publish.
@@ -257,9 +272,15 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let relay = match cli.fetch_retention_groups {
-        Some(groups) => relay.with_fetch_retention(moq_relay_ietf::FetchRetention::groups(groups)),
-        None => relay,
+    let relay = match (
+        cli.fetch_retention_groups,
+        cli.fetch_retention_track_bytes,
+        cli.fetch_retention_bytes,
+    ) {
+        (Some(groups), Some(track_bytes), Some(total_bytes)) => relay.with_fetch_retention(
+            moq_relay_ietf::FetchRetention::new(groups, track_bytes, total_bytes),
+        ),
+        _ => relay,
     };
     relay.run().await
 }
@@ -314,12 +335,49 @@ mod tests {
         let default = Cli::try_parse_from(["moq-relay-ietf"]).unwrap();
         assert_eq!(default.fetch_retention_groups, None);
 
-        let set = Cli::try_parse_from(["moq-relay-ietf", "--fetch-retention-groups", "4"]).unwrap();
+        let retention = |groups: &str, track: &str, total: &str| {
+            Cli::try_parse_from([
+                "moq-relay-ietf",
+                "--fetch-retention-groups",
+                groups,
+                "--fetch-retention-track-bytes",
+                track,
+                "--fetch-retention-bytes",
+                total,
+            ])
+        };
+        let set = retention("4", "1000", "5000").unwrap();
         assert_eq!(
             set.fetch_retention_groups.map(|groups| groups.get()),
             Some(4)
         );
+        assert_eq!(
+            set.fetch_retention_track_bytes.map(|bytes| bytes.get()),
+            Some(1000)
+        );
+        assert_eq!(
+            set.fetch_retention_bytes.map(|bytes| bytes.get()),
+            Some(5000)
+        );
 
-        assert!(Cli::try_parse_from(["moq-relay-ietf", "--fetch-retention-groups", "0"]).is_err());
+        assert!(retention("0", "1000", "5000").is_err());
+        assert!(retention("4", "0", "5000").is_err());
+        assert!(retention("4", "1000", "0").is_err());
+    }
+
+    #[test]
+    fn fetch_retention_requires_both_byte_budgets() {
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--fetch-retention-groups", "4"]).is_err());
+        assert!(Cli::try_parse_from([
+            "moq-relay-ietf",
+            "--fetch-retention-groups",
+            "4",
+            "--fetch-retention-track-bytes",
+            "1000",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["moq-relay-ietf", "--fetch-retention-bytes", "5000"]).is_err()
+        );
     }
 }
