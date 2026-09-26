@@ -476,6 +476,23 @@ impl ObjectForwarder {
         .await
     }
 
+    /// Object ID Delta for `object_id` (draft-16 §10.4.2): the Object ID itself
+    /// for the first object on the stream, otherwise the number of IDs skipped
+    /// since the previous object written to it.
+    fn object_id_delta(previous: Option<u64>, object_id: u64) -> Result<u64, ServeError> {
+        match previous {
+            None => Ok(object_id),
+            Some(previous) => object_id
+                .checked_sub(previous)
+                .and_then(|step| step.checked_sub(1))
+                .ok_or_else(|| {
+                    ServeError::internal_ctx(format!(
+                        "subgroup object id {object_id} does not follow {previous}"
+                    ))
+                }),
+        }
+    }
+
     async fn next_allowed_object(
         subgroup_reader: &mut serve::SubgroupReader,
         delivery_filter: DeliveryFilter,
@@ -527,6 +544,10 @@ impl ObjectForwarder {
 
         let mut object_count = 0;
         let mut next_object = Some(first_object);
+        // Object ID of the previous object written to this stream, for the
+        // Object ID Delta (draft-16 §10.4.2). Objects the delivery filter skips
+        // were never written, so they are not a reference point.
+        let mut previous_object_id: Option<u64> = None;
         loop {
             let mut subgroup_object_reader = match next_object.take() {
                 Some(reader) => reader,
@@ -538,11 +559,10 @@ impl ObjectForwarder {
                 }
             };
 
+            let object_id_delta =
+                Self::object_id_delta(previous_object_id, subgroup_object_reader.object_id)?;
             let subgroup_object = data::SubgroupObjectExt {
-                // TODO(itzmanish): compute real delta when the receive side uses object IDs
-                // for ordering. Both sender and receiver must agree on the same prev tracking
-                // semantics before this is meaningful.
-                object_id_delta: 0,
+                object_id_delta,
                 extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
                 payload_length: subgroup_object_reader.size,
                 status: if subgroup_object_reader.size == 0 {
@@ -564,6 +584,7 @@ impl ObjectForwarder {
             );
 
             output.encode(&subgroup_object).await?;
+            previous_object_id = Some(subgroup_object_reader.object_id);
 
             // Log subgroup object created/sent
             if let Some(ref mlog) = mlog {
@@ -1068,6 +1089,94 @@ mod tests {
         let payload = output.copy_to_bytes(object.payload_length);
         assert_eq!(&payload[..], b"hello");
         assert!(!output.has_remaining());
+    }
+
+    /// Object IDs survive a relay hop: the forwarder encodes each Object ID
+    /// Delta against the previous object it actually wrote (draft-16 §10.4.2).
+    #[tokio::test]
+    async fn object_forwarder_encodes_sparse_object_ids_as_deltas() {
+        use bytes::{Buf, Bytes};
+
+        use crate::{coding::Decode, coding::Location, coding::TrackNamespace};
+
+        async fn forwarded_object_ids(start_location: Option<Location>) -> Vec<u64> {
+            let (track_writer, track_reader) =
+                serve::Track::new(TrackNamespace::from_utf8_path("test"), "video").produce();
+            let mut subgroups_writer = track_writer.subgroups().unwrap();
+            let mut subgroup_writer = subgroups_writer
+                .create(serve::Subgroup {
+                    group_id: 7,
+                    subgroup_id: 0,
+                    priority: 9,
+                })
+                .unwrap();
+            for object_id in [3u64, 4, 9] {
+                let mut object = subgroup_writer.create_with_id(object_id, 1, None).unwrap();
+                object.write(Bytes::from_static(b"x")).unwrap();
+            }
+            drop(subgroup_writer);
+            drop(subgroups_writer);
+
+            let TrackReaderMode::Subgroups(mut subgroups) = track_reader.mode().await.unwrap()
+            else {
+                panic!("expected subgroups mode");
+            };
+            let subgroup = subgroups.next().await.unwrap().unwrap();
+            let header = data::SubgroupHeader {
+                header_type: data::StreamHeaderType::SubgroupIdExt,
+                track_alias: 1,
+                group_id: 7,
+                subgroup_id: Some(0),
+                publisher_priority: 9,
+            };
+            let mut output = ObjectForwarder::serve_subgroup_to_buffer(
+                header,
+                subgroup,
+                State::<ObjectForwarderState>::default(),
+                DeliveryFilter {
+                    forward: true,
+                    start_location,
+                    end_group_id: None,
+                },
+            )
+            .await
+            .unwrap()
+            .freeze();
+
+            let header_type = data::StreamHeaderType::decode(&mut output).unwrap();
+            data::SubgroupHeader::decode(header_type, &mut output).unwrap();
+            // Rebuild absolute IDs the way the receive path does.
+            let mut ids = Vec::new();
+            let mut previous: Option<u64> = None;
+            while output.has_remaining() {
+                let object = data::SubgroupObjectExt::decode(&mut output).unwrap();
+                output.advance(object.payload_length);
+                let id = match previous {
+                    None => object.object_id_delta,
+                    Some(previous) => previous + object.object_id_delta + 1,
+                };
+                previous = Some(id);
+                ids.push(id);
+            }
+            ids
+        }
+
+        assert_eq!(forwarded_object_ids(None).await, vec![3, 4, 9]);
+        // Object 3 is filtered out, so object 4 is the first on the stream and
+        // its delta is its own ID.
+        assert_eq!(
+            forwarded_object_ids(Some(Location::new(7, 4))).await,
+            vec![4, 9]
+        );
+    }
+
+    #[test]
+    fn object_id_delta_rejects_non_increasing_ids() {
+        assert_eq!(ObjectForwarder::object_id_delta(None, 5).unwrap(), 5);
+        assert_eq!(ObjectForwarder::object_id_delta(Some(5), 6).unwrap(), 0);
+        assert_eq!(ObjectForwarder::object_id_delta(Some(5), 9).unwrap(), 3);
+        assert!(ObjectForwarder::object_id_delta(Some(5), 5).is_err());
+        assert!(ObjectForwarder::object_id_delta(Some(5), 4).is_err());
     }
 
     #[test]

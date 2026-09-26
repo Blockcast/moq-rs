@@ -137,10 +137,8 @@ impl FetchRequested {
         reset: FetchReset,
     ) -> Result<message::FetchOk, SessionError> {
         let webtransport = self.webtransport.as_ref().ok_or(SessionError::Internal)?;
-        let mut stream = FetchStream::new(
-            Writer::new(webtransport.open_uni().await?),
-            reset.clone(),
-        );
+        let mut stream =
+            FetchStream::new(Writer::new(webtransport.open_uni().await?), reset.clone());
         stream
             .writer
             .encode(&FetchHeader {
@@ -362,12 +360,7 @@ mod tests {
         let (outgoing, receiver) = Queue::default().split();
         let keepalive = outgoing.clone();
         let active = Arc::new(Mutex::new(HashMap::new()));
-        let (request, recv) = FetchRequested::new(
-            None,
-            outgoing,
-            active.clone(),
-            request(id),
-        );
+        let (request, recv) = FetchRequested::new(None, outgoing, active.clone(), request(id));
         Handles {
             request,
             recv,
