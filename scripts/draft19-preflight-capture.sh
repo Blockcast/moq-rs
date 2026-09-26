@@ -88,39 +88,46 @@ relay_listening || { cat "$WORK/relay.log" >&2; echo "relay never listened" >&2;
 
 PUB_ARGS=("$RELAY_URL" --name draft19-preflight --catalog-json "$WORK/catalog.json"
           --wire-profile draft19 --tls-disable-verify)
-# Expected to exit non-zero: the publisher reports the negotiated profile and
-# then refuses to put draft-16 MMTP bytes on a moqt-19 connection.
-RUST_LOG=info "$BIN_DIR/moq-pub-mmtp" "${PUB_ARGS[@]}" >"$WORK/pub.log" 2>&1 || true
 
-strip_ansi <"$WORK/pub.log" | grep -F "negotiated moqt-19, but MMTP publish is draft-16 only" >/dev/null || {
-  cat "$WORK/pub.log" >&2; echo "publisher did not report a moqt-19 negotiation" >&2; exit 1
-}
-
+if [ "$ROLE" = "publisher" ]; then
+  EVIDENCE_LOG="$WORK/pub.log"
+  MARKER='draft-19 session established; MMTP publish over draft-19 is not implemented'
+  INVOCATION="moq-pub-mmtp ${PUB_ARGS[*]}"
+else
+  EVIDENCE_LOG="$WORK/relay.log"
+  MARKER='draft-19 session established: control plane only'
+  INVOCATION="moq-relay-ietf ${RELAY_ARGS[*]}"
+fi
 # `|| true` is load-bearing: under `set -o pipefail` a grep that matches nothing
 # makes the whole pipeline exit 1, which `set -e` turns into a bare exit before
 # the named diagnostic below can run.
-if [ "$ROLE" = "publisher" ]; then
-  # The publisher ran in the foreground, so its log is already complete here.
-  EVIDENCE_LOG="$WORK/pub.log"
-  EVIDENCE="$(strip_ansi <"$EVIDENCE_LOG" | grep -F 'draft-19 session established; MMTP publish over draft-19 is not implemented' | tail -1)" || true
-  INVOCATION="moq-pub-mmtp ${PUB_ARGS[*]}"
-else
-  # The relay is still running, and nothing orders its establishment line
-  # against the publisher's exit: each side returns from `establish`
-  # independently, and the publisher logs and then immediately bails, so it can
-  # be gone before the relay task has written its line. Poll on the same budget
-  # as the `listening` wait above rather than reading the log once. Killing the
-  # relay first would not fix this: SIGTERM can land before the relay task
-  # reaches the log call, which loses the line instead of flushing it.
-  EVIDENCE_LOG="$WORK/relay.log"
-  relay_evidence() { strip_ansi <"$EVIDENCE_LOG" | grep -F 'draft-19 session established: control plane only' | tail -1; }
-  for _ in $(seq 1 60); do
-    EVIDENCE="$(relay_evidence)" || true
+evidence() { strip_ansi <"$EVIDENCE_LOG" | grep -F "$MARKER" | tail -1; }
+
+# Each side returns from `establish` independently, and the publisher logs its
+# negotiation and then immediately exits. That tears the QUIC connection down
+# under the relay, which can still be inside `Draft19Session::establish`: it
+# then logs `failed to read capsule` / `connection error: closed` and never
+# writes an establishment line at all. Polling cannot recover that connection,
+# so reconnect. Each attempt is a fresh connection to the same still-running
+# relay, and the inner poll covers the narrower case where the relay's line is
+# merely late. Killing the relay to flush it would not help either: SIGTERM can
+# land before the relay task reaches the log call, losing the line.
+EVIDENCE=""
+for _ in $(seq 1 8); do
+  # Expected to exit non-zero: the publisher reports the negotiated profile and
+  # then refuses to put draft-16 MMTP bytes on a moqt-19 connection.
+  RUST_LOG=info "$BIN_DIR/moq-pub-mmtp" "${PUB_ARGS[@]}" >"$WORK/pub.log" 2>&1 || true
+  strip_ansi <"$WORK/pub.log" | grep -F "negotiated moqt-19, but MMTP publish is draft-16 only" >/dev/null || {
+    cat "$WORK/pub.log" >&2; echo "publisher did not report a moqt-19 negotiation" >&2; exit 1
+  }
+  for _ in $(seq 1 10); do
+    EVIDENCE="$(evidence)" || true
     if [ -n "$EVIDENCE" ]; then break; fi
     sleep 0.5
   done
-  INVOCATION="moq-relay-ietf ${RELAY_ARGS[*]}"
-fi
+  if [ -n "$EVIDENCE" ]; then break; fi
+  kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.log" >&2; echo "relay exited early" >&2; exit 1; }
+done
 [ -n "$EVIDENCE" ] || {
   cat "$EVIDENCE_LOG" >&2
   echo "no draft-19 establishment line for role $ROLE" >&2; exit 1
