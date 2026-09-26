@@ -60,11 +60,15 @@ COPY moq-sub-raw/Cargo.toml moq-sub-raw/Cargo.toml
 COPY moq-test-client/Cargo.toml moq-test-client/Cargo.toml
 COPY moq-transport/Cargo.toml moq-transport/Cargo.toml
 
+# One stub per declared target. Cargo resolves every [[bin]] path in the
+# manifests copied above, so a crate that declares a bin without a stub here
+# fails this layer with "can't find bin <name> at path ...". Adding a [[bin]]
+# anywhere in the workspace means adding its stub below.
 RUN mkdir -p \
       moq-api/src moq-canary/src moq-catalog/src moq-clock-ietf/src \
       moq-native-ietf/src moq-pub/src moq-pub-mmtp/src \
       moq-pub-mmtp/vendor/mmt-core/src moq-pub-mmtp/vendor/mmt-core/benches \
-      moq-relay-ietf/src/bin/moq-relay-ietf \
+      moq-relay-ietf/src/bin/moq-relay-ietf moq-relay-ietf/src/bin/draft19-preflight \
       moq-sub/src moq-sub-raw/src moq-test-client/src moq-transport/src && \
     for crate in moq-api moq-catalog moq-native-ietf moq-pub moq-relay-ietf moq-sub moq-transport; do \
       echo "" > "$crate/src/lib.rs"; \
@@ -74,7 +78,8 @@ RUN mkdir -p \
     for crate in moq-api moq-canary moq-clock-ietf moq-pub moq-pub-mmtp moq-sub moq-sub-raw moq-test-client; do \
       echo "fn main() {}" > "$crate/src/main.rs"; \
     done && \
-    echo "fn main() {}" > moq-relay-ietf/src/bin/moq-relay-ietf/main.rs
+    echo "fn main() {}" > moq-relay-ietf/src/bin/moq-relay-ietf/main.rs && \
+    echo "fn main() {}" > moq-relay-ietf/src/bin/draft19-preflight/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
