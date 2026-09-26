@@ -13,6 +13,7 @@ use moq_transport::{
 use tokio::sync::{broadcast, mpsc};
 
 use crate::metrics::GaugeGuard;
+use crate::retention::{FetchRetention, RetainedTrack, RetentionGuard};
 
 /// Scope key for the outer level of the two-level registry.
 ///
@@ -55,6 +56,8 @@ struct RemoteNamespaceSource {
 struct TrackEntry {
     reader: TrackReader,
     source: TrackSource,
+    /// Retention of this track's recent groups for FETCH, while the entry lives.
+    _retention: Option<RetentionGuard>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -102,6 +105,9 @@ pub struct Locals {
 
     /// Actual PUBLISH track add/remove notifications for Publish/Both fan-out.
     track_changes: broadcast::Sender<TrackChange>,
+
+    /// Which groups of each registered track are retained for FETCH.
+    fetch_retention: FetchRetention,
 }
 
 impl Default for Locals {
@@ -119,7 +125,24 @@ impl Locals {
             namespaces: Default::default(),
             namespace_changes,
             track_changes,
+            fetch_retention: FetchRetention::disabled(),
         }
+    }
+
+    /// Retain the recent groups of every track registered from now on, so a
+    /// standalone FETCH for them can be answered locally.
+    pub fn with_fetch_retention(mut self, fetch_retention: FetchRetention) -> Self {
+        self.fetch_retention = fetch_retention;
+        self
+    }
+
+    /// The retained groups of a track registered in `scope`, if any.
+    pub(crate) fn retained_track(
+        &self,
+        scope: Option<&str>,
+        full_name: &FullTrackName,
+    ) -> Option<Arc<RetainedTrack>> {
+        self.fetch_retention.lookup(scope, full_name)
     }
 
     pub fn subscribe_namespace_changes(&self) -> broadcast::Receiver<NamespaceChange> {
@@ -387,6 +410,7 @@ impl Locals {
             hash_map::Entry::Vacant(entry) => entry.insert(TrackEntry {
                 reader: track.clone(),
                 source: TrackSource::Published,
+                _retention: self.fetch_retention.retain(scope, &track),
             }),
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
         };
@@ -510,6 +534,7 @@ impl Locals {
                 TrackEntry {
                     reader: reader.clone(),
                     source: TrackSource::Cache,
+                    _retention: self.fetch_retention.retain(scope, &reader),
                 },
             );
             (writer, reader)

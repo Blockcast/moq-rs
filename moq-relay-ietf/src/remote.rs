@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::retention::FetchRetention;
 use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, RelayInfo, SessionContext};
 
 /// Cache key for upstream relay-to-relay connections.
@@ -37,6 +38,10 @@ pub struct RemoteManager {
     clients: Vec<quic::Client>,
     session_config: SessionConfig,
     remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
+
+    /// Which groups of each track pulled from a peer relay are retained for
+    /// FETCH.
+    fetch_retention: FetchRetention,
 }
 
 #[cfg(test)]
@@ -168,8 +173,11 @@ mod tests {
             max_request_id: 7,
             ..SessionConfig::default()
         };
-        let manager =
-            RemoteManager::new_with_session_config(Arc::new(TestCoordinator::default()), vec![], config);
+        let manager = RemoteManager::new_with_session_config(
+            Arc::new(TestCoordinator::default()),
+            vec![],
+            config,
+        );
 
         assert_eq!(manager.session_config, config);
     }
@@ -434,7 +442,15 @@ impl RemoteManager {
             clients,
             session_config,
             remotes: Arc::new(Mutex::new(HashMap::new())),
+            fetch_retention: FetchRetention::disabled(),
         }
+    }
+
+    /// Retain the recent groups of every track pulled from a peer relay from
+    /// now on, so a standalone FETCH for them can be answered locally.
+    pub fn with_fetch_retention(mut self, fetch_retention: FetchRetention) -> Self {
+        self.fetch_retention = fetch_retention;
+        self
     }
 
     /// Subscribe to a track from a remote relay.
@@ -478,7 +494,10 @@ impl RemoteManager {
             }
         };
 
-        match remote.subscribe(namespace.clone(), track_name).await {
+        match remote
+            .subscribe(scope, &self.fetch_retention, namespace.clone(), track_name)
+            .await
+        {
             Ok(reader) => Ok(reader),
             Err(err) => {
                 tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
@@ -878,6 +897,8 @@ impl Remote {
     /// Subscribe to a track on this remote relay.
     async fn subscribe(
         &self,
+        scope: Option<&str>,
+        fetch_retention: &FetchRetention,
         namespace: TrackNamespace,
         track_name: TrackName,
     ) -> anyhow::Result<Option<TrackReader>> {
@@ -925,6 +946,10 @@ impl Remote {
             tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+            // Start retaining before the peer can send anything on the track. The
+            // guard lives in the cleanup task below, so retention ends with the
+            // upstream subscription.
+            let retention = fetch_retention.retain(scope, &reader);
             let subscribe_result = tokio::select! {
                 result = subscriber.subscribe_open(writer) => result,
                 _ = cancel.cancelled() => {
@@ -956,6 +981,7 @@ impl Remote {
             let cleanup_reader = reader.clone();
             let cleanup_slot = slot.clone();
             tokio::spawn(async move {
+                let _retention = retention;
                 tokio::select! {
                     result = subscribe.closed() => {
                         match result {

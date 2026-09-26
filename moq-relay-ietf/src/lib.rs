@@ -42,6 +42,7 @@ pub mod metrics;
 mod producer;
 mod relay;
 mod remote;
+mod retention;
 mod session;
 #[cfg(test)]
 mod test;
@@ -56,5 +57,6 @@ pub use moq_transport::session::SessionConfig;
 pub use producer::*;
 pub use relay::*;
 pub use remote::RemoteManager;
+pub use retention::FetchRetention;
 pub use session::*;
 pub use web::*;

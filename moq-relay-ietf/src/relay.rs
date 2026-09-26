@@ -143,6 +143,26 @@ impl Relay {
         })
     }
 
+    /// Retain the recent groups of every track this relay receives, so a
+    /// standalone FETCH for them is answered locally instead of being
+    /// forwarded upstream (draft-ietf-moq-transport-16 §9.16.3).
+    ///
+    /// Call before [`Self::run`]. The relay-local and remote track registries
+    /// are replaced, and the namespace manager rebuilt over them, so every
+    /// track registered from then on is retained.
+    pub fn with_fetch_retention(mut self, fetch_retention: crate::FetchRetention) -> Self {
+        self.locals = self.locals.with_fetch_retention(fetch_retention.clone());
+        self.remotes = self.remotes.with_fetch_retention(fetch_retention);
+        let (upstream_namespaces, upstream_namespaces_runner) = UpstreamNamespaces::new(
+            self.locals.clone(),
+            self.remotes.clone(),
+            self.config.coordinator.clone(),
+        );
+        self.upstream_namespaces = upstream_namespaces;
+        self.upstream_namespaces_runner = upstream_namespaces_runner;
+        self
+    }
+
     /// Run the relay server.
     pub async fn run(self) -> anyhow::Result<()> {
         let Self {

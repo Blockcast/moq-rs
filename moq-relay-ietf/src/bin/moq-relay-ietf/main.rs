@@ -60,6 +60,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 100)]
     pub max_request_id: u64,
 
+    /// Retain the Objects of this many most recent groups of every track the
+    /// relay receives, and answer a standalone FETCH from them when every
+    /// Object of its range is retained. Without this flag nothing is retained
+    /// and every FETCH is forwarded upstream.
+    #[arg(long)]
+    pub fetch_retention_groups: Option<std::num::NonZeroU64>,
+
     /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
     /// If not provided, the relay accepts every unique namespace publish.
     #[arg(long)]
@@ -250,6 +257,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let relay = match cli.fetch_retention_groups {
+        Some(groups) => relay.with_fetch_retention(moq_relay_ietf::FetchRetention::groups(groups)),
+        None => relay,
+    };
     relay.run().await
 }
 
@@ -296,5 +307,19 @@ mod tests {
             [WireProfile::Draft16, WireProfile::Draft19]
         );
         assert_eq!(WireProfile::Draft19.name(), "moqt-19");
+    }
+
+    #[test]
+    fn fetch_retention_is_opt_in_and_rejects_zero() {
+        let default = Cli::try_parse_from(["moq-relay-ietf"]).unwrap();
+        assert_eq!(default.fetch_retention_groups, None);
+
+        let set = Cli::try_parse_from(["moq-relay-ietf", "--fetch-retention-groups", "4"]).unwrap();
+        assert_eq!(
+            set.fetch_retention_groups.map(|groups| groups.get()),
+            Some(4)
+        );
+
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--fetch-retention-groups", "0"]).is_err());
     }
 }

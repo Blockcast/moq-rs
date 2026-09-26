@@ -74,6 +74,8 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 # Self-signed localhost certificates for the FETCH relay tests.
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
+# Payload chunks in FETCH retention tests.
+bytes = "1"
 
 [features]
 default = []
