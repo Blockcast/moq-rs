@@ -11,6 +11,12 @@ qlog/
 /mlog/
 .vscode/launch.json
 
+# Where scripts/draft19-preflight-capture.sh writes its attestation, and where
+# the workflow uploads it from. Generated output, so it must not count against
+# that script's own dirty-tree guard: otherwise the first local capture leaves
+# a file that refuses the second one.
+artifacts/
+
 # .planning/ holds the milestone design docs + harness scripts, which are worth
 # tracking. Runtime output of those harnesses is not: it has no diff value and
 # every clone pays for it forever (BLO-19847 evicted 2.6 MB of it). Keep the

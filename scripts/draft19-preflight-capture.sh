@@ -78,10 +78,13 @@ RUST_LOG=info "$BIN_DIR/moq-relay-ietf" "${RELAY_ARGS[@]}" >"$WORK/relay.log" 2>
 RELAY_PID=$!
 
 relay_listening() { strip_ansi <"$WORK/relay.log" | grep -F "listening on 127.0.0.1:$PORT" >/dev/null; }
+# A dead relay is the likelier explanation for any line that never arrives, so
+# all three waits rule it out before reporting the line's own absence.
+relay_alive_or_die() { kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.log" >&2; echo "relay exited early" >&2; exit 1; }; }
 
 for _ in $(seq 1 60); do
   relay_listening && break
-  kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.log" >&2; echo "relay exited early" >&2; exit 1; }
+  relay_alive_or_die
   sleep 0.5
 done
 relay_listening || { cat "$WORK/relay.log" >&2; echo "relay never listened" >&2; exit 1; }
@@ -113,7 +116,8 @@ evidence() { strip_ansi <"$EVIDENCE_LOG" | grep -F "$MARKER" | tail -1; }
 # merely late. Killing the relay to flush it would not help either: SIGTERM can
 # land before the relay task reaches the log call, losing the line.
 EVIDENCE=""
-for _ in $(seq 1 8); do
+ATTEMPTS=8
+for _ in $(seq 1 "$ATTEMPTS"); do
   # Expected to exit non-zero: the publisher reports the negotiated profile and
   # then refuses to put draft-16 MMTP bytes on a moqt-19 connection.
   RUST_LOG=info "$BIN_DIR/moq-pub-mmtp" "${PUB_ARGS[@]}" >"$WORK/pub.log" 2>&1 || true
@@ -122,7 +126,7 @@ for _ in $(seq 1 8); do
     # so during the run above and takes the publisher's negotiation down with
     # it. Rule that out before blaming the publisher, or a dead relay reports
     # as a negotiation regression with only `pub.log` to read.
-    kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.log" >&2; echo "relay exited early" >&2; exit 1; }
+    relay_alive_or_die
     cat "$WORK/pub.log" >&2; echo "publisher did not report a moqt-19 negotiation" >&2; exit 1
   }
   for _ in $(seq 1 10); do
@@ -131,11 +135,11 @@ for _ in $(seq 1 8); do
     sleep 0.5
   done
   if [ -n "$EVIDENCE" ]; then break; fi
-  kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.log" >&2; echo "relay exited early" >&2; exit 1; }
+  relay_alive_or_die
 done
 [ -n "$EVIDENCE" ] || {
   cat "$EVIDENCE_LOG" >&2
-  echo "no draft-19 establishment line for role $ROLE after 8 attempts" >&2; exit 1
+  echo "no draft-19 establishment line for role $ROLE after $ATTEMPTS attempts" >&2; exit 1
 }
 
 # Fail closed rather than attesting a version the binary did not report.
