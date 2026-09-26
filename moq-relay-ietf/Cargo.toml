@@ -22,6 +22,13 @@ path = "src/lib.rs"
 name = "moq-relay-ietf"
 path = "src/bin/moq-relay-ietf/main.rs"
 
+# Phase 3 evidence tool, not shipped in the image. Lives in this crate because
+# it drives the same draft-19 session entry points serve_draft19_control_plane
+# does, so it cannot drift from the relay without breaking the build.
+[[bin]]
+name = "draft19-preflight"
+path = "src/bin/draft19-preflight/main.rs"
+
 [dependencies]
 moq-transport = { path = "../moq-transport", version = "0.16" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }

@@ -60,6 +60,22 @@ A draft-16 session refuses a draft-19 negotiation with a typed
 `SessionError::ProfileFramingMismatch`, so no session can report
 `selected_version() == moqt-19` while writing draft-16 bytes.
 
+#### Draft-19 preflight attestation
+
+`scripts/draft19-preflight-capture.sh <publisher|relay-root|relay-leaf> <out.json>`
+records what a role actually negotiated. It runs the shipped `moq-relay-ietf`
+and `moq-pub-mmtp` binaries against each other over real QUIC and quotes the
+role's own `selected_version=moqt-19` log line, then adds a decoded GOAWAY
+captured by the `draft19-preflight` binary over a draft-19 control stream.
+
+The GOAWAY half is a session-level capture, not an observed relay drain: no
+shipped binary emits a draft-19 GOAWAY today. Every artifact says so in
+`goaway.caveat` -- do not quote one as evidence of graceful relay drain.
+
+The `Draft-19 preflight attestation` workflow publishes one artifact per role.
+`Blockcast/pim-multicast-gateway` pins them by source commit, workflow run,
+artifact digest, and canonical payload digest.
+
 ## Interoperability
 
 A public relay instance running the latest `main` branch is available for interop testing at:
