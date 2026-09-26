@@ -10,14 +10,14 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{cmp, ops::Deref, sync::Arc};
+use std::{ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
 use crate::data::ObjectStatus;
 use crate::watch::State;
 
-use super::{ServeError, Track};
+use super::{ServeError, Track, TrackTapEvent, TrackTaps};
 
 pub struct Subgroups {
     pub track: Arc<Track>,
@@ -65,6 +65,7 @@ pub struct SubgroupsWriter {
     next_subgroup_id: u64, // Not in the state to avoid a lock
     next_group_id: u64,    // Not in the state to avoid a lock
     last_group_id: u64,    // Not in the state to avoid a lock
+    pub(super) taps: TrackTaps,
 }
 
 impl SubgroupsWriter {
@@ -75,7 +76,12 @@ impl SubgroupsWriter {
             next_subgroup_id: 0,
             next_group_id: 0,
             last_group_id: 0,
+            taps: TrackTaps::default(),
         }
+    }
+
+    pub(super) fn set_taps(&mut self, taps: TrackTaps) {
+        self.taps = taps;
     }
 
     // Helper to increment the group by one.
@@ -108,22 +114,26 @@ impl SubgroupsWriter {
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
-        if let Some(latest) = &state.latest_subgroup_reader {
-            // TODO: Check this logic again
-            if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
-                match writer.subgroup_id.cmp(&latest.subgroup_id) {
-                    cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
-                    cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-                    cmp::Ordering::Greater => state.latest_subgroup_reader = Some(reader),
-                }
-            } else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
-                state.latest_subgroup_reader = Some(reader);
-            } else {
-                return Ok(writer); // drop here as well
-            }
-        } else {
-            state.latest_subgroup_reader = Some(reader);
+        // Readers only follow the latest subgroup: a newer (group, subgroup)
+        // replaces it, the same one is a duplicate, and an older one is written
+        // but never handed to readers.
+        let key = (writer.group_id, writer.subgroup_id);
+        let latest = state
+            .latest_subgroup_reader
+            .as_ref()
+            .map(|latest| (latest.group_id, latest.subgroup_id));
+        if latest == Some(key) {
+            return Err(ServeError::Duplicate);
         }
+
+        // Taps see every subgroup, including the older ones readers never will.
+        self.taps.emit(|| TrackTapEvent::Subgroup(reader.clone()));
+
+        // TODO: Check this logic again
+        if latest.is_some_and(|latest| key < latest) {
+            return Ok(writer); // dropped immediately, lul
+        }
+        state.latest_subgroup_reader = Some(reader);
 
         self.next_subgroup_id = state.latest_subgroup_reader.as_ref().unwrap().subgroup_id + 1;
         self.next_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id + 1;

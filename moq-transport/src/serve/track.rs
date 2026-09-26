@@ -20,7 +20,7 @@ use crate::watch::State;
 
 use super::{
     Datagrams, DatagramsReader, DatagramsWriter, ObjectsWriter, ServeError, Stream, StreamReader,
-    StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter,
+    StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter, TapRegistrar, TrackTap, TrackTaps,
 };
 use crate::coding::{Location, TrackName, TrackNamespace};
 use paste::paste;
@@ -45,10 +45,12 @@ impl Track {
         // Create sharable TrackState and Info(Track)
         let (writer_track_state, reader_track_state) = State::default().split();
         let info = Arc::new(self);
+        let taps = TrackTaps::default();
+        let registrar = taps.registrar();
 
         // Create TrackReader and TrackWriter with shared state and info
-        let writer = TrackWriter::new(writer_track_state, info.clone());
-        let reader = TrackReader::new(reader_track_state, info);
+        let writer = TrackWriter::new(writer_track_state, info.clone(), taps);
+        let reader = TrackReader::new(reader_track_state, info, registrar);
 
         (writer, reader)
     }
@@ -74,12 +76,14 @@ impl Default for TrackState {
 pub struct TrackWriter {
     state: State<TrackState>,
     pub info: Arc<Track>,
+    /// Handed to the subgroups or datagrams writer this becomes.
+    taps: TrackTaps,
 }
 
 impl TrackWriter {
     /// Create a track with the given name (info/Track)
-    fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
-        Self { state, info }
+    fn new(state: State<TrackState>, info: Arc<Track>, taps: TrackTaps) -> Self {
+        Self { state, info, taps }
     }
 
     /// Create a new stream with the given priority, inserting it into the track.
@@ -109,10 +113,11 @@ impl TrackWriter {
     // TODO: rework this whole interface for clarity?
     /// Create a new subgroups stream with the given priority, inserting it into the track.
     pub fn subgroups(self) -> Result<SubgroupsWriter, ServeError> {
-        let (writer, reader) = Subgroups {
+        let (mut writer, reader) = Subgroups {
             track: self.info.clone(),
         }
         .produce();
+        writer.set_taps(self.taps.clone());
 
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {
@@ -130,10 +135,11 @@ impl TrackWriter {
     }
 
     pub fn datagrams(self) -> Result<DatagramsWriter, ServeError> {
-        let (writer, reader) = Datagrams {
+        let (mut writer, reader) = Datagrams {
             track: self.info.clone(),
         }
         .produce();
+        writer.set_taps(self.taps.clone());
 
         // Lock state to modify it
         let mut state = self.state.lock_mut().ok_or_else(|| {
@@ -187,11 +193,23 @@ impl Deref for TrackWriter {
 pub struct TrackReader {
     state: State<TrackState>,
     pub info: Arc<Track>,
+    taps: TapRegistrar,
 }
 
 impl TrackReader {
-    fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
-        Self { state, info }
+    fn new(state: State<TrackState>, info: Arc<Track>, taps: TapRegistrar) -> Self {
+        Self { state, info, taps }
+    }
+
+    /// Observe every subgroup and datagram written to this track from now on,
+    /// including ones a [`SubgroupsReader`] or [`DatagramsReader`] would skip
+    /// because a newer one arrived before it looked. A tap created before the
+    /// writer picks its mode sees everything the writer writes.
+    ///
+    /// The tap ends once the track's writer is gone. Stream-mode tracks are not
+    /// tapped.
+    pub fn tap(&self) -> TrackTap {
+        self.taps.tap()
     }
 
     /// Get the current mode of the track, waiting if necessary.
