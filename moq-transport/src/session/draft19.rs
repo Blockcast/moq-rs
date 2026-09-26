@@ -193,39 +193,33 @@ impl Draft19Session {
         self.control_goaway.timeout_expired(now)
     }
 
+    /// Close the session with `GOAWAY_TIMEOUT` once the Timeout this endpoint
+    /// advertised in its GOAWAY has elapsed without the peer closing.
+    ///
+    /// draft-ietf-moq-transport-19 §3.5 defines `GOAWAY_TIMEOUT` as the peer
+    /// taking too long to close in response to a GOAWAY, and §3.6 has the
+    /// sender close with it once the indicated Timeout passes. Neither keys the
+    /// close on open requests, so a control-plane-only session that never
+    /// opened a request stream is closed too. `has_open_requests` only selects
+    /// the close reason.
+    ///
+    /// Returns whether the session was closed. Only a sent GOAWAY sets a
+    /// deadline, and one carrying `Timeout=0` sets none, so this is always
+    /// false before sending or for a zero Timeout.
     pub fn enforce_control_goaway_timeout(&self, now: Instant, has_open_requests: bool) -> bool {
-        if has_open_requests && self.control_goaway.timeout_expired(now) {
-            self.session.close(
-                crate::profile::draft19::SessionErrorCode::GoAwayTimeout as u32,
-                "GOAWAY timeout elapsed with open requests",
-            );
-            return true;
+        if !self.control_goaway.timeout_expired(now) {
+            return false;
         }
-        false
-    }
-
-    /// Close the session because the peer did not close it within the Timeout
-    /// this endpoint advertised in its GOAWAY.
-    ///
-    /// draft-ietf-moq-transport-19 §3.6 states two separate obligations for a
-    /// GOAWAY sender. [`Self::enforce_control_goaway_timeout`] covers the one
-    /// conditioned on still-open subscriptions. This covers the other: the
-    /// sender closes with `GOAWAY_TIMEOUT` if the peer does not close within
-    /// the indicated Timeout, whether or not any request stream was ever
-    /// opened. A control-plane-only session needs this arm, since it never
-    /// opens a request stream and would otherwise linger forever.
-    ///
-    /// Returns whether the session was closed. A GOAWAY carrying `Timeout=0`
-    /// sets no deadline, so this is always false for one.
-    pub fn close_on_goaway_timeout(&self, now: Instant) -> bool {
-        if self.control_goaway.sent() && self.control_goaway.timeout_expired(now) {
-            self.session.close(
-                crate::profile::draft19::SessionErrorCode::GoAwayTimeout as u32,
-                "GOAWAY timeout elapsed without peer close",
-            );
-            return true;
-        }
-        false
+        let reason = if has_open_requests {
+            "GOAWAY timeout elapsed with open requests"
+        } else {
+            "GOAWAY timeout elapsed without peer close"
+        };
+        self.session.close(
+            crate::profile::draft19::SessionErrorCode::GoAwayTimeout as u32,
+            reason,
+        );
+        true
     }
 
     pub fn close_after_goaway(&self) -> Result<(), Draft19SessionError> {

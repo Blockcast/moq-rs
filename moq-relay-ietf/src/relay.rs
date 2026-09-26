@@ -629,7 +629,8 @@ pub async fn serve_draft19_control_plane(
     match outcome {
         Ok(err) => tracing::info!(error = %err, "draft-19 session closed after GOAWAY"),
         Err(_elapsed) => {
-            if session.close_on_goaway_timeout(Instant::now()) {
+            // A control-plane-only session never opens a request stream.
+            if session.enforce_control_goaway_timeout(Instant::now(), false) {
                 metrics::counter!("moq_relay_draft19_goaway_timeout_total").increment(1);
                 tracing::warn!(
                     timeout_ms = drain.timeout_ms,

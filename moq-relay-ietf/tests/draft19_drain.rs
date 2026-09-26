@@ -5,8 +5,10 @@
 //!
 //! These exercise the relay's own serve path ([`serve_draft19_control_plane`])
 //! rather than an in-process session pair, so the GOAWAY a client observes here
-//! is the one the relay binary emits.
+//! is the one the relay binary emits. The binary's shutdown-signal handling is
+//! driven through the built executable itself.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use moq_native_ietf::quic::{Config, Endpoint};
@@ -26,11 +28,8 @@ const TIMEOUT_MS: u64 = 400;
 /// `SessionErrorCode::GoAwayTimeout`, as the client sees it on the close.
 const GOAWAY_TIMEOUT_CODE: u32 = 0x10;
 
-/// Self-signed TLS for localhost, written to disk so `tls::Args` can load it.
-///
-/// Going through `tls::Args` rather than building a `rustls::ServerConfig` by
-/// hand keeps `rcgen` the only dev-dependency this test needs.
-fn tls_config(tag: &str) -> tls::Config {
+/// Self-signed TLS for localhost, written to disk as `(cert, key)` paths.
+fn tls_files(tag: &str) -> (PathBuf, PathBuf) {
     let dir =
         std::env::temp_dir().join(format!("moq-draft19-drain-{}-{}", std::process::id(), tag));
     std::fs::create_dir_all(&dir).expect("temp dir is creatable");
@@ -42,6 +41,15 @@ fn tls_config(tag: &str) -> tls::Config {
     std::fs::write(&cert_path, certified.cert.pem()).expect("cert is writable");
     std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("key is writable");
 
+    (cert_path, key_path)
+}
+
+/// Self-signed TLS for localhost, loaded through `tls::Args`.
+///
+/// Going through `tls::Args` rather than building a `rustls::ServerConfig` by
+/// hand keeps `rcgen` the only dev-dependency this test needs.
+fn tls_config(tag: &str) -> tls::Config {
+    let (cert_path, key_path) = tls_files(tag);
     tls::Args {
         cert: vec![cert_path],
         key: vec![key_path],
@@ -207,6 +215,10 @@ async fn goaway_timeout_closes_the_session_with_no_open_requests() {
     )
     .await;
 
+    // Start the clock before the drain, not on GOAWAY receipt. The relay times
+    // its deadline from sending the GOAWAY, which is after this point but ahead
+    // of the client decoding it, so only this start is a sound lower bound.
+    let started = Instant::now();
     signal.cancel();
     let goaway = tokio::time::timeout(Duration::from_secs(10), await_goaway(&mut session))
         .await
@@ -214,9 +226,8 @@ async fn goaway_timeout_closes_the_session_with_no_open_requests() {
     assert_eq!(goaway.timeout_ms, TIMEOUT_MS);
 
     // Deliberately do not close. This session never opened a request stream, so
-    // the relay has to be enforcing the second arm of draft-19 section 3.6
-    // rather than the open-subscriptions one.
-    let started = Instant::now();
+    // this pins that the relay enforces the Timeout whether or not any request
+    // is open, as draft-19 sections 3.5 and 3.6 key it to the peer alone.
     let error = tokio::time::timeout(Duration::from_secs(10), raw.closed())
         .await
         .expect("relay closes the idle session rather than lingering");
@@ -240,4 +251,78 @@ async fn goaway_timeout_closes_the_session_with_no_open_requests() {
         .await
         .expect("serve task finishes after enforcing the timeout")
         .expect("serve task does not panic");
+}
+
+/// Read the relay's log output until a line containing `needle` appears.
+#[cfg(unix)]
+async fn await_log<R>(lines: &mut tokio::io::Lines<R>, needle: &str)
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let wait = async {
+        while let Some(line) = lines.next_line().await.expect("relay log is readable") {
+            if line.contains(needle) {
+                return;
+            }
+        }
+        panic!("relay exited before logging {needle:?}");
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .unwrap_or_else(|_| panic!("relay did not log {needle:?}"));
+}
+
+/// Deliver SIGTERM to the relay process.
+#[cfg(unix)]
+fn sigterm(relay: &tokio::process::Child) {
+    let pid = relay.id().expect("relay is still running").to_string();
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "SIGTERM delivered to the relay");
+}
+
+/// The first SIGTERM starts the drain and the second stops the process.
+///
+/// Installing the tokio signal handlers replaces the default terminate action
+/// for the rest of the process, so a draining relay that ignored the second
+/// signal could only be stopped with SIGKILL.
+#[cfg(unix)]
+#[tokio::test]
+async fn second_shutdown_signal_stops_a_draining_relay() {
+    use tokio::io::AsyncBufReadExt;
+
+    let (cert, key) = tls_files("signals");
+    let coordinator = cert.with_file_name("coordinator.json");
+    let mut relay = tokio::process::Command::new(env!("CARGO_BIN_EXE_moq-relay-ietf"))
+        .arg("--bind=127.0.0.1:0")
+        .arg("--tls-cert")
+        .arg(&cert)
+        .arg("--tls-key")
+        .arg(&key)
+        .arg("--coordinator-file")
+        .arg(&coordinator)
+        .arg(format!("--draft19-goaway-uri={NEW_SESSION_URI}"))
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("relay binary starts");
+    let mut lines =
+        tokio::io::BufReader::new(relay.stdout.take().expect("stdout is piped")).lines();
+
+    // Logged only once the handlers are installed, so SIGTERM is caught from here.
+    await_log(&mut lines, "graceful drain armed").await;
+
+    sigterm(&relay);
+    await_log(&mut lines, "draining draft-19 sessions").await;
+
+    sigterm(&relay);
+    let status = tokio::time::timeout(Duration::from_secs(10), relay.wait())
+        .await
+        .expect("relay exits on the second SIGTERM instead of swallowing it")
+        .expect("relay exit status is readable");
+    assert!(status.success(), "relay stops cleanly, got {status}");
 }
