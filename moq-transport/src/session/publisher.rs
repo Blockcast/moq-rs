@@ -687,7 +687,7 @@ impl Publisher {
             self.outgoing.clone(),
             self.fetches.clone(),
             msg,
-        );
+        )?;
         self.fetches
             .lock()
             .map_err(|_| SessionError::Internal)?
