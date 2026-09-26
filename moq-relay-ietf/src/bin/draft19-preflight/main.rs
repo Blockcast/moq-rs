@@ -24,7 +24,7 @@ use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use moq_native_ietf::{quic, tls};
 use moq_transport::coding::{Encode, SessionUri};
-use moq_transport::profile::draft19::{Frame, GoAway, Setup};
+use moq_transport::profile::draft19::{Frame, GoAway, Setup, SETUP_TYPE};
 use moq_transport::profile::WireProfile;
 use moq_transport::session::{Draft19Session, Draft19SessionRole};
 use serde::Serialize;
@@ -47,7 +47,9 @@ const OFFERED: [WireProfile; 2] = [WireProfile::Draft16, WireProfile::Draft19];
 enum Role {
     /// `moq-pub-mmtp --wire-profile draft19`: the draft-19 client side.
     Publisher,
-    /// `moq-relay-ietf --wire-profile draft19 --node <self>`: origin-advertising relay.
+    /// `moq-relay-ietf --wire-profile draft19 --node <self>`: the relay as it
+    /// is launched to advertise itself as an origin. `--node` reaches no code
+    /// the draft-19 accept path runs, so see `path_equivalent_to`.
     RelayRoot,
     /// `moq-relay-ietf --wire-profile draft19`: coordinator-consuming relay.
     RelayLeaf,
@@ -83,6 +85,23 @@ impl Role {
         match self {
             Self::Publisher => "relay_to_publisher",
             Self::RelayRoot | Self::RelayLeaf => "relay_to_subscriber",
+        }
+    }
+
+    /// The role whose draft-19 negotiation this row duplicates, if any.
+    ///
+    /// The two relay rows observe one identical negotiation, not two. The only
+    /// flag separating them is `--node`, and `RelayConfig.node` is written at
+    /// `moq-relay-ietf/src/bin/moq-relay-ietf/main.rs:223` and never read
+    /// anywhere in the crate; the value the capture passes also recomputes the
+    /// byte-identical `relay_url` that the `None` fallback already produces.
+    /// Recording that inside the digest is what stops a consumer counting them
+    /// as two independent attestations.
+    const fn path_equivalent_to(self) -> Option<&'static str> {
+        match self {
+            Self::Publisher => None,
+            Self::RelayRoot => Some("relay-leaf"),
+            Self::RelayLeaf => Some("relay-root"),
         }
     }
 }
@@ -124,11 +143,17 @@ struct Cli {
 /// The digest-covered subset: everything a third party can recompute offline
 /// from this repository at `source_commit`. Capture timestamps and workflow
 /// coordinates are provenance, not payload, so they stay outside the digest.
+///
+/// `attests` states the consequence of that split in the artifact itself,
+/// because it is not the one a reader expects: every other field here is a
+/// constant, an enum-derived string, or a deterministic function of those, so
+/// the digest is an encoding fingerprint rather than a build fingerprint.
 #[derive(Serialize)]
 struct CanonicalPayload {
     role: String,
     binary: String,
     session_role: String,
+    path_equivalent_to: Option<&'static str>,
     offered_versions: Vec<String>,
     selected_version: String,
     setup_type: String,
@@ -136,6 +161,7 @@ struct CanonicalPayload {
     goaway_uri: String,
     goaway_timeout_ms: String,
     goaway_hex: String,
+    attests: &'static str,
 }
 
 #[derive(Serialize)]
@@ -295,9 +321,10 @@ async fn main() -> anyhow::Result<()> {
 
     let offered: Vec<String> = OFFERED.iter().map(|p| p.name().to_string()).collect();
     let selected_version = selected.name().to_string();
-    // Draft-19 SETUP is 0x2f00, not draft-16's 0x20. Pinning it here is what
-    // makes "selected moqt-19" a framing claim and not just an ALPN string.
-    let setup_type = "0x2f00".to_string();
+    // Draft-19 SETUP is 0x2f00, not draft-16's 0x20. Rendered from the constant
+    // the framing code itself encodes with, so the artifact cannot keep
+    // asserting a type the wire profile has moved away from.
+    let setup_type = format!("{SETUP_TYPE:#06x}");
     let goaway_hex = encode_hex(&wire);
     let timeout_ms = goaway.timeout_ms.to_string();
 
@@ -338,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
             role: cli.role.name().to_string(),
             binary: cli.role.binary().to_string(),
             session_role: cli.role.session_role().to_string(),
+            path_equivalent_to: cli.role.path_equivalent_to(),
             offered_versions: offered,
             selected_version,
             setup_type,
@@ -345,6 +373,17 @@ async fn main() -> anyhow::Result<()> {
             goaway_uri: goaway.new_session_uri.0,
             goaway_timeout_ms: timeout_ms,
             goaway_hex,
+            attests: "The draft-19 constants this repository encodes with at \
+                      source_commit, and the GOAWAY bytes this capture wrote \
+                      and read back over a real QUIC control stream. It does \
+                      not cover the shipped binaries: their own negotiation is \
+                      quoted in handshake.binary_evidence, which is outside \
+                      this digest because the log line carries a timestamp, a \
+                      temporary directory and an ephemeral port. Two commits \
+                      therefore share this digest unless the GOAWAY encoder or \
+                      a profile constant changes. Authenticity of the shipped \
+                      binary half rests on the workflow run and the artifact \
+                      digest, not on this sha256.",
         },
         canonical_encoding: "UTF-8 JSON with ordered keys and one trailing LF",
     };

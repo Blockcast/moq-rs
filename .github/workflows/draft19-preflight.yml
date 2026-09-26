@@ -66,7 +66,10 @@ jobs:
           if [ "$EVENT_NAME" = "pull_request" ]; then
             source_commit="$PR_HEAD_SHA"
           elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            test -n "$PR_NUMBER"
+            if [ -z "${PR_NUMBER:-}" ]; then
+              echo "::error::workflow_dispatch needs the pr_number input to resolve a head commit." >&2
+              exit 1
+            fi
             pr_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
             # Fork guard: never check out fork code on self-hosted runners.
             test "$(jq -r '.head.repo.full_name' <<<"$pr_json")" = "$REPO"
@@ -132,6 +135,7 @@ jobs:
           test "$(jq -r '.source.source_commit' "$ARTIFACT")" = "$MOQ_RS_SOURCE_COMMIT"
           test "$(jq -r '.role' "$ARTIFACT")" = "$ROLE"
           test "$(jq -r '.handshake.selected_version' "$ARTIFACT")" = "moqt-19"
+          test "$(jq -r '.handshake.setup_type' "$ARTIFACT")" = "0x2f00"
           test "$(jq -r '.goaway.decoded_uri' "$ARTIFACT")" = "moqt://next.example"
           test "$(jq -r '.goaway.decoded_timeout_ms' "$ARTIFACT")" = "250"
           # The digest a consumer recomputes offline must match the one shipped.

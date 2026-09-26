@@ -51,9 +51,11 @@ PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));prin
 RELAY_URL="https://127.0.0.1:$PORT"
 
 # Root advertises itself as an origin to the coordinator; leaf only consumes
-# the coordinator. Both run the identical draft-19 accept path, because
-# `serve_draft19_control_plane` runs before any scope or coordinator lookup --
-# the artifact says so rather than implying two different negotiations.
+# the coordinator. Both runs are the same observation: `serve_draft19_control_plane`
+# runs before any scope or coordinator lookup, `RelayConfig.node` is written and
+# never read, and the `--node` value below recomputes the byte-identical
+# `relay_url` the `None` fallback already produces. The artifact records that in
+# the digest-covered `canonical_payload.path_equivalent_to`.
 RELAY_ARGS=(--bind "127.0.0.1:$PORT" --wire-profile draft19
             --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" --tls-disable-verify
             --coordinator-file "$WORK/coordinator-$ROLE.json")
@@ -77,12 +79,15 @@ PUB_ARGS=("$RELAY_URL" --name draft19-preflight --catalog-json "$WORK/catalog.js
 # then refuses to put draft-16 MMTP bytes on a moqt-19 connection.
 RUST_LOG=info "$BIN_DIR/moq-pub-mmtp" "${PUB_ARGS[@]}" >"$WORK/pub.log" 2>&1 || true
 
-grep -q "negotiated moqt-19, but MMTP publish is draft-16 only" "$WORK/pub.log" || {
+# Strip ANSI styling so every check below reads the log line, not its colouring.
+# `grep -q` would exit early and SIGPIPE the sed, which `set -o pipefail` would
+# then report as a failed check, so these greps discard stdout instead.
+strip_ansi() { sed -r 's/\x1b\[[0-9;]*m//g'; }
+
+strip_ansi <"$WORK/pub.log" | grep -F "negotiated moqt-19, but MMTP publish is draft-16 only" >/dev/null || {
   cat "$WORK/pub.log" >&2; echo "publisher did not report a moqt-19 negotiation" >&2; exit 1
 }
 
-# Strip ANSI styling so the quoted evidence is the log line, not its colouring.
-strip_ansi() { sed -r 's/\x1b\[[0-9;]*m//g'; }
 if [ "$ROLE" = "publisher" ]; then
   EVIDENCE="$(strip_ansi <"$WORK/pub.log" | grep -F 'draft-19 session established; MMTP publish over draft-19 is not implemented' | tail -1)"
   INVOCATION="moq-pub-mmtp ${PUB_ARGS[*]}"

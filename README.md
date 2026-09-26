@@ -72,6 +72,19 @@ The GOAWAY half is a session-level capture, not an observed relay drain: no
 shipped binary emits a draft-19 GOAWAY today. Every artifact says so in
 `goaway.caveat` -- do not quote one as evidence of graceful relay drain.
 
+The `sha256` covers `canonical_payload` only, and every field in it is a
+constant, an enum-derived string, or a deterministic function of those. It is
+an encoding fingerprint, not a build fingerprint: the shipped binaries' own
+`selected_version=moqt-19` line lives in `handshake.binary_evidence`, outside
+the digest. Pin the digest to detect a changed profile constant or GOAWAY
+encoding; cite the workflow run and artifact digest to attest the binaries.
+`canonical_payload.attests` states the same split inside the artifact.
+
+`relay-root` and `relay-leaf` are one observation recorded twice, not two
+independent negotiations: `--node` is the only flag between them and it reaches
+no code the draft-19 accept path runs. Each row names the other in
+`canonical_payload.path_equivalent_to`; do not count them as two.
+
 The `Draft-19 preflight attestation` workflow publishes one artifact per role.
 `Blockcast/pim-multicast-gateway` pins them by source commit, workflow run,
 artifact digest, and canonical payload digest.
