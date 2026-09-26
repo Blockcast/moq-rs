@@ -90,6 +90,12 @@ impl Writer {
         Ok(())
     }
 
+    /// Set the stream's send order, as computed by [`super::send_order`].
+    /// Quinn transmits data of higher-order streams first.
+    pub(super) fn set_priority(&mut self, order: i32) {
+        self.stream.set_priority(order);
+    }
+
     pub(crate) fn finish(&mut self) -> Result<(), SessionError> {
         self.stream.finish()?;
         Ok(())
