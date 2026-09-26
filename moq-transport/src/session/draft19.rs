@@ -204,6 +204,30 @@ impl Draft19Session {
         false
     }
 
+    /// Close the session because the peer did not close it within the Timeout
+    /// this endpoint advertised in its GOAWAY.
+    ///
+    /// draft-ietf-moq-transport-19 §3.6 states two separate obligations for a
+    /// GOAWAY sender. [`Self::enforce_control_goaway_timeout`] covers the one
+    /// conditioned on still-open subscriptions. This covers the other: the
+    /// sender closes with `GOAWAY_TIMEOUT` if the peer does not close within
+    /// the indicated Timeout, whether or not any request stream was ever
+    /// opened. A control-plane-only session needs this arm, since it never
+    /// opens a request stream and would otherwise linger forever.
+    ///
+    /// Returns whether the session was closed. A GOAWAY carrying `Timeout=0`
+    /// sets no deadline, so this is always false for one.
+    pub fn close_on_goaway_timeout(&self, now: Instant) -> bool {
+        if self.control_goaway.sent() && self.control_goaway.timeout_expired(now) {
+            self.session.close(
+                crate::profile::draft19::SessionErrorCode::GoAwayTimeout as u32,
+                "GOAWAY timeout elapsed without peer close",
+            );
+            return true;
+        }
+        false
+    }
+
     pub fn close_after_goaway(&self) -> Result<(), Draft19SessionError> {
         if !self.control_goaway.active() {
             return Err(StreamProtocolError::InvalidTransition.into());

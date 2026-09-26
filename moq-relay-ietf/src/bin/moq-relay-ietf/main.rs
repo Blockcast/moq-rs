@@ -13,7 +13,27 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
+use moq_relay_ietf::{
+    Coordinator, Draft19Drain, Relay, RelayConfig, SessionConfig, Web, WebConfig,
+};
+use tokio_util::sync::CancellationToken;
+
+/// Resolve on SIGINT, or on SIGTERM where the platform has it.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WireProfileArg {
@@ -115,6 +135,26 @@ pub struct Cli {
     /// When set, serves metrics at http://<addr>/metrics
     #[arg(long)]
     pub metrics_addr: Option<net::SocketAddr>,
+
+    /// Redirect draining draft-19 sessions to this URL.
+    ///
+    /// Setting it enables the draft-19 graceful drain: on SIGINT/SIGTERM the
+    /// relay sends every draft-19 session a GOAWAY carrying this New Session
+    /// URI, and redirects new draft-19 sessions the same way instead of
+    /// serving them. Draft-16 sessions are unaffected.
+    ///
+    /// The process keeps running so sessions can drain; the supervisor is
+    /// expected to stop it once the grace period is over.
+    #[arg(long)]
+    pub draft19_goaway_uri: Option<Url>,
+
+    /// Milliseconds advertised in the draft-19 GOAWAY Timeout.
+    ///
+    /// Once it elapses with the peer still connected, the relay closes that
+    /// session with GOAWAY_TIMEOUT (0x10). Zero advertises no deadline and
+    /// waits for the peer instead. Only used with --draft19-goaway-uri.
+    #[arg(long, default_value_t = 30_000)]
+    pub draft19_goaway_timeout_ms: u64,
 }
 
 #[tokio::main]
@@ -214,6 +254,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
+    let draft19_drain = cli.draft19_goaway_uri.clone().map(|uri| Draft19Drain {
+        new_session_uri: uri,
+        timeout_ms: cli.draft19_goaway_timeout_ms,
+        signal: CancellationToken::new(),
+    });
+
     let relay = Relay::new(RelayConfig {
         tls: tls.clone(),
         bind: None,
@@ -233,7 +279,25 @@ async fn main() -> anyhow::Result<()> {
         // connection as a public client. Embedders that run relay-to-relay
         // meshes supply a tagger to mark internal peers.
         connection_tagger: None,
+        draft19_drain: draft19_drain.clone(),
     })?;
+
+    // Start the draft-19 drain on shutdown signals, when one is configured.
+    if let Some(drain) = draft19_drain {
+        tracing::info!(
+            new_session_uri = %drain.new_session_uri,
+            timeout_ms = drain.timeout_ms,
+            "draft-19 graceful drain armed: SIGINT/SIGTERM sends GOAWAY"
+        );
+        tokio::spawn(async move {
+            if let Err(err) = shutdown_signal().await {
+                tracing::warn!(error = %err, "failed to watch for shutdown signals");
+                return;
+            }
+            tracing::info!("shutdown signal received: draining draft-19 sessions");
+            drain.signal.cancel();
+        });
+    }
 
     if cli.dev {
         // Create a web server too.

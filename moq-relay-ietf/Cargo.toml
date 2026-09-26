@@ -73,3 +73,7 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 [features]
 default = []
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
+
+[dev-dependencies]
+# Self-signed localhost certs for the draft-19 drain integration test.
+rcgen = "0.13"
