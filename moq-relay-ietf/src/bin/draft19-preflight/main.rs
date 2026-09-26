@@ -383,9 +383,18 @@ async fn main() -> anyhow::Result<()> {
                       therefore share this digest unless the GOAWAY encoder or \
                       a profile constant changes. Authenticity of the shipped \
                       binary half rests on the workflow run and the artifact \
-                      digest, not on this sha256.",
+                      digest, not on this sha256. The byte encoding to \
+                      recompute this digest over is named in \
+                      canonical_encoding, one level up, which is outside the \
+                      digest because it describes it.",
         },
-        canonical_encoding: "UTF-8 JSON with ordered keys and one trailing LF",
+        // Names the serialization, not just the charset: the artifact ships
+        // this payload pretty-printed, so digesting the bytes as they appear
+        // gives a different answer than the shipped sha256.
+        canonical_encoding: "UTF-8 JSON, compact (no insignificant whitespace), \
+                             keys in the order emitted here, one trailing LF. \
+                             Recompute with: \
+                             jq -c '.canonical_payload' <artifact> | sha256sum",
     };
 
     if let Some(parent) = cli.output.parent() {

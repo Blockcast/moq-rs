@@ -146,6 +146,10 @@ jobs:
             *) echo "unknown role $ROLE" >&2; exit 1 ;;
           esac
           test "$(jq -r '.canonical_payload.path_equivalent_to' "$ARTIFACT")" = "$expect_equiv"
+          # `jq -r` prints `null` for an absent field as well as a present-null
+          # one, so the publisher row above passes if the field is dropped
+          # entirely. Check presence separately from value.
+          test "$(jq -r '.canonical_payload | has("path_equivalent_to")' "$ARTIFACT")" = true
           test "$(jq -r '.goaway.decoded_uri' "$ARTIFACT")" = "moqt://next.example"
           test "$(jq -r '.goaway.decoded_timeout_ms' "$ARTIFACT")" = "250"
           # The digest a consumer recomputes offline must match the one shipped.
