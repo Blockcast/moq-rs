@@ -17,7 +17,7 @@ use bytes::Bytes;
 use crate::data::ObjectStatus;
 use crate::watch::State;
 
-use super::{ServeError, Track};
+use super::{ServeError, Track, TrackTapEvent, TrackTaps};
 
 pub struct Subgroups {
     pub track: Arc<Track>,
@@ -74,6 +74,7 @@ pub struct SubgroupsWriter {
     // older groups are pruned on create(). None = retain unbounded (matching the
     // object-level stream). Live publishers MUST set this to bound memory.
     history_window_groups: Option<NonZeroU64>,
+    pub(super) taps: TrackTaps,
 }
 
 impl SubgroupsWriter {
@@ -86,7 +87,12 @@ impl SubgroupsWriter {
             last_group_id: 0,
             newest_group_id: None,
             history_window_groups: None,
+            taps: TrackTaps::default(),
         }
+    }
+
+    pub(super) fn set_taps(&mut self, taps: TrackTaps) {
+        self.taps = taps;
     }
 
     /// Bound retained subgroup history to the most recent `groups` group ids.
@@ -153,6 +159,9 @@ impl SubgroupsWriter {
         {
             return Err(ServeError::Duplicate);
         }
+        // Taps see every subgroup, whether or not it stays in the history
+        // window long enough for a reader to reach it.
+        self.taps.emit(|| TrackTapEvent::Subgroup(reader.clone()));
         self.next_subgroup_id = writer.subgroup_id.saturating_add(1);
         self.next_group_id = writer.group_id.saturating_add(1);
         self.last_group_id = writer.group_id;
