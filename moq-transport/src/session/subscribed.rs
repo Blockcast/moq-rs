@@ -16,7 +16,9 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{DeliveryFilter, Publisher, SessionError, SessionId, SubscribeInfo, Writer};
+use super::{
+    send_order, DeliveryFilter, Publisher, SessionError, SessionId, SubscribeInfo, Writer,
+};
 
 // This file defines Publisher handling of inbound Subscriptions
 
@@ -74,6 +76,9 @@ pub(super) struct ObjectForwarder {
     publisher: Publisher,
     state: State<ObjectForwarderState>,
     track_alias: u64,
+    /// Subscriber Priority of the request being served (draft-16 §7.1). Every
+    /// subgroup stream of the subscription is scheduled under it first.
+    subscriber_priority: u8,
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
 
@@ -81,6 +86,7 @@ impl ObjectForwarder {
     pub(super) fn new(
         publisher: Publisher,
         track_alias: u64,
+        subscriber_priority: u8,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> (Self, ObjectForwarderRecv) {
         let (send, recv) = State::default().split();
@@ -88,6 +94,7 @@ impl ObjectForwarder {
             publisher,
             state: send,
             track_alias,
+            subscriber_priority,
             mlog,
         };
         let recv = ObjectForwarderRecv { state: recv };
@@ -356,7 +363,8 @@ impl Subscribed {
     ) -> Result<(Self, ObjectForwarderRecv), SessionError> {
         let info = SubscribeInfo::new_from_subscribe(&msg)?;
         let track_alias = info.id;
-        let (forwarder, recv) = ObjectForwarder::new(publisher, track_alias, mlog);
+        let (forwarder, recv) =
+            ObjectForwarder::new(publisher, track_alias, info.subscriber_priority, mlog);
         let send = Self {
             info,
             forwarder,
@@ -518,9 +526,10 @@ impl ObjectForwarder {
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
                         let session_id = self.publisher.session_id().clone();
+                        let send_order = send_order(self.subscriber_priority, subgroup.priority);
 
                         tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
+                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter, send_order).await {
                                 if Subscribed::is_expected_serve_shutdown(&err) {
                                     tracing::debug!(session_id = %session_id, subgroup_info = ?info, error = %err, "stopped serving subgroup");
                                 } else {
@@ -546,6 +555,7 @@ impl ObjectForwarder {
         state: State<ObjectForwarderState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
+        send_order: i32,
     ) -> Result<(), SessionError> {
         tracing::trace!(
             "[PUBLISHER] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
@@ -568,8 +578,9 @@ impl ObjectForwarder {
             .ok_or(ServeError::Done)?
             .record_stream_opened();
 
-        // TODO figure out u32 vs u64 priority
-        send_stream.set_priority(subgroup_reader.priority as i32);
+        // Draft-16 §7.2 order (Subscriber Priority, then Publisher Priority),
+        // inverted into quinn's higher-is-sent-first scale.
+        send_stream.set_priority(send_order);
 
         let mut output =
             SubgroupOutput::stream(Writer::new(publisher.session_id().clone(), send_stream));

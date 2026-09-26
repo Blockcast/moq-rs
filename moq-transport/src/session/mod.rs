@@ -4,6 +4,7 @@
 
 mod error;
 mod pending_requests;
+mod priority;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -22,6 +23,8 @@ mod writer;
 
 pub use error::*;
 pub(crate) use pending_requests::{PendingRequest, PendingRequests, PendingResponse};
+pub(crate) use priority::send_order;
+pub use priority::DEFAULT_SUBSCRIBER_PRIORITY;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
