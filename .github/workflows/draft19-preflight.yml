@@ -136,6 +136,16 @@ jobs:
           test "$(jq -r '.role' "$ARTIFACT")" = "$ROLE"
           test "$(jq -r '.handshake.selected_version' "$ARTIFACT")" = "moqt-19"
           test "$(jq -r '.handshake.setup_type' "$ARTIFACT")" = "0x2f00"
+          # The relay rows record one negotiation observed twice, so each must
+          # name its counterpart. Recomputing the digest cannot check this: it
+          # reads the same field back out of the same file.
+          case "$ROLE" in
+            publisher)  expect_equiv=null ;;
+            relay-root) expect_equiv=relay-leaf ;;
+            relay-leaf) expect_equiv=relay-root ;;
+            *) echo "unknown role $ROLE" >&2; exit 1 ;;
+          esac
+          test "$(jq -r '.canonical_payload.path_equivalent_to' "$ARTIFACT")" = "$expect_equiv"
           test "$(jq -r '.goaway.decoded_uri' "$ARTIFACT")" = "moqt://next.example"
           test "$(jq -r '.goaway.decoded_timeout_ms' "$ARTIFACT")" = "250"
           # The digest a consumer recomputes offline must match the one shipped.

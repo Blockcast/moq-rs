@@ -63,15 +63,22 @@ if [ "$ROLE" = "relay-root" ]; then
   RELAY_ARGS+=(--node "$RELAY_URL")
 fi
 
+# Strip ANSI styling so every log check reads the line, not its colouring.
+# `grep -q` would exit early and SIGPIPE the sed, which `set -o pipefail` would
+# then report as a failed check, so these greps discard stdout instead.
+strip_ansi() { sed -r 's/\x1b\[[0-9;]*m//g'; }
+
 RUST_LOG=info "$BIN_DIR/moq-relay-ietf" "${RELAY_ARGS[@]}" >"$WORK/relay.log" 2>&1 &
 RELAY_PID=$!
 
+relay_listening() { strip_ansi <"$WORK/relay.log" | grep -F "listening on 127.0.0.1:$PORT" >/dev/null; }
+
 for _ in $(seq 1 60); do
-  grep -q "listening on 127.0.0.1:$PORT" "$WORK/relay.log" && break
+  relay_listening && break
   kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.log" >&2; echo "relay exited early" >&2; exit 1; }
   sleep 0.5
 done
-grep -q "listening on 127.0.0.1:$PORT" "$WORK/relay.log" || { cat "$WORK/relay.log" >&2; echo "relay never listened" >&2; exit 1; }
+relay_listening || { cat "$WORK/relay.log" >&2; echo "relay never listened" >&2; exit 1; }
 
 PUB_ARGS=("$RELAY_URL" --name draft19-preflight --catalog-json "$WORK/catalog.json"
           --wire-profile draft19 --tls-disable-verify)
@@ -79,20 +86,18 @@ PUB_ARGS=("$RELAY_URL" --name draft19-preflight --catalog-json "$WORK/catalog.js
 # then refuses to put draft-16 MMTP bytes on a moqt-19 connection.
 RUST_LOG=info "$BIN_DIR/moq-pub-mmtp" "${PUB_ARGS[@]}" >"$WORK/pub.log" 2>&1 || true
 
-# Strip ANSI styling so every check below reads the log line, not its colouring.
-# `grep -q` would exit early and SIGPIPE the sed, which `set -o pipefail` would
-# then report as a failed check, so these greps discard stdout instead.
-strip_ansi() { sed -r 's/\x1b\[[0-9;]*m//g'; }
-
 strip_ansi <"$WORK/pub.log" | grep -F "negotiated moqt-19, but MMTP publish is draft-16 only" >/dev/null || {
   cat "$WORK/pub.log" >&2; echo "publisher did not report a moqt-19 negotiation" >&2; exit 1
 }
 
+# `|| true` is load-bearing: under `set -o pipefail` a grep that matches nothing
+# makes the whole pipeline exit 1, which `set -e` turns into a bare exit before
+# the named diagnostic below can run.
 if [ "$ROLE" = "publisher" ]; then
-  EVIDENCE="$(strip_ansi <"$WORK/pub.log" | grep -F 'draft-19 session established; MMTP publish over draft-19 is not implemented' | tail -1)"
+  EVIDENCE="$(strip_ansi <"$WORK/pub.log" | grep -F 'draft-19 session established; MMTP publish over draft-19 is not implemented' | tail -1)" || true
   INVOCATION="moq-pub-mmtp ${PUB_ARGS[*]}"
 else
-  EVIDENCE="$(strip_ansi <"$WORK/relay.log" | grep -F 'draft-19 session established: control plane only' | tail -1)"
+  EVIDENCE="$(strip_ansi <"$WORK/relay.log" | grep -F 'draft-19 session established: control plane only' | tail -1)" || true
   INVOCATION="moq-relay-ietf ${RELAY_ARGS[*]}"
 fi
 [ -n "$EVIDENCE" ] || { echo "no draft-19 establishment line for role $ROLE" >&2; exit 1; }
