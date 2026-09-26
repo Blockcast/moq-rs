@@ -16,7 +16,7 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
+use super::{send_order, DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
 
 // This file defines Publisher handling of inbound Subscriptions
 
@@ -110,18 +110,17 @@ pub(super) struct ObjectForwarder {
     publisher: Publisher,
     state: State<ObjectForwarderState>,
     track_alias: u64,
+    /// Subscriber Priority of the request being served (draft-16 §7.1). Every
+    /// subgroup stream of the subscription is scheduled under it first.
+    subscriber_priority: u8,
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
 
 impl ObjectForwarder {
-    fn quinn_priority(moq_priority: u8) -> i32 {
-        // MoQT sends smaller priorities first; Quinn sends larger priorities first.
-        -i32::from(moq_priority)
-    }
-
     pub(super) fn new(
         publisher: Publisher,
         track_alias: u64,
+        subscriber_priority: u8,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> (Self, ObjectForwarderRecv) {
         let (send, recv) = State::default().split();
@@ -129,6 +128,7 @@ impl ObjectForwarder {
             publisher,
             state: send,
             track_alias,
+            subscriber_priority,
             mlog,
         };
         let recv = ObjectForwarderRecv { state: recv };
@@ -247,7 +247,8 @@ impl Subscribed {
     ) -> Result<(Self, ObjectForwarderRecv), SessionError> {
         let info = SubscribeInfo::new_from_subscribe(&msg)?;
         let track_alias = info.id;
-        let (forwarder, recv) = ObjectForwarder::new(publisher, track_alias, mlog);
+        let (forwarder, recv) =
+            ObjectForwarder::new(publisher, track_alias, info.subscriber_priority, mlog);
         let send = Self {
             info,
             forwarder,
@@ -406,9 +407,10 @@ impl ObjectForwarder {
                         let state = self.state.clone();
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
+                        let send_order = send_order(self.subscriber_priority, subgroup.priority);
 
                         tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
+                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter, send_order).await {
                                 if Subscribed::is_expected_serve_shutdown(&err) {
                                     tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
                                 } else {
@@ -434,6 +436,7 @@ impl ObjectForwarder {
         state: State<ObjectForwarderState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
+        send_order: i32,
     ) -> Result<(), SessionError> {
         tracing::trace!(
             "[PUBLISHER] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
@@ -456,7 +459,9 @@ impl ObjectForwarder {
             .ok_or(ServeError::Done)?
             .record_stream_opened();
 
-        send_stream.set_priority(Self::quinn_priority(subgroup_reader.priority));
+        // Draft-16 §7.2 order (Subscriber Priority, then Publisher Priority),
+        // inverted into quinn's higher-is-sent-first scale.
+        send_stream.set_priority(send_order);
 
         let mut output = SubgroupOutput::Stream(Writer::new(send_stream));
         Self::serve_subgroup_objects(
@@ -966,27 +971,6 @@ mod tests {
             let params = subscribe_ok_params(profile, None, None)
                 .expect("generic profiles retain absent-window behavior");
             assert!(params.get(SUBGROUP_HISTORY_GROUPS_PARAM).is_none());
-        }
-    }
-
-    #[test]
-    fn quinn_priority_schedules_source_before_repair() {
-        let source = ObjectForwarder::quinn_priority(128);
-        let repair = ObjectForwarder::quinn_priority(240);
-
-        assert!(source > repair, "Quinn sends larger priorities first");
-    }
-
-    #[test]
-    fn quinn_priority_reverses_the_full_moq_range() {
-        assert_eq!(ObjectForwarder::quinn_priority(0), 0);
-        assert_eq!(ObjectForwarder::quinn_priority(u8::MAX), -255);
-
-        for priority in 0..u8::MAX {
-            assert!(
-                ObjectForwarder::quinn_priority(priority)
-                    > ObjectForwarder::quinn_priority(priority + 1)
-            );
         }
     }
 

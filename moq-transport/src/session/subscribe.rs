@@ -15,6 +15,7 @@ use crate::watch::State;
 
 use super::SessionError;
 use super::Subscriber;
+use super::DEFAULT_SUBSCRIBER_PRIORITY;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -93,7 +94,10 @@ impl SubscribeInfo {
             id: msg.id,
             track_namespace: msg.track_namespace.clone(),
             track_name: msg.track_name.clone(),
-            subscriber_priority: msg.params.subscriber_priority()?.unwrap_or(128),
+            subscriber_priority: msg
+                .params
+                .subscriber_priority()?
+                .unwrap_or(DEFAULT_SUBSCRIBER_PRIORITY),
             group_order: msg.params.group_order()?.unwrap_or(GroupOrder::Publisher),
             forward: msg.params.forward()?.unwrap_or(true),
             filter_type,
@@ -191,7 +195,7 @@ impl Subscribe {
                 id: request_id,
                 track_namespace: track.namespace.clone(),
                 track_name: track.name.clone(),
-                subscriber_priority: 128,
+                subscriber_priority: DEFAULT_SUBSCRIBER_PRIORITY,
                 group_order: GroupOrder::Publisher,
                 forward: true,
                 filter_type: FilterType::AbsoluteStart,
