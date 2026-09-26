@@ -30,6 +30,12 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+# The artifact attests source_commit, so a dirty tree would emit a commit that
+# did not build these binaries. The workflow checks out clean, so this only
+# catches a local run.
+git -C "$REPO_ROOT" diff --quiet HEAD || {
+  echo "working tree is dirty; $SOURCE_COMMIT would not describe these binaries" >&2; exit 1
+}
 BIN_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
 WORK="$(mktemp -d)"
 trap 'kill "${RELAY_PID:-}" 2>/dev/null || true; rm -rf "$WORK"' EXIT
@@ -94,13 +100,31 @@ strip_ansi <"$WORK/pub.log" | grep -F "negotiated moqt-19, but MMTP publish is d
 # makes the whole pipeline exit 1, which `set -e` turns into a bare exit before
 # the named diagnostic below can run.
 if [ "$ROLE" = "publisher" ]; then
-  EVIDENCE="$(strip_ansi <"$WORK/pub.log" | grep -F 'draft-19 session established; MMTP publish over draft-19 is not implemented' | tail -1)" || true
+  # The publisher ran in the foreground, so its log is already complete here.
+  EVIDENCE_LOG="$WORK/pub.log"
+  EVIDENCE="$(strip_ansi <"$EVIDENCE_LOG" | grep -F 'draft-19 session established; MMTP publish over draft-19 is not implemented' | tail -1)" || true
   INVOCATION="moq-pub-mmtp ${PUB_ARGS[*]}"
 else
-  EVIDENCE="$(strip_ansi <"$WORK/relay.log" | grep -F 'draft-19 session established: control plane only' | tail -1)" || true
+  # The relay is still running, and nothing orders its establishment line
+  # against the publisher's exit: each side returns from `establish`
+  # independently, and the publisher logs and then immediately bails, so it can
+  # be gone before the relay task has written its line. Poll on the same budget
+  # as the `listening` wait above rather than reading the log once. Killing the
+  # relay first would not fix this: SIGTERM can land before the relay task
+  # reaches the log call, which loses the line instead of flushing it.
+  EVIDENCE_LOG="$WORK/relay.log"
+  relay_evidence() { strip_ansi <"$EVIDENCE_LOG" | grep -F 'draft-19 session established: control plane only' | tail -1; }
+  for _ in $(seq 1 60); do
+    EVIDENCE="$(relay_evidence)" || true
+    if [ -n "$EVIDENCE" ]; then break; fi
+    sleep 0.5
+  done
   INVOCATION="moq-relay-ietf ${RELAY_ARGS[*]}"
 fi
-[ -n "$EVIDENCE" ] || { echo "no draft-19 establishment line for role $ROLE" >&2; exit 1; }
+[ -n "$EVIDENCE" ] || {
+  cat "$EVIDENCE_LOG" >&2
+  echo "no draft-19 establishment line for role $ROLE" >&2; exit 1
+}
 
 # Fail closed rather than attesting a version the binary did not report.
 case "$EVIDENCE" in

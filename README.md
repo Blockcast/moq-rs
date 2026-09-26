@@ -81,11 +81,13 @@ encoding; cite the workflow run and artifact digest to attest the binaries.
 `canonical_payload.attests` states the same split inside the artifact.
 
 The digest is taken over the payload re-serialized compact, in the emitted key
-order, with one trailing LF. The artifact ships that payload pretty-printed, so
+order, with minimal string escaping (non-ASCII stays raw UTF-8), and one
+trailing LF. The artifact ships that payload pretty-printed, so
 digesting the bytes as they appear gives a different answer. Recompute with
 `jq -c '.canonical_payload' <artifact> | sha256sum`. The artifact's
-`canonical_encoding` field names the same two facts for a consumer that reaches
-for a non-`jq` serializer.
+`canonical_encoding` field names the same facts for a consumer that reaches
+for a non-`jq` serializer. Python's `json.dumps` needs
+`separators=(',', ':')` and `ensure_ascii=False` to match.
 
 `relay-root` and `relay-leaf` are one observation recorded twice, not two
 independent negotiations: `--node` is the only flag between them and it reaches

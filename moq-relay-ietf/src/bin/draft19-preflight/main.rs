@@ -392,8 +392,9 @@ async fn main() -> anyhow::Result<()> {
         // this payload pretty-printed, so digesting the bytes as they appear
         // gives a different answer than the shipped sha256.
         canonical_encoding: "UTF-8 JSON, compact (no insignificant whitespace), \
-                             keys in the order emitted here, one trailing LF. \
-                             Recompute with: \
+                             keys in the order emitted here, minimal string \
+                             escaping with non-ASCII emitted as raw UTF-8, one \
+                             trailing LF. Recompute with: \
                              jq -c '.canonical_payload' <artifact> | sha256sum",
     };
 
