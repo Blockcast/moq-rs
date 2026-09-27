@@ -16,7 +16,9 @@ use crate::{
     watch::State,
 };
 
-use super::{DeliveryFilter, ObjectForwarder, Publisher, SessionError};
+use super::{
+    DeliveryFilter, ObjectForwarder, Publisher, SessionError, DEFAULT_SUBSCRIBER_PRIORITY,
+};
 
 #[derive(Debug, Clone)]
 pub struct PublishedInfo {
@@ -32,6 +34,9 @@ pub struct PublishedInfo {
 pub(crate) struct PublishedState {
     ok: bool,
     forward: bool,
+    /// Subscriber Priority from PUBLISH_OK, or the draft-16 §9.2.2.3 default
+    /// when the parameter is omitted.
+    subscriber_priority: u8,
     unsubscribed: bool,
     closed: Result<(), ServeError>,
 }
@@ -41,6 +46,7 @@ impl PublishedState {
         Self {
             ok: false,
             forward,
+            subscriber_priority: DEFAULT_SUBSCRIBER_PRIORITY,
             unsubscribed: false,
             closed: Ok(()),
         }
@@ -126,7 +132,10 @@ impl Published {
     async fn serve_inner(&mut self) -> Result<(), SessionError> {
         self.ok().await?;
 
-        let forward = self.state.lock().forward;
+        let (forward, subscriber_priority) = {
+            let state = self.state.lock();
+            (state.forward, state.subscriber_priority)
+        };
         if !forward {
             let track = self.track.take().ok_or(SessionError::Internal)?;
             let res = tokio::select! {
@@ -140,8 +149,12 @@ impl Published {
         }
 
         let track = self.track.take().ok_or(SessionError::Internal)?;
-        let (mut forwarder, recv) =
-            ObjectForwarder::new(self.publisher.clone(), self.info.track_alias, None);
+        let (mut forwarder, recv) = ObjectForwarder::new(
+            self.publisher.clone(),
+            self.info.track_alias,
+            subscriber_priority,
+            None,
+        );
         self.publisher
             .register_published_subscription(self.info.id, recv)?;
 
@@ -236,11 +249,18 @@ impl PublishedRecv {
             .params
             .forward()
             .map_err(|_| ServeError::internal_ctx("invalid FORWARD in PUBLISH_OK"))?;
+        let subscriber_priority = msg
+            .params
+            .subscriber_priority()
+            .map_err(|_| ServeError::internal_ctx("invalid SUBSCRIBER_PRIORITY in PUBLISH_OK"))?;
 
         if let Some(mut state) = self.state.lock_mut() {
             state.ok = true;
             if let Some(forward) = forward {
                 state.forward = forward;
+            }
+            if let Some(subscriber_priority) = subscriber_priority {
+                state.subscriber_priority = subscriber_priority;
             }
         }
 
@@ -315,6 +335,44 @@ mod tests {
 
         assert!(!recv.state.lock().forward);
         assert!(recv.state.lock().ok);
+    }
+
+    #[test]
+    fn recv_ok_records_subscriber_priority_when_present() {
+        let (_send, recv_state) = split_published_state(true);
+        let mut recv = PublishedRecv::new(recv_state);
+        let mut params = KeyValuePairs::default();
+        params.set_subscriber_priority(7);
+
+        recv.recv_ok(&message::PublishOk { id: 0, params }).unwrap();
+
+        assert_eq!(recv.state.lock().subscriber_priority, 7);
+    }
+
+    #[test]
+    fn recv_ok_keeps_default_subscriber_priority_when_omitted() {
+        let (_send, recv_state) = split_published_state(true);
+        let mut recv = PublishedRecv::new(recv_state);
+
+        recv.recv_ok(&message::PublishOk {
+            id: 0,
+            params: KeyValuePairs::default(),
+        })
+        .unwrap();
+
+        // draft-16 §9.2.2.3: omitted from PUBLISH_OK means 128.
+        assert_eq!(recv.state.lock().subscriber_priority, 128);
+    }
+
+    #[test]
+    fn recv_ok_rejects_out_of_range_subscriber_priority() {
+        let (_send, recv_state) = split_published_state(true);
+        let mut recv = PublishedRecv::new(recv_state);
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(message::parameter_type::SUBSCRIBER_PRIORITY, 256);
+
+        assert!(recv.recv_ok(&message::PublishOk { id: 0, params }).is_err());
+        assert!(!recv.state.lock().ok);
     }
 
     #[test]

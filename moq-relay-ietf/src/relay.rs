@@ -12,8 +12,8 @@ use url::Url;
 
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
-    metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
-    RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
+    metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, FetchRetention,
+    Locals, Producer, RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
     DEFAULT_CACHE_IDLE_TIMEOUT,
 };
 
@@ -111,8 +111,21 @@ impl Relay {
     /// subscription outlives the last subscriber and the relay keeps receiving a
     /// track nobody is watching. A zero timeout restores that behaviour.
     pub fn new_with_cache_idle_timeout(
+        config: RelayConfig,
+        cache_idle_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_fetch_retention(config, cache_idle_timeout, FetchRetention::disabled())
+    }
+
+    /// Create a relay that also retains the recent groups of every track it
+    /// receives, so a standalone FETCH for them is answered locally instead of
+    /// being forwarded upstream (draft-ietf-moq-transport-16 §9.16.3).
+    ///
+    /// `cache_idle_timeout` is as for [`Self::new_with_cache_idle_timeout`].
+    pub fn new_with_fetch_retention(
         mut config: RelayConfig,
         cache_idle_timeout: Duration,
+        fetch_retention: FetchRetention,
     ) -> anyhow::Result<Self> {
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
@@ -142,7 +155,8 @@ impl Relay {
             tracing::info!("mlog output enabled: {}", mlog_dir.display());
         }
 
-        let locals = Locals::with_cache_idle_timeout(cache_idle_timeout);
+        let locals = Locals::with_cache_idle_timeout(cache_idle_timeout)
+            .with_fetch_retention(fetch_retention.clone());
 
         // FIXME(itzmanish): have a generic filter to find endpoints for forward, remote etc.
         let remote_clients = config
@@ -157,7 +171,8 @@ impl Relay {
             remote_clients,
             config.session,
         )
-        .with_cache_idle_timeout(cache_idle_timeout);
+        .with_cache_idle_timeout(cache_idle_timeout)
+        .with_fetch_retention(fetch_retention);
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
 

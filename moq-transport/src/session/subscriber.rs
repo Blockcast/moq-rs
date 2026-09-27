@@ -1483,10 +1483,16 @@ impl Subscriber {
                 }
             }
 
-            // Write the object payload.
-            // TODO SLG - object_id_delta and object status are still being ignored
+            // Write the object payload under the Object ID decoded from the
+            // stream, so relays cache and forward the publisher's IDs
+            // (draft-16 §8.1, §8.7).
+            // TODO SLG - object status is still being ignored
             let subgroup_writer = subgroup_writer.as_mut().ok_or(SessionError::Internal)?;
-            let mut object_writer = subgroup_writer.create(remaining_bytes, extension_headers)?;
+            let mut object_writer = subgroup_writer.create_with_id(
+                current_object_id,
+                remaining_bytes,
+                extension_headers,
+            )?;
 
             while remaining_bytes > 0 {
                 let chunk = reader.read_chunk(remaining_bytes).await?.ok_or_else(|| {

@@ -8,16 +8,17 @@ use std::time::Duration;
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    coding::{KeyValuePairs, TrackNamespace},
-    message::{RequestErrorCode, SubscribeOptions},
+    coding::{KeyValuePairs, Location, TrackNamespace},
+    message::{GroupOrder, RequestErrorCode, StandaloneFetch, SubscribeOptions},
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{
-        FetchRequested, Publisher, SessionError, Subscribed, SubscribedNamespace,
-        TrackStatusRequested,
+        FetchRequested, FetchResponseObject, FetchRest, Publisher, SessionError, Subscribed,
+        SubscribedNamespace, TrackStatusRequested,
     },
 };
 use tokio::sync::broadcast;
 
+use crate::retention::FetchPlan;
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
     upstream_namespaces::UpstreamNamespaces,
@@ -34,6 +35,23 @@ pub struct Producer {
     upstream_namespaces: UpstreamNamespaces,
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+}
+
+/// What is left of a standalone FETCH that retained groups did not answer.
+enum Unserved {
+    /// The leading `objects` are retained; `first_unknown` is not.
+    Partial {
+        objects: Vec<FetchResponseObject>,
+        first_unknown: Location,
+        last_location: Location,
+        end_location: Location,
+    },
+    /// The range starts after the Largest Location the relay knows of.
+    BeyondLargest,
+    /// The relay holds the track but has received no Object on it.
+    NothingPublished,
+    /// The relay retains nothing for the track.
+    NotRetained,
 }
 
 /// Why the wait for upstream readiness ended without the subscription being
@@ -187,15 +205,91 @@ impl Producer {
         if fetch.closed().now_or_never().is_some() {
             return Ok(());
         }
+
+        // Answer from retained groups when the relay holds every Object of the
+        // range. Otherwise draft-16 §9.16.3 has the relay confirm the first
+        // Object of unknown status upstream before delivering past it.
+        let full_name = FullTrackName {
+            namespace: standalone.track_namespace.clone(),
+            name: standalone.track_name.clone(),
+        };
+        let retained = self
+            .locals
+            .retained_track(self.context.scope(), &full_name)
+            .map(|track| {
+                track.plan(
+                    standalone.start_location,
+                    standalone.end_location,
+                    fetch.group_order(),
+                )
+            });
+        let unserved = match retained {
+            Some(FetchPlan::Complete {
+                objects,
+                end_location,
+            }) => {
+                metrics::counter!("moq_relay_fetch_responses_total", "source" => "retained")
+                    .increment(1);
+                fetch
+                    .serve(
+                        objects,
+                        FetchRest::Complete {
+                            // The relay keeps no Object Status, so it never knows
+                            // that the track has ended.
+                            end_of_track: false,
+                            end_location,
+                        },
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Some(FetchPlan::Partial {
+                objects,
+                first_unknown,
+                last_location,
+                end_location,
+            }) => Unserved::Partial {
+                objects,
+                first_unknown,
+                last_location,
+                end_location,
+            },
+            Some(FetchPlan::BeyondLargest) => Unserved::BeyondLargest,
+            Some(FetchPlan::NothingPublished) => Unserved::NothingPublished,
+            None => Unserved::NotRetained,
+        };
+
+        // In ascending order the rest of the range after the retained prefix is
+        // one range, so upstream is asked for exactly that and its stream is
+        // appended. In descending order the rest is not a single range, so the
+        // whole request goes upstream.
+        let splice_from = match &unserved {
+            Unserved::Partial {
+                objects,
+                first_unknown,
+                ..
+            } if fetch.group_order() == GroupOrder::Ascending && !objects.is_empty() => {
+                Some(*first_unknown)
+            }
+            _ => None,
+        };
+        let upstream_request = match splice_from {
+            Some(start_location) => StandaloneFetch {
+                start_location,
+                ..standalone
+            },
+            None => standalone,
+        };
+
         let open = async {
             if let Some(mut source) = self
                 .locals
-                .fetch_source(self.context.scope(), &standalone.track_namespace)
+                .fetch_source(self.context.scope(), &upstream_request.track_namespace)
             {
-                Ok(Some(source.fetch(standalone, params)?))
+                Ok(Some(source.fetch(upstream_request, params)?))
             } else {
                 self.remotes
-                    .fetch(self.context.scope(), standalone, params)
+                    .fetch(self.context.scope(), upstream_request, params)
                     .await
             }
         };
@@ -207,23 +301,74 @@ impl Producer {
                 return Ok(());
             }
             result = open => match result {
-                Ok(Some(upstream)) => upstream,
-                Ok(None) => {
-                    fetch.reject(RequestErrorCode::DoesNotExist, "track not found")?;
-                    return Ok(());
-                }
+                Ok(upstream) => upstream,
                 Err(err) => {
                     fetch.reject(RequestErrorCode::InternalError, "failed to open upstream FETCH")?;
                     return Err(err).context("failed to open upstream FETCH");
                 }
             },
         };
-        fetch
-            .proxy(
-                upstream,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await?;
+
+        match (upstream, unserved) {
+            (Some(upstream), unserved) => {
+                let prefix = match (splice_from, unserved) {
+                    (Some(_), Unserved::Partial { objects, .. }) => objects,
+                    _ => Vec::new(),
+                };
+                let source = if prefix.is_empty() {
+                    "upstream"
+                } else {
+                    "retained_then_upstream"
+                };
+                metrics::counter!("moq_relay_fetch_responses_total", "source" => source)
+                    .increment(1);
+                fetch
+                    .serve(
+                        prefix,
+                        FetchRest::Upstream {
+                            fetch: Box::new(upstream),
+                            timeout: deadline
+                                .saturating_duration_since(tokio::time::Instant::now()),
+                        },
+                    )
+                    .await?;
+            }
+            // No upstream to confirm the unknown Objects with: §9.16.3 lets the
+            // publisher "indicate the range of unknown Objects and continue
+            // serving other known Objects".
+            (
+                None,
+                Unserved::Partial {
+                    objects,
+                    last_location,
+                    end_location,
+                    ..
+                },
+            ) => {
+                metrics::counter!("moq_relay_fetch_responses_total", "source" => "retained_then_unknown")
+                    .increment(1);
+                fetch
+                    .serve(
+                        objects,
+                        FetchRest::Unknown {
+                            last_location,
+                            end_location,
+                        },
+                    )
+                    .await?;
+            }
+            (None, Unserved::BeyondLargest) => fetch.reject(
+                RequestErrorCode::InvalidRange,
+                "fetch starts after the largest object",
+            )?,
+            (None, Unserved::NothingPublished) => fetch.reject(
+                RequestErrorCode::InvalidRange,
+                "no objects have been published on the track",
+            )?,
+            (None, Unserved::NotRetained) => {
+                fetch.reject(RequestErrorCode::DoesNotExist, "track not found")?
+            }
+        }
         Ok(())
     }
 
@@ -1776,5 +1921,499 @@ mod tests {
         assert!(!Producer::is_expected_serve_shutdown(&anyhow::Error::new(
             ServeError::NotFound
         )));
+    }
+
+    // ---------------------------------------------------------------
+    // Standalone FETCH answered from retained groups
+    // ---------------------------------------------------------------
+
+    mod retained_fetch {
+        use std::num::{NonZeroU64, NonZeroUsize};
+
+        use bytes::Bytes;
+        use moq_transport::{
+            coding::VarInt,
+            data::{FetchEndOfRange, FetchEntry, FetchObjectDecoder},
+            serve::{FullTrackName, Subgroup, SubgroupsWriter, Track},
+        };
+
+        use super::*;
+        use crate::FetchRetention;
+
+        const RETAINED_GROUPS: u64 = 4;
+        const REPAIR_PRIORITY: u8 = 240;
+
+        fn retaining_locals() -> Locals {
+            Locals::new().with_fetch_retention(FetchRetention::new(
+                NonZeroU64::new(RETAINED_GROUPS).unwrap(),
+                NonZeroUsize::MAX,
+            ))
+        }
+
+        fn payload(group_id: u64, object_id: u64) -> Bytes {
+            Bytes::from(format!("repair g{group_id} o{object_id}"))
+        }
+
+        fn write_group(subgroups: &mut SubgroupsWriter, group_id: u64, object_ids: &[u64]) {
+            let mut subgroup = subgroups
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: REPAIR_PRIORITY,
+                })
+                .unwrap();
+            for object_id in object_ids {
+                let payload = payload(group_id, *object_id);
+                let mut object = subgroup
+                    .create_with_id(*object_id, payload.len(), None)
+                    .unwrap();
+                object.write(payload).unwrap();
+            }
+        }
+
+        /// Yield until the relay retains `location`. The feed task runs on the
+        /// same runtime, so this waits on its progress, not on a clock.
+        async fn retained(locals: &Locals, name: &FullTrackName, location: Location) {
+            for _ in 0..10_000 {
+                let complete = locals.retained_track(None, name).is_some_and(|track| {
+                    matches!(
+                        track.plan(
+                            location,
+                            Location::new(location.group_id, location.object_id + 1),
+                            GroupOrder::Ascending,
+                        ),
+                        crate::retention::FetchPlan::Complete { .. }
+                    )
+                });
+                if complete {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("{location:?} was never retained");
+        }
+
+        fn fetch_range(
+            id: u64,
+            namespace: &TrackNamespace,
+            start: Location,
+            end: Location,
+        ) -> Message {
+            message::Fetch {
+                id,
+                fetch_type: FetchType::Standalone,
+                standalone_fetch: Some(message::StandaloneFetch {
+                    track_namespace: namespace.clone(),
+                    track_name: "video".into(),
+                    start_location: start,
+                    end_location: end,
+                }),
+                joining_fetch: None,
+                params: KeyValuePairs::default(),
+            }
+            .into()
+        }
+
+        /// Entries of a FETCH stream body, each with its payload.
+        fn decode_body(mut body: &[u8]) -> Vec<(FetchEntry, Vec<u8>)> {
+            let mut decoder = FetchObjectDecoder::new();
+            let mut entries = Vec::new();
+            while !body.is_empty() {
+                let (entry, consumed) = decoder.decode(body).unwrap();
+                body = &body[consumed..];
+                let payload = match &entry {
+                    FetchEntry::Object(object) => {
+                        let (payload, rest) = body.split_at(object.payload_length);
+                        body = rest;
+                        payload.to_vec()
+                    }
+                    FetchEntry::EndOfRange { .. } => Vec::new(),
+                };
+                entries.push((entry, payload));
+            }
+            entries
+        }
+
+        fn objects(entries: &[(FetchEntry, Vec<u8>)]) -> Vec<(u64, u64, u8, Vec<u8>)> {
+            entries
+                .iter()
+                .filter_map(|(entry, payload)| match entry {
+                    FetchEntry::Object(object) => Some((
+                        object.group_id,
+                        object.object_id,
+                        object.publisher_priority,
+                        payload.clone(),
+                    )),
+                    FetchEntry::EndOfRange { .. } => None,
+                })
+                .collect()
+        }
+
+        fn expected(
+            group_id: u64,
+            object_ids: impl IntoIterator<Item = u64>,
+        ) -> Vec<(u64, u64, u8, Vec<u8>)> {
+            object_ids
+                .into_iter()
+                .map(|object_id| {
+                    (
+                        group_id,
+                        object_id,
+                        REPAIR_PRIORITY,
+                        payload(group_id, object_id).to_vec(),
+                    )
+                })
+                .collect()
+        }
+
+        async fn fetch_ok(control: &mut WireReader, id: u64) -> message::FetchOk {
+            let Message::FetchOk(ok) = control.decode::<Message>().await else {
+                panic!("expected FETCH_OK");
+            };
+            assert_eq!(ok.id, id);
+            ok
+        }
+
+        fn producer(
+            publisher: moq_transport::session::Publisher,
+            locals: &Locals,
+            coordinator: MockCoordinator,
+        ) -> Producer {
+            let coordinator: Arc<dyn Coordinator> = Arc::new(coordinator);
+            Producer::new(
+                publisher,
+                locals.clone(),
+                RemoteManager::new(coordinator.clone(), Vec::new()),
+                coordinator,
+                SessionContext::public(None),
+            )
+        }
+
+        /// A standalone FETCH of a retained group returns exactly those
+        /// Objects, in order, without an upstream request.
+        #[tokio::test]
+        async fn retained_group_is_answered_locally_in_order() {
+            let mut downstream = manual_peer().await;
+            let coordinator = MockCoordinator::without_route();
+            let lookups = coordinator.lookups.clone();
+            let mut locals = retaining_locals();
+            let producer = producer(downstream.server_publisher, &locals, coordinator);
+            let namespace = TrackNamespace::from_utf8_path("test/retained");
+            let (writer, reader) = Track::new(namespace.clone(), "video").produce();
+            let name = FullTrackName {
+                namespace: namespace.clone(),
+                name: "video".into(),
+            };
+            let _registration = locals.register_track(None, reader).await.unwrap();
+            let mut subgroups = writer.subgroups().unwrap();
+
+            let scenario = async {
+                write_group(&mut subgroups, 6, &[0, 1, 2, 3, 4]);
+                write_group(&mut subgroups, 7, &[0, 1]);
+                retained(&locals, &name, Location::new(6, 4)).await;
+                retained(&locals, &name, Location::new(7, 1)).await;
+
+                // Objects 0..=3 of the older group 6 (End Location is exclusive).
+                write(
+                    &mut downstream.control_send,
+                    &fetch_range(0, &namespace, Location::new(6, 0), Location::new(6, 4)),
+                )
+                .await;
+                let (id, body) = receive_fetch_stream(&downstream.transport).await;
+                assert_eq!(id, 0);
+                assert_eq!(objects(&decode_body(&body)), expected(6, 0..4));
+                let ok = fetch_ok(&mut downstream.control_recv, 0).await;
+                assert_eq!(ok.end_location, Location::new(6, 4));
+
+                // All of group 7, which holds the Largest Location: the response
+                // ends there and FETCH_OK says so (§9.17).
+                write(
+                    &mut downstream.control_send,
+                    &fetch_range(2, &namespace, Location::new(7, 0), Location::new(7, 0)),
+                )
+                .await;
+                let (id, body) = receive_fetch_stream(&downstream.transport).await;
+                assert_eq!(id, 2);
+                assert_eq!(objects(&decode_body(&body)), expected(7, 0..2));
+                let ok = fetch_ok(&mut downstream.control_recv, 2).await;
+                assert_eq!(ok.end_location, Location::new(7, 2));
+
+                assert_eq!(lookups.load(Ordering::Relaxed), 0, "nothing went upstream");
+            };
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = scenario => {},
+                    result = producer.run() => panic!("producer ended: {result:?}"),
+                    result = downstream.server_session.run() => panic!("downstream server ended: {result:?}"),
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        /// A partially retained range is served from retention up to the first
+        /// unknown Object, and only the rest is fetched upstream (§9.16.3).
+        #[tokio::test]
+        async fn partially_retained_range_fetches_only_the_rest_upstream() {
+            let mut downstream = manual_peer().await;
+            let mut upstream = manual_peer().await;
+            let coordinator = MockCoordinator::without_route();
+            let mut locals = retaining_locals();
+            let producer = producer(downstream.server_publisher, &locals, coordinator.clone());
+            let coordinator: Arc<dyn Coordinator> = Arc::new(coordinator);
+            let consumer = Consumer::new(
+                upstream.server_subscriber,
+                locals.clone(),
+                coordinator.clone(),
+                RemoteManager::new(coordinator, Vec::new()),
+                None,
+                SessionContext::public(None),
+            );
+            let namespace = TrackNamespace::from_utf8_path("test/fetch");
+            let (writer, reader) = Track::new(namespace.clone(), "video").produce();
+            let name = FullTrackName {
+                namespace: namespace.clone(),
+                name: "video".into(),
+            };
+            let _registration = locals.register_track(None, reader).await.unwrap();
+            let mut subgroups = writer.subgroups().unwrap();
+
+            let scenario = async {
+                write(
+                    &mut upstream.control_send,
+                    &Message::PublishNamespace(message::PublishNamespace {
+                        id: 0,
+                        track_namespace: namespace.clone(),
+                        params: KeyValuePairs::default(),
+                    }),
+                )
+                .await;
+                assert!(matches!(
+                    upstream.control_recv.decode::<Message>().await,
+                    Message::RequestOk(message::RequestOk { id: 0, .. })
+                ));
+
+                // Group 5 is not the newest group, so its end is unknown.
+                write_group(&mut subgroups, 5, &[0, 1]);
+                write_group(&mut subgroups, 6, &[0]);
+                retained(&locals, &name, Location::new(5, 1)).await;
+                retained(&locals, &name, Location::new(6, 0)).await;
+
+                write(
+                    &mut downstream.control_send,
+                    &fetch_range(0, &namespace, Location::new(5, 0), Location::new(5, 0)),
+                )
+                .await;
+                let Message::Fetch(request) = upstream.control_recv.decode::<Message>().await
+                else {
+                    panic!("expected upstream FETCH for the unretained rest");
+                };
+                let range = request.standalone_fetch.as_ref().unwrap();
+                assert_eq!(range.start_location, Location::new(5, 2));
+                assert_eq!(range.end_location, Location::new(5, 0));
+
+                let mut rest = fetch_object(5, 2, b"upstream o2");
+                rest.extend(fetch_object(5, 3, b"upstream o3"));
+                send_fetch_success(
+                    &upstream.transport,
+                    &mut upstream.control_send,
+                    &request,
+                    &rest,
+                    FetchResponseOrder::StreamFirst,
+                )
+                .await;
+
+                let (id, body) = receive_fetch_stream(&downstream.transport).await;
+                assert_eq!(id, 0);
+                let mut want = expected(5, 0..2);
+                // The upstream objects keep their own priority (17 in
+                // `fetch_object`).
+                want.push((5, 2, 17, b"upstream o2".to_vec()));
+                want.push((5, 3, 17, b"upstream o3".to_vec()));
+                assert_eq!(objects(&decode_body(&body)), want);
+                let ok = fetch_ok(&mut downstream.control_recv, 0).await;
+                assert_eq!(ok.end_location, Location::new(5, 0));
+            };
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = scenario => {},
+                    result = producer.run() => panic!("producer ended: {result:?}"),
+                    result = consumer.run() => panic!("consumer ended: {result:?}"),
+                    result = downstream.server_session.run() => panic!("downstream server ended: {result:?}"),
+                    result = upstream.server_session.run() => panic!("upstream server ended: {result:?}"),
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        /// With nothing upstream to ask, the unretained rest is reported as an
+        /// End of Unknown Range, and requests the relay cannot place at all are
+        /// rejected per §9.16.3.
+        #[tokio::test]
+        async fn without_upstream_the_rest_is_unknown_or_rejected() {
+            let mut downstream = manual_peer().await;
+            let mut locals = retaining_locals();
+            let producer = producer(
+                downstream.server_publisher,
+                &locals,
+                MockCoordinator::without_route(),
+            );
+            let namespace = TrackNamespace::from_utf8_path("test/published");
+            let (writer, reader) = Track::new(namespace.clone(), "video").produce();
+            let name = FullTrackName {
+                namespace: namespace.clone(),
+                name: "video".into(),
+            };
+            let _registration = locals.register_track(None, reader).await.unwrap();
+            let mut subgroups = writer.subgroups().unwrap();
+
+            let scenario = async {
+                write_group(&mut subgroups, 5, &[0, 1]);
+                write_group(&mut subgroups, 6, &[0]);
+                retained(&locals, &name, Location::new(5, 1)).await;
+                retained(&locals, &name, Location::new(6, 0)).await;
+
+                write(
+                    &mut downstream.control_send,
+                    &fetch_range(0, &namespace, Location::new(5, 0), Location::new(5, 0)),
+                )
+                .await;
+                let (id, body) = receive_fetch_stream(&downstream.transport).await;
+                assert_eq!(id, 0);
+                let entries = decode_body(&body);
+                assert_eq!(objects(&entries), expected(5, 0..2));
+                assert_eq!(
+                    entries.last().unwrap().0,
+                    FetchEntry::EndOfRange {
+                        kind: FetchEndOfRange::Unknown,
+                        location: Location::new(5, VarInt::MAX.into_inner()),
+                    }
+                );
+                let ok = fetch_ok(&mut downstream.control_recv, 0).await;
+                assert_eq!(ok.end_location, Location::new(5, 0));
+
+                write(
+                    &mut downstream.control_send,
+                    &fetch_range(2, &namespace, Location::new(6, 1), Location::new(6, 0)),
+                )
+                .await;
+                let Message::RequestError(error) =
+                    downstream.control_recv.decode::<Message>().await
+                else {
+                    panic!("expected REQUEST_ERROR");
+                };
+                assert_eq!(error.id, 2);
+                assert_eq!(error.error_code, RequestErrorCode::InvalidRange as u64);
+
+                write(
+                    &mut downstream.control_send,
+                    &fetch_range(
+                        4,
+                        &TrackNamespace::from_utf8_path("test/elsewhere"),
+                        Location::new(0, 0),
+                        Location::new(0, 0),
+                    ),
+                )
+                .await;
+                let Message::RequestError(error) =
+                    downstream.control_recv.decode::<Message>().await
+                else {
+                    panic!("expected REQUEST_ERROR");
+                };
+                assert_eq!(error.id, 4);
+                assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
+            };
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = scenario => {},
+                    result = producer.run() => panic!("producer ended: {result:?}"),
+                    result = downstream.server_session.run() => panic!("downstream server ended: {result:?}"),
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        /// FETCH_CANCEL resets a response the relay is serving from retention
+        /// with CANCELLED and sends no FETCH_OK for it (§5.2).
+        #[tokio::test]
+        async fn fetch_cancel_resets_a_retained_response() {
+            let mut downstream = manual_peer().await;
+            let mut locals = retaining_locals();
+            let producer = producer(
+                downstream.server_publisher,
+                &locals,
+                MockCoordinator::without_route(),
+            );
+            let namespace = TrackNamespace::from_utf8_path("test/cancel");
+            let (writer, reader) = Track::new(namespace.clone(), "video").produce();
+            let name = FullTrackName {
+                namespace: namespace.clone(),
+                name: "video".into(),
+            };
+            let _registration = locals.register_track(None, reader).await.unwrap();
+            let mut subgroups = writer.subgroups().unwrap();
+
+            let scenario = async {
+                // Larger than QUIC will buffer for a reader that is not reading,
+                // so the relay is still writing when the cancel arrives.
+                let large = Bytes::from(vec![0x5a; 16 << 20]);
+                let mut subgroup = subgroups
+                    .create(Subgroup {
+                        group_id: 1,
+                        subgroup_id: 0,
+                        priority: REPAIR_PRIORITY,
+                    })
+                    .unwrap();
+                let mut object = subgroup.create_with_id(0, large.len(), None).unwrap();
+                object.write(large).unwrap();
+                drop(object);
+                drop(subgroup);
+                write_group(&mut subgroups, 2, &[0]);
+                retained(&locals, &name, Location::new(1, 0)).await;
+                retained(&locals, &name, Location::new(2, 0)).await;
+
+                write(
+                    &mut downstream.control_send,
+                    &fetch_range(0, &namespace, Location::new(1, 0), Location::new(1, 1)),
+                )
+                .await;
+                let (id, mut stream) = receive_fetch_reader(&downstream.transport).await;
+                assert_eq!(id, 0);
+                stream.read_exact(64 * 1024).await;
+                write(
+                    &mut downstream.control_send,
+                    &Message::FetchCancel(message::FetchCancel { id: 0 }),
+                )
+                .await;
+                assert_eq!(stream.reset_code().await, 1, "CANCELLED");
+
+                // The next response on the control stream belongs to the next
+                // FETCH, so none was sent for the cancelled one.
+                write(
+                    &mut downstream.control_send,
+                    &fetch_range(2, &namespace, Location::new(2, 0), Location::new(2, 1)),
+                )
+                .await;
+                let (id, body) = receive_fetch_stream(&downstream.transport).await;
+                assert_eq!(id, 2);
+                assert_eq!(objects(&decode_body(&body)), expected(2, 0..1));
+                fetch_ok(&mut downstream.control_recv, 2).await;
+            };
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = scenario => {},
+                    result = producer.run() => panic!("producer ended: {result:?}"),
+                    result = downstream.server_session.run() => panic!("downstream server ended: {result:?}"),
+                }
+            })
+            .await
+            .unwrap();
+        }
     }
 }

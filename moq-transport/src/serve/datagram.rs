@@ -6,7 +6,7 @@ use std::{fmt, sync::Arc};
 
 use crate::watch::State;
 
-use super::{ServeError, Track};
+use super::{ServeError, Track, TrackTapEvent, TrackTaps};
 
 pub struct Datagrams {
     pub track: Arc<Track>,
@@ -24,8 +24,13 @@ impl Datagrams {
 }
 
 struct DatagramsState {
-    // The latest datagram
+    // The latest datagram, delivered to readers.
     latest: Option<Datagram>,
+
+    // The largest (group, object) written. Datagrams can arrive reordered, and
+    // a late one is still delivered through `latest`, but it must never move
+    // the track's Largest Location backwards.
+    largest: Option<(u64, u64)>,
 
     // Increased each time datagram changes.
     epoch: u64,
@@ -38,6 +43,7 @@ impl Default for DatagramsState {
     fn default() -> Self {
         Self {
             latest: None,
+            largest: None,
             epoch: 0,
             closed: Ok(()),
         }
@@ -47,16 +53,29 @@ impl Default for DatagramsState {
 pub struct DatagramsWriter {
     state: State<DatagramsState>,
     pub track: Arc<Track>,
+    taps: TrackTaps,
 }
 
 impl DatagramsWriter {
     fn new(state: State<DatagramsState>, track: Arc<Track>) -> Self {
-        Self { state, track }
+        Self {
+            state,
+            track,
+            taps: TrackTaps::default(),
+        }
+    }
+
+    pub(super) fn set_taps(&mut self, taps: TrackTaps) {
+        self.taps = taps;
     }
 
     pub fn write(&mut self, datagram: Datagram) -> Result<(), ServeError> {
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        self.taps.emit(|| TrackTapEvent::Datagram(datagram.clone()));
 
+        state.largest = state
+            .largest
+            .max(Some((datagram.group_id, datagram.object_id)));
         state.latest = Some(datagram);
         state.epoch += 1;
 
@@ -110,13 +129,10 @@ impl DatagramsReader {
         }
     }
 
-    // Returns the largest group/sequence
+    // Returns the largest group/sequence written, which a reordered datagram
+    // never lowers.
     pub fn latest(&self) -> Option<(u64, u64)> {
-        let state = self.state.lock();
-        state
-            .latest
-            .as_ref()
-            .map(|datagram| (datagram.group_id, datagram.object_id))
+        self.state.lock().largest
     }
 
     /// Check if the datagrams writer has been closed or dropped.
