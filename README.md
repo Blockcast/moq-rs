@@ -62,11 +62,14 @@ A draft-16 session refuses a draft-19 negotiation with a typed
 
 #### Draft-19 preflight attestation
 
-`scripts/draft19-preflight-capture.sh <publisher|relay-root|relay-leaf> <out.json>`
+`scripts/draft19-preflight-capture.sh <publisher|relay-root|relay-leaf> artifacts/<role>.json`
 records what a role actually negotiated. It runs the shipped `moq-relay-ietf`
 and `moq-pub-mmtp` binaries against each other over real QUIC and quotes the
 role's own `selected_version=moqt-19` log line, then adds a decoded GOAWAY
 captured by the `draft19-preflight` binary over a draft-19 control stream.
+
+Write the output under `artifacts/`. That directory is ignored, so a capture's
+own output does not count against the next capture's dirty-tree guard.
 
 The GOAWAY half is a session-level capture, not an observed relay drain: no
 shipped binary emits a draft-19 GOAWAY today. Every artifact says so in

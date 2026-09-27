@@ -15,7 +15,7 @@ qlog/
 # the workflow uploads it from. Generated output, so it must not count against
 # that script's own dirty-tree guard: otherwise the first local capture leaves
 # a file that refuses the second one.
-artifacts/
+/artifacts/
 
 # .planning/ holds the milestone design docs + harness scripts, which are worth
 # tracking. Runtime output of those harnesses is not: it has no diff value and
