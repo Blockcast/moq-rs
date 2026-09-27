@@ -18,6 +18,7 @@ use moq_transport::profile::draft19::{GoAway, Setup, GOAWAY_TYPE};
 use moq_transport::profile::WireProfile;
 use moq_transport::session::{Draft19Session, Draft19SessionRole};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use url::Url;
 
 /// The relay advertises this as the GOAWAY New Session URI.
@@ -139,6 +140,7 @@ async fn drain_sends_goaway_with_configured_uri_and_timeout() {
             new_session_uri: Url::parse(NEW_SESSION_URI).unwrap(),
             timeout_ms: TIMEOUT_MS,
             signal: signal.clone(),
+            sessions: TaskTracker::new(),
         },
     )
     .await;
@@ -184,6 +186,7 @@ async fn session_opened_during_drain_is_redirected_immediately() {
             new_session_uri: Url::parse(NEW_SESSION_URI).unwrap(),
             timeout_ms: TIMEOUT_MS,
             signal,
+            sessions: TaskTracker::new(),
         },
     )
     .await;
@@ -211,6 +214,7 @@ async fn goaway_timeout_closes_the_session_with_no_open_requests() {
             new_session_uri: Url::parse(NEW_SESSION_URI).unwrap(),
             timeout_ms: TIMEOUT_MS,
             signal: signal.clone(),
+            sessions: TaskTracker::new(),
         },
     )
     .await;
@@ -272,6 +276,26 @@ where
         .unwrap_or_else(|_| panic!("relay did not log {needle:?}"));
 }
 
+/// Read the relay's log output until a line containing `needle` appears, and
+/// return that line.
+#[cfg(unix)]
+async fn await_log_line<R>(lines: &mut tokio::io::Lines<R>, needle: &str) -> String
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let wait = async {
+        while let Some(line) = lines.next_line().await.expect("relay log is readable") {
+            if line.contains(needle) {
+                return line;
+            }
+        }
+        panic!("relay exited before logging {needle:?}");
+    };
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .unwrap_or_else(|_| panic!("relay did not log {needle:?}"))
+}
+
 /// Deliver SIGTERM to the relay process.
 #[cfg(unix)]
 fn sigterm(relay: &tokio::process::Child) {
@@ -321,6 +345,46 @@ async fn spawn_draining_relay(
     (relay, lines)
 }
 
+/// Read the bound address from the relay binary's `listening on` log line.
+#[cfg(unix)]
+async fn await_listen_addr<R>(lines: &mut tokio::io::Lines<R>) -> std::net::SocketAddr
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let listening = await_log_line(lines, "listening on").await;
+    listening
+        .rsplit(' ')
+        .next()
+        .and_then(|addr| addr.parse().ok())
+        .unwrap_or_else(|| panic!("relay logs its bound address, got: {listening}"))
+}
+
+/// Connect a draft-19 client to the relay binary at `addr`, returning the
+/// session and the bare connection that carries the session close code.
+#[cfg(unix)]
+async fn connect_client(
+    addr: std::net::SocketAddr,
+    tag: &str,
+) -> (Draft19Session, web_transport::Session) {
+    let url = Url::parse(&format!("https://localhost:{}/", addr.port())).unwrap();
+    let (conn, _cid, _transport, selected) = endpoint(tag)
+        .client
+        .connect_with_profile(&url, Some(addr), WireProfile::Draft19)
+        .await
+        .expect("client connects to the relay binary");
+    assert_eq!(selected, WireProfile::Draft19, "negotiated draft-19");
+    let raw = conn.clone();
+    let session = Draft19Session::establish(
+        conn,
+        Draft19SessionRole::Client,
+        WireProfile::Draft19,
+        Setup::default(),
+    )
+    .await
+    .expect("client establishes a draft-19 session");
+    (session, raw)
+}
+
 /// The first SIGTERM starts the drain and the second stops the process.
 ///
 /// Installing the tokio signal handlers replaces the default terminate action
@@ -333,12 +397,19 @@ async fn spawn_draining_relay(
 #[cfg(unix)]
 #[tokio::test]
 async fn second_shutdown_signal_stops_a_draining_relay() {
-    // The default 30 s drain window cannot elapse within this test, so the
-    // exit below can only come from the second signal.
-    let (mut relay, mut lines) = spawn_draining_relay("signals", &[]).await;
+    // Keep one client connected under the default 30 s Timeout, so the drain
+    // cannot complete within this test and the exit can only come from the
+    // second signal.
+    let (mut relay, mut lines) =
+        spawn_draining_relay("signals", &["--wire-profile=draft19".to_string()]).await;
+    let addr = await_listen_addr(&mut lines).await;
+    let (mut session, _raw) = connect_client(addr, "signals-client").await;
 
     sigterm(&relay);
     await_log(&mut lines, "draining draft-19 sessions").await;
+    tokio::time::timeout(Duration::from_secs(10), await_goaway(&mut session))
+        .await
+        .expect("GOAWAY arrives");
 
     sigterm(&relay);
     let status = tokio::time::timeout(Duration::from_secs(10), relay.wait())
@@ -348,29 +419,67 @@ async fn second_shutdown_signal_stops_a_draining_relay() {
     assert!(status.success(), "relay stops cleanly, got {status}");
 }
 
-/// A supervisor sends one SIGTERM and waits (systemd, a Kubernetes pod delete).
-/// The relay exits cleanly once the drain window has elapsed, rather than
-/// waiting to be SIGKILLed at the end of the grace period.
+/// With no draft-19 session to drain, one SIGTERM (a supervisor's) stops the
+/// relay at once and cleanly, rather than waiting to be SIGKILLed at the end
+/// of the grace period.
 #[cfg(unix)]
 #[tokio::test]
-async fn single_shutdown_signal_stops_the_relay_after_the_drain_window() {
+async fn single_shutdown_signal_stops_a_relay_with_no_sessions() {
+    let (mut relay, mut lines) = spawn_draining_relay("single-signal", &[]).await;
+
+    sigterm(&relay);
+    await_log(&mut lines, "draft-19 drain complete").await;
+    let status = tokio::time::timeout(Duration::from_secs(10), relay.wait())
+        .await
+        .expect("relay exits without a second signal")
+        .expect("relay exit status is readable");
+    assert!(status.success(), "relay stops cleanly, got {status}");
+}
+
+/// The supervisor path must still close an idle draft-19 client with
+/// `GOAWAY_TIMEOUT` (0x10). One SIGTERM drains the binary; the client takes the
+/// GOAWAY and stays silent. The relay may only exit once that session has been
+/// closed with the code, not when a timer started at the signal runs out: each
+/// session's Timeout runs from its own GOAWAY send, which is later.
+#[cfg(unix)]
+#[tokio::test]
+async fn single_shutdown_signal_closes_an_idle_client_with_goaway_timeout_before_exit() {
     let (mut relay, mut lines) = spawn_draining_relay(
-        "single-signal",
-        &[format!("--draft19-goaway-timeout-ms={TIMEOUT_MS}")],
+        "idle-client",
+        &[
+            "--wire-profile=draft19".to_string(),
+            format!("--draft19-goaway-timeout-ms={TIMEOUT_MS}"),
+        ],
     )
     .await;
+    let addr = await_listen_addr(&mut lines).await;
+    let (mut session, raw) = connect_client(addr, "idle-client-client").await;
 
     let signalled = Instant::now();
     sigterm(&relay);
-    await_log(&mut lines, "draft-19 drain window elapsed").await;
-    let status = tokio::time::timeout(Duration::from_secs(10), relay.wait())
+    let goaway = tokio::time::timeout(Duration::from_secs(10), await_goaway(&mut session))
         .await
-        .expect("relay exits after the drain window without a second signal")
-        .expect("relay exit status is readable");
-    assert!(status.success(), "relay stops cleanly, got {status}");
+        .expect("GOAWAY arrives");
+    assert_eq!(goaway.timeout_ms, TIMEOUT_MS);
+
+    // Stay silent. The relay has to close this session itself.
+    let error = tokio::time::timeout(Duration::from_secs(10), raw.closed())
+        .await
+        .expect("relay closes the idle session");
+    let rendered = format!("{error}");
+    assert!(
+        rendered.contains(&format!("code={}", GOAWAY_TIMEOUT_CODE)),
+        "relay closed with GOAWAY_TIMEOUT (0x10) before exiting, got: {rendered}"
+    );
     assert!(
         signalled.elapsed() >= Duration::from_millis(TIMEOUT_MS),
-        "relay held the drain window open before exiting, took {:?}",
+        "relay waited out the advertised Timeout, took {:?}",
         signalled.elapsed()
     );
+
+    let status = tokio::time::timeout(Duration::from_secs(10), relay.wait())
+        .await
+        .expect("relay exits once its draining session is closed")
+        .expect("relay exit status is readable");
+    assert!(status.success(), "relay stops cleanly, got {status}");
 }

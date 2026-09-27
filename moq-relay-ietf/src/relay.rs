@@ -17,6 +17,7 @@ use moq_native_ietf::quic::{self, Endpoint};
 use moq_transport::profile::WireProfile;
 use moq_transport::session::SessionConfig;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use url::Url;
 
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
@@ -109,6 +110,12 @@ pub struct Draft19Drain {
 
     /// Cancel to begin draining.
     pub signal: CancellationToken,
+
+    /// Every draft-19 session holds a token from this tracker until it ends,
+    /// so a caller can close the tracker after cancelling [`Self::signal`] and
+    /// wait for it to empty: that is the point at which every session has been
+    /// redirected and closed, by its peer or with `GOAWAY_TIMEOUT`.
+    pub sessions: TaskTracker,
 }
 
 impl RelayConfig {
@@ -554,6 +561,8 @@ pub async fn serve_draft19_control_plane(
     conn: web_transport::Session,
     drain: Option<Draft19Drain>,
 ) {
+    let _in_flight = drain.as_ref().map(|drain| drain.sessions.token());
+
     use moq_transport::profile::draft19::Setup;
     use moq_transport::session::{Draft19Session, Draft19SessionRole};
 

@@ -18,6 +18,7 @@ use moq_relay_ietf::{
     Coordinator, Draft19Drain, Relay, RelayConfig, SessionConfig, Web, WebConfig,
 };
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 /// SIGINT, and SIGTERM where the platform has it.
 ///
@@ -203,11 +204,13 @@ pub struct Cli {
     /// URI, and redirects new draft-19 sessions the same way instead of
     /// serving them. Draft-16 sessions are unaffected.
     ///
-    /// The process keeps running for the GOAWAY Timeout so sessions can drain,
-    /// then exits cleanly. A second SIGINT or SIGTERM stops it early. With a
-    /// zero Timeout there is no drain window, so only the second signal stops
-    /// it. Sessions redirected late in the window are cut off at exit; they
-    /// already hold the New Session URI.
+    /// The process keeps running until every draft-19 session has closed,
+    /// either by its peer or with GOAWAY_TIMEOUT once the Timeout counted from
+    /// that session's GOAWAY elapses, then exits cleanly. A second SIGINT or
+    /// SIGTERM stops it early. With a zero Timeout, sessions close only when
+    /// their peers do. Draft-19 sessions that arrive during the drain are
+    /// redirected and waited for too, so a steady stream of them keeps the
+    /// process up until the second signal or the supervisor's kill.
     #[arg(long)]
     pub draft19_goaway_uri: Option<Url>,
 
@@ -321,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
         new_session_uri: uri,
         timeout_ms: cli.draft19_goaway_timeout_ms,
         signal: CancellationToken::new(),
+        sessions: TaskTracker::new(),
     });
 
     let relay = Relay::new(RelayConfig {
@@ -345,8 +349,8 @@ async fn main() -> anyhow::Result<()> {
         draft19_drain: draft19_drain.clone(),
     })?;
 
-    // Start the draft-19 drain on the first shutdown signal and stop once the
-    // drain window elapses or on the second signal, when a drain is
+    // Start the draft-19 drain on the first shutdown signal and stop once every
+    // draft-19 session has closed, or on the second signal, when a drain is
     // configured. Without one no handler is installed and the platform's
     // default terminate action still applies.
     let drain_then_stop = match draft19_drain {
@@ -362,21 +366,19 @@ async fn main() -> anyhow::Result<()> {
                 signals.recv().await?;
                 tracing::info!("shutdown signal received: draining draft-19 sessions");
                 drain.signal.cancel();
-                // Every session live at the signal is closed within the
-                // advertised Timeout, so that is the drain window. Zero means
-                // no deadline: wait for the second signal only.
-                let window = async {
-                    match drain.timeout_ms {
-                        0 => std::future::pending().await,
-                        ms => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
-                    }
-                };
+                // Wait for the sessions themselves, not a timer. Each session's
+                // Timeout runs from its own GOAWAY send, which is later than
+                // this signal, so a timer started here would stop the process
+                // before any session could be closed with GOAWAY_TIMEOUT.
+                drain.sessions.close();
                 tokio::select! {
                     result = signals.recv() => {
                         result?;
                         tracing::info!("second shutdown signal received: stopping");
                     }
-                    () = window => tracing::info!("draft-19 drain window elapsed: stopping"),
+                    () = drain.sessions.wait() => {
+                        tracing::info!("draft-19 drain complete: every session has closed, stopping");
+                    }
                 }
                 Ok::<_, std::io::Error>(())
             })
