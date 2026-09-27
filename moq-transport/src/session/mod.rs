@@ -4,7 +4,10 @@
 
 mod draft19;
 mod error;
+mod fetch;
+mod fetch_requested;
 mod pending_requests;
+mod priority;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -22,7 +25,13 @@ mod writer;
 
 pub use draft19::*;
 pub use error::*;
+pub use fetch::Fetch;
+pub(crate) use fetch::FetchRecv;
+pub(crate) use fetch_requested::FetchRequestedRecv;
+pub use fetch_requested::{FetchRequested, FetchResponseObject, FetchRest};
 pub(crate) use pending_requests::{PendingRequest, PendingRequests, PendingResponse};
+pub(crate) use priority::send_order;
+pub use priority::DEFAULT_SUBSCRIBER_PRIORITY;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
@@ -1232,7 +1241,7 @@ impl Session {
                 .as_mut()
                 .ok_or(SessionError::RoleViolation)?
                 .recv_request_error(msg),
-            Some(PendingRequest::Subscribe) => subscriber
+            Some(PendingRequest::Subscribe | PendingRequest::Fetch) => subscriber
                 .as_mut()
                 .ok_or(SessionError::RoleViolation)?
                 .recv_request_error(&msg),
@@ -1328,7 +1337,7 @@ impl Session {
                         .as_mut()
                         .ok_or(SessionError::RoleViolation)?
                         .recv_request_timeout(id, request)?,
-                    PendingRequest::Subscribe => subscriber
+                    PendingRequest::Subscribe | PendingRequest::Fetch => subscriber
                         .as_mut()
                         .ok_or(SessionError::RoleViolation)?
                         .recv_request_timeout(id, request)?,

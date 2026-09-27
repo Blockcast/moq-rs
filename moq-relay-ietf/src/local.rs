@@ -8,10 +8,12 @@ use std::sync::{Arc, RwLock, Weak};
 use moq_transport::{
     coding::{TrackNamespace, TrackNamespacePrefix},
     serve::{FullTrackName, ServeError, Track, TrackReader, TrackWriter},
+    session::Subscriber,
 };
 use tokio::sync::{broadcast, mpsc};
 
 use crate::metrics::GaugeGuard;
+use crate::retention::{FetchRetention, RetainedTrack, RetentionGuard};
 
 /// Scope key for the outer level of the two-level registry.
 ///
@@ -37,6 +39,7 @@ const TRACK_CHANGE_CHANNEL_CAPACITY: usize = 1024;
 #[derive(Clone)]
 struct NamespaceSource {
     requests: mpsc::Sender<TrackWriter>,
+    fetch: Option<Subscriber>,
 }
 
 struct NamespaceEntry {
@@ -53,6 +56,8 @@ struct RemoteNamespaceSource {
 struct TrackEntry {
     reader: TrackReader,
     source: TrackSource,
+    /// Retention of this track's recent groups for FETCH, while the entry lives.
+    _retention: Option<RetentionGuard>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -100,6 +105,9 @@ pub struct Locals {
 
     /// Actual PUBLISH track add/remove notifications for Publish/Both fan-out.
     track_changes: broadcast::Sender<TrackChange>,
+
+    /// Which groups of each registered track are retained for FETCH.
+    fetch_retention: FetchRetention,
 }
 
 impl Default for Locals {
@@ -117,7 +125,24 @@ impl Locals {
             namespaces: Default::default(),
             namespace_changes,
             track_changes,
+            fetch_retention: FetchRetention::disabled(),
         }
+    }
+
+    /// Retain the recent groups of every track registered from now on, so a
+    /// standalone FETCH for them can be answered locally.
+    pub fn with_fetch_retention(mut self, fetch_retention: FetchRetention) -> Self {
+        self.fetch_retention = fetch_retention;
+        self
+    }
+
+    /// The retained groups of a track registered in `scope`, if any.
+    pub(crate) fn retained_track(
+        &self,
+        scope: Option<&str>,
+        full_name: &FullTrackName,
+    ) -> Option<Arc<RetainedTrack>> {
+        self.fetch_retention.lookup(scope, full_name)
     }
 
     pub fn subscribe_namespace_changes(&self) -> broadcast::Receiver<NamespaceChange> {
@@ -221,6 +246,25 @@ impl Locals {
         scope: Option<&str>,
         namespace: TrackNamespace,
     ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackWriter>)> {
+        self.register_namespace_inner(scope, namespace, None).await
+    }
+
+    pub(crate) async fn register_namespace_with_fetch(
+        &mut self,
+        scope: Option<&str>,
+        namespace: TrackNamespace,
+        fetch: Subscriber,
+    ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackWriter>)> {
+        self.register_namespace_inner(scope, namespace, Some(fetch))
+            .await
+    }
+
+    async fn register_namespace_inner(
+        &mut self,
+        scope: Option<&str>,
+        namespace: TrackNamespace,
+        fetch: Option<Subscriber>,
+    ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackWriter>)> {
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
         let (tx, rx) = mpsc::channel(NAMESPACE_REQUEST_CHANNEL_CAPACITY);
 
@@ -233,7 +277,10 @@ impl Locals {
             match bucket.entry(namespace.clone()) {
                 hash_map::Entry::Vacant(entry) => {
                     entry.insert(NamespaceEntry {
-                        local: Some(NamespaceSource { requests: tx }),
+                        local: Some(NamespaceSource {
+                            requests: tx,
+                            fetch,
+                        }),
                         remote: Weak::new(),
                     });
                     true
@@ -242,7 +289,10 @@ impl Locals {
                     if entry.get().local.is_some() {
                         return Err(ServeError::Duplicate.into());
                     }
-                    entry.get_mut().local = Some(NamespaceSource { requests: tx });
+                    entry.get_mut().local = Some(NamespaceSource {
+                        requests: tx,
+                        fetch,
+                    });
                     false
                 }
             }
@@ -264,6 +314,14 @@ impl Locals {
         }
 
         Ok((registration, rx))
+    }
+
+    pub(crate) fn fetch_source(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+    ) -> Option<Subscriber> {
+        self.route_namespace(scope, namespace)?.fetch
     }
 
     /// Register remote discovery metadata for one exact namespace.
@@ -352,6 +410,7 @@ impl Locals {
             hash_map::Entry::Vacant(entry) => entry.insert(TrackEntry {
                 reader: track.clone(),
                 source: TrackSource::Published,
+                _retention: self.fetch_retention.retain(scope, &track),
             }),
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
         };
@@ -475,6 +534,7 @@ impl Locals {
                 TrackEntry {
                     reader: reader.clone(),
                     source: TrackSource::Cache,
+                    _retention: self.fetch_retention.retain(scope, &reader),
                 },
             );
             (writer, reader)
