@@ -319,29 +319,30 @@ impl RetainedTrack {
         }
     }
 
-    /// The Largest Location the relay knows of: the live track's, or a later
-    /// retained Object's. The live track reports the last Object of its latest
-    /// subgroup, which another subgroup of the same group can exceed, so a
-    /// retained Object counts too; an outlier retained group stops counting
-    /// once it ages out (see [`RetainedGroups::arrival`]).
+    /// The Largest Location the relay knows of. The live track's is the anchor:
+    /// it reports the last Object of its latest subgroup, which another
+    /// subgroup of the same group can exceed, so a retained Object of that
+    /// group extends it. A retained group beyond the live one never does, so
+    /// an outlier Group ID cannot suppress §9.16.3 INVALID_RANGE or widen the
+    /// §9.17 End Location, even before it ages out. Without a live Location the
+    /// highest retained group stands in.
     fn largest_location(&self) -> Option<Location> {
-        let retained = self.groups.lock().ok().and_then(|state| {
-            state
-                .groups
-                .iter()
+        let live = self.reader.largest_location();
+        let Ok(state) = self.groups.lock() else {
+            return live;
+        };
+        let group = match live {
+            Some(live) => state.groups.get_key_value(&live.group_id),
+            None => state.groups.iter().next_back(),
+        };
+        let retained = group.and_then(|(group_id, group)| {
+            group
+                .objects
+                .keys()
                 .next_back()
-                .and_then(|(group_id, group)| {
-                    group
-                        .objects
-                        .keys()
-                        .next_back()
-                        .map(|object_id| Location::new(*group_id, *object_id))
-                })
+                .map(|object_id| Location::new(*group_id, *object_id))
         });
-        match (self.reader.largest_location(), retained) {
-            (Some(live), Some(retained)) => Some(live.max(retained)),
-            (live, retained) => live.or(retained),
-        }
+        live.max(retained)
     }
 
     /// Match a Standalone FETCH range (§9.16.1: `end` is the End Location plus
@@ -927,9 +928,10 @@ mod tests {
     async fn a_group_larger_than_the_budget_keeps_its_leading_objects() {
         let cost = retained_bytes(&object(1, 0));
         let (writer, track) = track_with_budget(3 * cost);
+        let mut subgroups = writer.subgroups().unwrap();
         // The live track knows the whole group, so its Largest Location is
         // {5, 5} even though retention holds less.
-        write_group(&mut writer.subgroups().unwrap(), 5, &[0, 1, 2, 3, 4, 5]).await;
+        write_group(&mut subgroups, 5, &[0, 1, 2, 3, 4, 5]).await;
         retain(&track, 5, 0..6);
 
         // Objects that do not fit are not retained; their status is unknown.
@@ -956,6 +958,7 @@ mod tests {
         // An Object of an earlier arrival never evicts a later one: group 6
         // fills the budget after group 4, so group 4's next Object is not
         // retained.
+        write_group(&mut subgroups, 6, &[0, 1]).await;
         retain(&track, 6, 0..2);
         track.insert(object(4, 1));
         assert!(matches!(
@@ -969,6 +972,37 @@ mod tests {
         ));
         assert!(is_complete(&track, 6, 2));
         assert_eq!(track.groups.lock().unwrap().bytes, 3 * cost);
+    }
+
+    /// §9.16.3 and §9.17 anchor on the Largest Location. While an outlier
+    /// group is still retained it must not move that anchor: a Start past the
+    /// live Largest is still rejected, and the End Location still clamps.
+    #[tokio::test]
+    async fn a_retained_outlier_group_does_not_move_the_largest_location() {
+        let (writer, track) = track();
+        let mut subgroups = writer.subgroups().unwrap();
+        write_group(&mut subgroups, 5, &[0, 1]).await;
+        retain(&track, 5, 0..2);
+        track.insert(object(1 << 62, 0));
+        assert!(is_complete(&track, 5, 2));
+        assert_eq!(track.largest_location(), Some(Location::new(5, 1)));
+
+        assert!(matches!(
+            track.plan(
+                Location::new(6, 0),
+                Location::new(6, 1),
+                GroupOrder::Ascending
+            ),
+            FetchPlan::BeyondLargest
+        ));
+        let FetchPlan::Complete { end_location, .. } = track.plan(
+            Location::new(5, 0),
+            Location::new(9, 0),
+            GroupOrder::Ascending,
+        ) else {
+            panic!("expected a complete plan");
+        };
+        assert_eq!(end_location, Location::new(5, 2));
     }
 
     #[tokio::test]
