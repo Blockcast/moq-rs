@@ -1137,6 +1137,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reordered_datagram_does_not_lower_the_largest_location() {
+        let retention = retention();
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "repair").produce();
+        let name = FullTrackName {
+            namespace: reader.namespace.clone(),
+            name: reader.name.clone(),
+        };
+        let _guard = retention.retain(None, &reader).unwrap();
+        let mut datagrams = writer.datagrams().unwrap();
+        let track = retention.lookup(None, &name).unwrap();
+
+        // QUIC reorders datagrams: group 6 arrives, then group 5.
+        for group_id in [6, 5] {
+            datagrams
+                .write(moq_transport::serve::Datagram {
+                    group_id,
+                    object_id: 0,
+                    priority: 200,
+                    payload: Bytes::from_static(b"d"),
+                    extension_headers: Default::default(),
+                })
+                .unwrap();
+            until(|| {
+                matches!(
+                    track.plan(
+                        Location::new(group_id, 0),
+                        Location::new(group_id, 1),
+                        GroupOrder::Ascending
+                    ),
+                    FetchPlan::Complete { .. }
+                )
+            })
+            .await;
+        }
+
+        assert_eq!(reader.largest_location(), Some(Location::new(6, 0)));
+        assert!(matches!(
+            track.plan(
+                Location::new(6, 0),
+                Location::new(6, 1),
+                GroupOrder::Ascending
+            ),
+            FetchPlan::Complete { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn retain_keeps_datagram_objects() {
         let retention = retention();
         let (writer, reader) =
