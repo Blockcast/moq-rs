@@ -317,6 +317,7 @@ impl RetainedTrack {
         if state.groups.len() as u64 > self.window.get() {
             state.evict_oldest();
         }
+        debug_assert_eq!(state.arrival.len(), state.groups.len());
     }
 
     /// The Largest Location the relay knows of. The live track's is the anchor:

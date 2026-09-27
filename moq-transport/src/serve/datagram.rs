@@ -165,3 +165,36 @@ impl fmt::Debug for Datagram {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::coding::TrackNamespace;
+
+    fn datagram(group_id: u64) -> Datagram {
+        Datagram {
+            group_id,
+            object_id: 0,
+            priority: 0,
+            payload: bytes::Bytes::new(),
+            extension_headers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_reordered_datagram_is_delivered_without_lowering_the_largest() {
+        let track = Arc::new(Track::new(TrackNamespace::from_utf8_path("test"), "repair"));
+        let (mut writer, mut reader) = Datagrams { track }.produce();
+
+        // QUIC reorders datagrams: group 6 arrives, then group 5. The late
+        // datagram still reaches readers; only the largest ignores it.
+        for group_id in [6, 5] {
+            writer.write(datagram(group_id)).unwrap();
+            let read = reader.read().now_or_never().unwrap().unwrap().unwrap();
+            assert_eq!((read.group_id, read.object_id), (group_id, 0));
+        }
+        assert_eq!(reader.latest(), Some((6, 0)));
+    }
+}
