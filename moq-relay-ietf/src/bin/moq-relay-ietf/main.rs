@@ -47,14 +47,22 @@ impl ShutdownSignals {
         }
     }
 
+    /// Wait for the next shutdown signal.
+    ///
+    /// tokio coalesces a signal kind: several deliveries before this is polled
+    /// yield one notification, so a very fast double Ctrl-C can count as one.
+    /// Supervisors send one SIGTERM and then wait, which is unaffected.
     async fn recv(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
+            // `None` means the stream closed, not that a signal arrived.
+            // Reporting it as a signal would stop the relay with exit 0 and
+            // look like a clean shutdown.
             tokio::select! {
-                _ = self.interrupt.recv() => {}
-                _ = self.terminate.recv() => {}
+                Some(()) = self.interrupt.recv() => Ok(()),
+                Some(()) = self.terminate.recv() => Ok(()),
+                else => Err(std::io::Error::other("shutdown signal streams closed")),
             }
-            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -195,8 +203,11 @@ pub struct Cli {
     /// URI, and redirects new draft-19 sessions the same way instead of
     /// serving them. Draft-16 sessions are unaffected.
     ///
-    /// The process keeps running so sessions can drain. A second SIGINT or
-    /// SIGTERM stops it, so the supervisor can end the drain early.
+    /// The process keeps running for the GOAWAY Timeout so sessions can drain,
+    /// then exits cleanly. A second SIGINT or SIGTERM stops it early. With a
+    /// zero Timeout there is no drain window, so only the second signal stops
+    /// it. Sessions redirected late in the window are cut off at exit; they
+    /// already hold the New Session URI.
     #[arg(long)]
     pub draft19_goaway_uri: Option<Url>,
 
@@ -334,9 +345,10 @@ async fn main() -> anyhow::Result<()> {
         draft19_drain: draft19_drain.clone(),
     })?;
 
-    // Start the draft-19 drain on the first shutdown signal and stop on the
-    // second, when a drain is configured. Without one no handler is installed
-    // and the platform's default terminate action still applies.
+    // Start the draft-19 drain on the first shutdown signal and stop once the
+    // drain window elapses or on the second signal, when a drain is
+    // configured. Without one no handler is installed and the platform's
+    // default terminate action still applies.
     let drain_then_stop = match draft19_drain {
         Some(drain) => {
             let mut signals =
@@ -350,8 +362,22 @@ async fn main() -> anyhow::Result<()> {
                 signals.recv().await?;
                 tracing::info!("shutdown signal received: draining draft-19 sessions");
                 drain.signal.cancel();
-                signals.recv().await?;
-                tracing::info!("second shutdown signal received: stopping");
+                // Every session live at the signal is closed within the
+                // advertised Timeout, so that is the drain window. Zero means
+                // no deadline: wait for the second signal only.
+                let window = async {
+                    match drain.timeout_ms {
+                        0 => std::future::pending().await,
+                        ms => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+                    }
+                };
+                tokio::select! {
+                    result = signals.recv() => {
+                        result?;
+                        tracing::info!("second shutdown signal received: stopping");
+                    }
+                    () = window => tracing::info!("draft-19 drain window elapsed: stopping"),
+                }
                 Ok::<_, std::io::Error>(())
             })
         }

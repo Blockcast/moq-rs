@@ -283,17 +283,19 @@ fn sigterm(relay: &tokio::process::Child) {
     assert!(status.success(), "SIGTERM delivered to the relay");
 }
 
-/// The first SIGTERM starts the drain and the second stops the process.
-///
-/// Installing the tokio signal handlers replaces the default terminate action
-/// for the rest of the process, so a draining relay that ignored the second
-/// signal could only be stopped with SIGKILL.
+/// Start the relay binary with a draft-19 drain configured, and return it with
+/// its log once the shutdown handlers are installed.
 #[cfg(unix)]
-#[tokio::test]
-async fn second_shutdown_signal_stops_a_draining_relay() {
+async fn spawn_draining_relay(
+    tag: &str,
+    extra_args: &[String],
+) -> (
+    tokio::process::Child,
+    tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+) {
     use tokio::io::AsyncBufReadExt;
 
-    let (cert, key) = tls_files("signals");
+    let (cert, key) = tls_files(tag);
     let coordinator = cert.with_file_name("coordinator.json");
     let mut relay = tokio::process::Command::new(env!("CARGO_BIN_EXE_moq-relay-ietf"))
         .arg("--bind=127.0.0.1:0")
@@ -304,6 +306,7 @@ async fn second_shutdown_signal_stops_a_draining_relay() {
         .arg("--coordinator-file")
         .arg(&coordinator)
         .arg(format!("--draft19-goaway-uri={NEW_SESSION_URI}"))
+        .args(extra_args)
         .env("RUST_LOG", "info")
         .env("NO_COLOR", "1")
         .stdout(std::process::Stdio::piped())
@@ -315,6 +318,24 @@ async fn second_shutdown_signal_stops_a_draining_relay() {
 
     // Logged only once the handlers are installed, so SIGTERM is caught from here.
     await_log(&mut lines, "graceful drain armed").await;
+    (relay, lines)
+}
+
+/// The first SIGTERM starts the drain and the second stops the process.
+///
+/// Installing the tokio signal handlers replaces the default terminate action
+/// for the rest of the process, so a draining relay that ignored the second
+/// signal could only be stopped with SIGKILL.
+///
+/// tokio coalesces two SIGTERMs delivered before the first is observed into
+/// one notification, so this waits for the drain log between them. It does not
+/// cover that window, which only a very fast double Ctrl-C can hit.
+#[cfg(unix)]
+#[tokio::test]
+async fn second_shutdown_signal_stops_a_draining_relay() {
+    // The default 30 s drain window cannot elapse within this test, so the
+    // exit below can only come from the second signal.
+    let (mut relay, mut lines) = spawn_draining_relay("signals", &[]).await;
 
     sigterm(&relay);
     await_log(&mut lines, "draining draft-19 sessions").await;
@@ -325,4 +346,31 @@ async fn second_shutdown_signal_stops_a_draining_relay() {
         .expect("relay exits on the second SIGTERM instead of swallowing it")
         .expect("relay exit status is readable");
     assert!(status.success(), "relay stops cleanly, got {status}");
+}
+
+/// A supervisor sends one SIGTERM and waits (systemd, a Kubernetes pod delete).
+/// The relay exits cleanly once the drain window has elapsed, rather than
+/// waiting to be SIGKILLed at the end of the grace period.
+#[cfg(unix)]
+#[tokio::test]
+async fn single_shutdown_signal_stops_the_relay_after_the_drain_window() {
+    let (mut relay, mut lines) = spawn_draining_relay(
+        "single-signal",
+        &[format!("--draft19-goaway-timeout-ms={TIMEOUT_MS}")],
+    )
+    .await;
+
+    let signalled = Instant::now();
+    sigterm(&relay);
+    await_log(&mut lines, "draft-19 drain window elapsed").await;
+    let status = tokio::time::timeout(Duration::from_secs(10), relay.wait())
+        .await
+        .expect("relay exits after the drain window without a second signal")
+        .expect("relay exit status is readable");
+    assert!(status.success(), "relay stops cleanly, got {status}");
+    assert!(
+        signalled.elapsed() >= Duration::from_millis(TIMEOUT_MS),
+        "relay held the drain window open before exiting, took {:?}",
+        signalled.elapsed()
+    );
 }

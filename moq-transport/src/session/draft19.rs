@@ -201,7 +201,8 @@ impl Draft19Session {
     /// sender close with it once the indicated Timeout passes. Neither keys the
     /// close on open requests, so a control-plane-only session that never
     /// opened a request stream is closed too. `has_open_requests` only selects
-    /// the close reason.
+    /// the close reason. No caller in this workspace passes `true`; it is kept
+    /// for a request-plane caller downstream of this library crate.
     ///
     /// Returns whether the session was closed. Only a sent GOAWAY sets a
     /// deadline, and one carrying `Timeout=0` sets none, so this is always
