@@ -19,7 +19,7 @@
 //! retained; otherwise [`RetainedTrack::plan`] reports where the unknown part
 //! begins.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem::{size_of, size_of_val};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex, Weak};
@@ -61,7 +61,7 @@ impl FetchRetention {
         Self { inner: None }
     }
 
-    /// Retain the Objects of the `groups` highest Group IDs received on each
+    /// Retain the Objects of the `groups` most recently arrived groups of each
     /// track, holding at most `bytes` of them per track.
     pub fn new(groups: NonZeroU64, bytes: NonZeroUsize) -> Self {
         Self {
@@ -178,6 +178,11 @@ pub(crate) struct RetainedTrack {
 struct RetainedGroups {
     /// Retained groups by Group ID.
     groups: BTreeMap<u64, RetainedGroup>,
+    /// Retained Group IDs, least recently arrived first. Group ID is
+    /// peer-supplied, so eviction follows arrival: an outlier Group ID ages out
+    /// like any other group instead of pinning the window, the byte budget or
+    /// the Largest Location.
+    arrival: VecDeque<u64>,
     /// The sum of every group's `bytes`.
     bytes: usize,
 }
@@ -191,8 +196,12 @@ struct RetainedGroup {
 }
 
 impl RetainedGroups {
+    /// Drop the least recently arrived group.
     fn evict_oldest(&mut self) {
-        if let Some((_, group)) = self.groups.pop_first() {
+        let Some(group_id) = self.arrival.pop_front() else {
+            return;
+        };
+        if let Some(group) = self.groups.remove(&group_id) {
             self.bytes -= group.bytes;
         }
     }
@@ -251,50 +260,70 @@ impl RetainedTrack {
         let state = &mut *state;
         let group_id = object.object.group_id;
         let object_id = object.object.object_id;
-        let group = state.groups.get(&group_id);
         // §8.1: a relay MAY ignore a later copy of an Object it already holds.
-        if group.is_some_and(|group| group.objects.contains_key(&object_id)) {
-            return;
-        }
-
-        // The window holds the `window` highest Group IDs received. It counts
-        // groups, not a range of Group IDs, so Group IDs may be sparse and one
-        // far beyond the rest takes a single slot instead of leaving every
-        // later group out of range.
-        let full = state.groups.len() as u64 >= self.window.get();
-        if group.is_none()
-            && full
-            && state
-                .groups
-                .first_key_value()
-                .is_some_and(|(oldest, _)| group_id < *oldest)
+        if state
+            .groups
+            .get(&group_id)
+            .is_some_and(|group| group.objects.contains_key(&object_id))
         {
             return;
         }
 
-        // The byte budget is met by evicting older groups only: an Object that
-        // does not fit beside this group and the newer ones is not retained,
-        // and its Location stays unknown.
+        // Only groups that arrived before this Object's group may be dropped
+        // to make room. An Object that does not fit beside its own group and
+        // the groups after it is not retained and evicts nothing, so its
+        // Location stays unknown and a FETCH for it goes upstream.
         let cost = retained_bytes(&object);
-        let older: usize = state.groups.range(..group_id).map(|(_, g)| g.bytes).sum();
-        if (state.bytes - older).saturating_add(cost) > self.max_bytes.get() {
+        let older_bytes: usize = state
+            .arrival
+            .iter()
+            .take_while(|arrived| **arrived != group_id)
+            .filter_map(|arrived| state.groups.get(arrived))
+            .map(|group| group.bytes)
+            .sum();
+        let fits = |bytes: usize| {
+            bytes
+                .checked_add(cost)
+                .is_some_and(|total| total <= self.max_bytes.get())
+        };
+        if !fits(state.bytes - older_bytes) {
+            tracing::debug!(
+                namespace = %self.reader.namespace,
+                track = %self.reader.name,
+                group_id,
+                object_id,
+                cost,
+                "object exceeds the fetch retention byte budget; not retained"
+            );
             return;
         }
-        while state.bytes + cost > self.max_bytes.get() {
+        // Ends once the older groups are gone at the latest, since the check
+        // above proved the rest fits.
+        while !fits(state.bytes) {
             state.evict_oldest();
         }
 
+        if !state.groups.contains_key(&group_id) {
+            state.arrival.push_back(group_id);
+        }
         let group = state.groups.entry(group_id).or_default();
         group.objects.insert(object_id, object);
         group.bytes += cost;
         state.bytes += cost;
+
+        // The window holds the `window` most recently arrived groups. Only a
+        // new group can exceed it, and a new group arrives last, so this
+        // Object's group is never the one dropped here.
         if state.groups.len() as u64 > self.window.get() {
             state.evict_oldest();
         }
     }
 
     /// The Largest Location the relay knows of: the live track's, or a later
-    /// retained Object's.
+    /// retained Object's. The live track reports the last Object of its latest
+    /// subgroup, which another subgroup of the same group can exceed, so a
+    /// retained Object counts too; an outlier retained group stops counting
+    /// once it ages out (see [`RetainedGroups::arrival`]).
     fn largest_location(&self) -> Option<Location> {
         let retained = self.groups.lock().ok().and_then(|state| {
             state
@@ -557,6 +586,31 @@ mod tests {
         }
     }
 
+    /// Objects `0..count` of the group are retained.
+    fn is_complete(track: &RetainedTrack, group_id: u64, count: u64) -> bool {
+        matches!(
+            track.plan(
+                Location::new(group_id, 0),
+                Location::new(group_id, count),
+                GroupOrder::Ascending
+            ),
+            FetchPlan::Complete { ref objects, .. } if !objects.is_empty()
+        )
+    }
+
+    /// No Object of the group is retained, though the group is in range.
+    fn is_absent(track: &RetainedTrack, group_id: u64) -> bool {
+        matches!(
+            track.plan(
+                Location::new(group_id, 0),
+                Location::new(group_id, 1),
+                GroupOrder::Ascending
+            ),
+            FetchPlan::Partial { ref objects, first_unknown, .. }
+                if objects.is_empty() && first_unknown == Location::new(group_id, 0)
+        )
+    }
+
     #[test]
     fn explicit_range_inside_a_retained_group_is_complete() {
         let (_writer, track) = track();
@@ -749,48 +803,86 @@ mod tests {
             ),
             FetchPlan::Complete { .. }
         ));
-        // A late object of an evicted group is not retained again.
+        // Eviction follows arrival, not Group ID: a late object of an evicted
+        // group arrives last, so the least recently arrived group, 3, goes.
         track.insert(object(1, 0));
-        assert!(matches!(
-            track.plan(
-                Location::new(1, 0),
-                Location::new(1, 1),
-                GroupOrder::Ascending
-            ),
-            FetchPlan::Partial { ref objects, .. } if objects.is_empty()
-        ));
+        assert!(is_complete(&track, 1, 1));
+        assert!(is_absent(&track, 3));
+        assert!(is_complete(&track, 4, 2));
+        assert!(is_complete(&track, 5, 2));
     }
 
     #[test]
-    fn a_far_future_group_takes_one_slot_of_the_window() {
+    fn a_far_future_group_ages_out_of_the_window() {
         let (_writer, track) = track();
+        let far = VarInt::MAX.into_inner() - 1;
         retain(&track, 1, 0..2);
         // A Group ID near the varint maximum, e.g. from a publisher restarting
         // with a clock-derived base, followed by the track's usual groups.
-        retain(&track, VarInt::MAX.into_inner() - 1, [0]);
+        retain(&track, far, [0]);
         for group_id in 2..5 {
             retain(&track, group_id, 0..2);
         }
 
-        // Window 3 keeps the far group and the two highest groups below it.
-        for group_id in [3, 4] {
-            assert!(matches!(
-                track.plan(
-                    Location::new(group_id, 0),
-                    Location::new(group_id, 2),
-                    GroupOrder::Ascending
-                ),
-                FetchPlan::Complete { ref objects, .. } if objects.len() == 2
-            ));
+        // Window 3 keeps the three most recently arrived groups.
+        for group_id in 2..5 {
+            assert!(is_complete(&track, group_id, 2));
         }
+        // The far group is gone, so it no longer sets the Largest Location
+        // (§9.16.3 INVALID_RANGE, §9.17 End Location).
         assert!(matches!(
             track.plan(
-                Location::new(2, 0),
-                Location::new(2, 2),
+                Location::new(far, 0),
+                Location::new(far, 1),
                 GroupOrder::Ascending
             ),
-            FetchPlan::Partial { ref objects, .. } if objects.is_empty()
+            FetchPlan::BeyondLargest
         ));
+        let FetchPlan::Complete { end_location, .. } = track.plan(
+            Location::new(4, 0),
+            Location::new(far, 1),
+            GroupOrder::Ascending,
+        ) else {
+            panic!("expected a complete plan");
+        };
+        assert_eq!(end_location, Location::new(4, 2));
+    }
+
+    #[test]
+    fn a_far_future_group_at_the_byte_budget_ages_out() {
+        let far = 1 << 62;
+        let budget = 4 * retained_bytes(&object(1, 0));
+        let (_writer, track) = track_with_budget(budget);
+        // The far group grows until its next Object no longer fits.
+        let mut object_id = 0;
+        loop {
+            let before = track.groups.lock().unwrap().bytes;
+            track.insert(object(far, object_id));
+            if track.groups.lock().unwrap().bytes == before {
+                break;
+            }
+            object_id += 1;
+        }
+        assert!(object_id > 0, "the far group is retained");
+        assert!(
+            track.groups.lock().unwrap().bytes + retained_bytes(&object(far, object_id)) > budget
+        );
+
+        // Once it stops being fed, the track's usual groups displace it.
+        retain(&track, 1, 0..2);
+        retain(&track, 2, 0..2);
+        assert!(is_complete(&track, 2, 2));
+        assert!(matches!(
+            track.plan(
+                Location::new(far, 0),
+                Location::new(far, 1),
+                GroupOrder::Ascending
+            ),
+            FetchPlan::BeyondLargest
+        ));
+        let state = track.groups.lock().unwrap();
+        assert!(!state.groups.contains_key(&far));
+        assert!(state.bytes <= budget);
     }
 
     #[test]
@@ -856,17 +948,66 @@ mod tests {
         assert_eq!(locations(&objects), vec![(5, 0), (5, 1), (5, 2)]);
         assert_eq!(first_unknown, Location::new(5, 3));
 
-        // An Object of an older group never evicts a newer group.
+        // Eviction follows arrival, not Group ID: group 4 arrives after group
+        // 5, so group 5 makes room for it.
         track.insert(object(4, 0));
+        assert!(is_complete(&track, 4, 1));
+        assert!(is_absent(&track, 5));
+        // An Object of an earlier arrival never evicts a later one: group 6
+        // fills the budget after group 4, so group 4's next Object is not
+        // retained.
+        retain(&track, 6, 0..2);
+        track.insert(object(4, 1));
         assert!(matches!(
             track.plan(
                 Location::new(4, 0),
-                Location::new(4, 1),
+                Location::new(4, 2),
                 GroupOrder::Ascending
             ),
-            FetchPlan::Partial { ref objects, .. } if objects.is_empty()
+            FetchPlan::Partial { ref objects, first_unknown, .. }
+                if objects.len() == 1 && first_unknown == Location::new(4, 1)
         ));
+        assert!(is_complete(&track, 6, 2));
         assert_eq!(track.groups.lock().unwrap().bytes, 3 * cost);
+    }
+
+    #[tokio::test]
+    async fn a_retained_object_past_the_live_latest_subgroup_is_in_range() {
+        let (writer, track) = track();
+        let mut subgroups = writer.subgroups().unwrap();
+        // Group 5 splits its Objects across two subgroups. The live track's
+        // Largest Location follows its latest subgroup, {5, 1}, though
+        // subgroup 0 already carried Object 2.
+        write_group(&mut subgroups, 5, &[0, 2]).await;
+        let mut second = subgroups
+            .create(Subgroup {
+                group_id: 5,
+                subgroup_id: 1,
+                priority: 240,
+            })
+            .unwrap();
+        let payload = Bytes::from("g5o1");
+        second
+            .create_with_id(1, payload.len(), None)
+            .unwrap()
+            .write(payload)
+            .unwrap();
+        assert_eq!(track.reader.largest_location(), Some(Location::new(5, 1)));
+        retain(&track, 5, 0..3);
+
+        let FetchPlan::Complete {
+            objects,
+            end_location,
+        } = track.plan(
+            Location::new(5, 2),
+            Location::new(5, 3),
+            GroupOrder::Ascending,
+        )
+        else {
+            panic!("expected a complete plan");
+        };
+        assert_eq!(locations(&objects), vec![(5, 2)]);
+        assert_eq!(end_location, Location::new(5, 3));
     }
 
     #[test]
