@@ -6,7 +6,7 @@ use std::{collections::VecDeque, fmt, sync::Arc};
 
 use crate::watch::State;
 
-use super::{ServeError, Track};
+use super::{ServeError, Track, TrackTapEvent, TrackTaps};
 
 pub struct Datagrams {
     pub track: Arc<Track>,
@@ -78,15 +78,25 @@ impl Default for DatagramsState {
 pub struct DatagramsWriter {
     state: State<DatagramsState>,
     pub track: Arc<Track>,
+    taps: TrackTaps,
 }
 
 impl DatagramsWriter {
     fn new(state: State<DatagramsState>, track: Arc<Track>) -> Self {
-        Self { state, track }
+        Self {
+            state,
+            track,
+            taps: TrackTaps::default(),
+        }
+    }
+
+    pub(super) fn set_taps(&mut self, taps: TrackTaps) {
+        self.taps = taps;
     }
 
     pub fn write(&mut self, datagram: Datagram) -> Result<(), ServeError> {
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        self.taps.emit(|| TrackTapEvent::Datagram(datagram.clone()));
 
         if state.ring.len() >= state.depth {
             // Raw-lossy overflow policy: supersede the oldest unread datagram

@@ -24,12 +24,13 @@ This repository provides:
 - PUBLISH_NAMESPACE
 - PUBLISH / PUBLISH_OK / PUBLISH_DONE
 - SUBSCRIBE
+- Standalone FETCH: passthrough for local and remote PUBLISH_NAMESPACE origins, and answers from retained groups with `--fetch-retention-groups` (bounded by `--fetch-retention-track-bytes` and `--fetch-retention-bytes`)
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
 - SUBSCRIBE_NAMESPACE (Soon)
-- FETCH (Not Soon)
+- Joining FETCH, and FETCH passthrough to exact PUBLISH origins
 
 ### Wire Profiles
 

@@ -7,6 +7,7 @@ mod error;
 mod object;
 mod stream;
 mod subgroup;
+mod tap;
 mod track;
 mod tracks;
 
@@ -15,5 +16,7 @@ pub use error::*;
 pub use object::*;
 pub use stream::*;
 pub use subgroup::*;
+pub(crate) use tap::{TapRegistrar, TrackTaps};
+pub use tap::{TrackTap, TrackTapEvent};
 pub use track::*;
 pub use tracks::*;
