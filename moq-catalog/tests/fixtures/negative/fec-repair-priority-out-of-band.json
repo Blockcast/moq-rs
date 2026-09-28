@@ -6,21 +6,18 @@
     {
       "name": "video",
       "packaging": "mmtp",
+      "codec": "avc1.640028",
       "mmtpMode": "mfu",
       "timescale": 90000,
       "groupDurationMs": 1000,
       "fec": {
         "algorithm": "raptorq",
-        "sourceSymbols": 32,
+        "sourceSymbols": 64,
         "repairSymbols": 8,
-        "symbolSize": 1310,
-        "repairTrack": "video-repair"
+        "symbolSize": 1312,
+        "repairTrack": "video/repair"
       }
     },
-    {
-      "name": "video-repair",
-      "packaging": "fec-repair",
-      "priority": 240
-    }
+    { "name": "video/repair", "packaging": "fec-repair", "priority": 100 }
   ]
 }

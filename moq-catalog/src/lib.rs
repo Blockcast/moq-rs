@@ -61,6 +61,19 @@ pub struct Track {
     pub samplerate: Option<u64>,
     #[serde(rename = "channelConfig", skip_serializing_if = "Option::is_none")]
     pub channel_config: Option<String>,
+    /// Content role (`video`, `audio`, `repair`, ...).
+    ///
+    /// Untyped on purpose: libmmt's schema pins this to `video|audio|repair`
+    /// while hang's `moq_msf::Role` also emits caption/subtitle/sign-language
+    /// and an `Unknown(String)` catch-all. Narrowing it here would swap one
+    /// divergence for another, so the value set stays an open spec question
+    /// (BLO-37534) and this crate only guarantees the field survives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Publisher ownership role, e.g. `base`, `delta`, `repair`,
+    /// `abr-rung:<track name>`.
+    #[serde(rename = "trackRole", skip_serializing_if = "Option::is_none")]
+    pub track_role: Option<String>,
     #[serde(rename = "mmtpMode", skip_serializing_if = "Option::is_none")]
     pub mmtp_mode: Option<MmtpMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,10 +82,33 @@ pub struct Track {
     pub group_duration_ms: Option<u32>,
     #[serde(rename = "groupDurationTicks", skip_serializing_if = "Option::is_none")]
     pub group_duration_ticks: Option<u64>,
+    /// Measured keyframe interval, used by repair watchdogs.
+    #[serde(rename = "keyframeIntervalMs", skip_serializing_if = "Option::is_none")]
+    pub keyframe_interval_ms: Option<u64>,
+    /// Exact keyframe interval in `timescale` ticks (draft-ramadan-moq-mmt
+    /// §4.4.3). Wins over `keyframeIntervalMs` when both are present.
+    #[serde(
+        rename = "keyframeIntervalTicks",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub keyframe_interval_ticks: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec: Option<FecDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
+    /// `fec-repair` only: base repair layer index within this source's chain.
+    #[serde(rename = "repairLayer", skip_serializing_if = "Option::is_none")]
+    pub repair_layer: Option<u32>,
+    /// `fec-repair` only: repair symbols per block carried by this layer or
+    /// overlay (P_i).
+    #[serde(rename = "repairSymbols", skip_serializing_if = "Option::is_none")]
+    pub repair_symbols: Option<u32>,
+    /// `fec-repair` only: marks a keyframe-overlay FEC instance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// `fec-repair` overlay only: source symbols per block (K_overlay).
+    #[serde(rename = "sourceSymbols", skip_serializing_if = "Option::is_none")]
+    pub source_symbols: Option<u32>,
     #[serde(rename = "renderGroup", skip_serializing_if = "Option::is_none")]
     pub render_group: Option<u32>,
     #[serde(rename = "altGroup", skip_serializing_if = "Option::is_none")]
@@ -127,8 +163,15 @@ pub struct FecDescriptor {
     pub symbol_size: u32,
     #[serde(rename = "interleaveDepthMs", skip_serializing_if = "Option::is_none")]
     pub interleave_depth_ms: Option<u32>,
+    /// Receiver reorder budget before a block is declared lost.
+    #[serde(rename = "reorderToleranceMs", skip_serializing_if = "Option::is_none")]
+    pub reorder_tolerance_ms: Option<f64>,
     #[serde(rename = "repairTrack")]
     pub repair_track: String,
+    /// Container carrying the repair symbols. `native` is the only value on
+    /// the MSF wire (BLO-37534); `validate` rejects anything else.
+    #[serde(rename = "repairContainer", skip_serializing_if = "Option::is_none")]
+    pub repair_container: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<FecMode>,
 }
@@ -320,21 +363,41 @@ impl Root {
                     reason: "interleaveDepthMs must be positive when present",
                 });
             }
+            // libmmt pins `repairContainer` to `native`, hang's own profile
+            // checker enforces the same, and `to_golden_string` strips the
+            // field entirely. `native` is therefore the only value the MSF
+            // wire carries (BLO-37534).
+            if let Some(container) = &fec.repair_container {
+                if container != "native" {
+                    return Err(CatalogValidationError::InvalidFecParams {
+                        track_name: track.name.clone(),
+                        reason: "repairContainer must be native",
+                    });
+                }
+            }
         }
         Ok(())
     }
 
     fn validate_repair_track(&self, track: &Track) -> Result<(), CatalogValidationError> {
-        if track.priority != Some(240) {
-            return Err(CatalogValidationError::InvalidRepairTrack {
-                track_name: track.name.clone(),
-                reason: "priority must be 240",
-            });
+        // libmmt's schema allows 192..=255 and defaults an absent priority to
+        // 240: layers 1..n and keyframe overlays are deliberately ranked below
+        // layer 0. The old `== Some(240)` here rejected every layered-repair
+        // catalog the canonical corpus publishes (BLO-37534).
+        if let Some(priority) = track.priority {
+            if priority < 192 {
+                return Err(CatalogValidationError::InvalidRepairTrack {
+                    track_name: track.name.clone(),
+                    reason: "priority must be between 192 and 255",
+                });
+            }
         }
         if track.mmtp_mode.is_some()
             || track.timescale.is_some()
             || track.group_duration_ms.is_some()
             || track.group_duration_ticks.is_some()
+            || track.keyframe_interval_ms.is_some()
+            || track.keyframe_interval_ticks.is_some()
             || track.fec.is_some()
         {
             return Err(CatalogValidationError::InvalidRepairTrack {

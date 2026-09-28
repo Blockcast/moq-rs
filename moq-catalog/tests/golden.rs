@@ -1,6 +1,6 @@
 use moq_catalog::Root;
 
-const POSITIVE: [(&str, &str); 3] = [
+const POSITIVE: [(&str, &str); 6] = [
     ("flat-av", include_str!("fixtures/positive/flat-av.json")),
     (
         "fec-multicast",
@@ -10,9 +10,21 @@ const POSITIVE: [(&str, &str); 3] = [
         "ticks-and-mixed-timescales",
         include_str!("fixtures/positive/ticks-and-mixed-timescales.json"),
     ),
+    (
+        "track-role",
+        include_str!("fixtures/positive/track-role.json"),
+    ),
+    (
+        "fec-layered-repair",
+        include_str!("fixtures/positive/fec-layered-repair.json"),
+    ),
+    (
+        "hang-catalog-to-string",
+        include_str!("fixtures/positive/hang-catalog-to-string.json"),
+    ),
 ];
 
-const NEGATIVE: [(&str, &str); 6] = [
+const NEGATIVE: [(&str, &str); 8] = [
     (
         "legacy-selection-params",
         include_str!("fixtures/negative/legacy-selection-params.json"),
@@ -36,6 +48,14 @@ const NEGATIVE: [(&str, &str); 6] = [
     (
         "raptorq-unaligned-symbol",
         include_str!("fixtures/negative/raptorq-unaligned-symbol.json"),
+    ),
+    (
+        "fec-repair-priority-out-of-band",
+        include_str!("fixtures/negative/fec-repair-priority-out-of-band.json"),
+    ),
+    (
+        "fec-repair-container-not-native",
+        include_str!("fixtures/negative/fec-repair-container-not-native.json"),
     ),
 ];
 

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "streamingFormat": "mmtp",
+  "streamingFormatVersion": "draft-ramadan-moq-mmt-00",
+  "tracks": [
+    {
+      "name": "video/base",
+      "packaging": "mmtp",
+      "codec": "avc1.640028",
+      "trackRole": "base",
+      "mmtpMode": "mfu",
+      "timescale": 90000,
+      "groupDurationMs": 1000
+    },
+    {
+      "name": "video/delta",
+      "packaging": "mmtp",
+      "codec": "avc1.640028",
+      "trackRole": "delta",
+      "mmtpMode": "mfu",
+      "timescale": 90000,
+      "groupDurationMs": 1000
+    },
+    {
+      "name": "video/repair",
+      "packaging": "fec-repair",
+      "trackRole": "repair",
+      "priority": 240
+    },
+    {
+      "name": "audio",
+      "packaging": "mmtp",
+      "codec": "mp4a.40.2",
+      "trackRole": "audio",
+      "mmtpMode": "mfu",
+      "timescale": 48000,
+      "groupDurationMs": 1000
+    },
+    {
+      "name": "video/1080p",
+      "packaging": "mmtp",
+      "codec": "avc1.640028",
+      "trackRole": "abr-rung:video/1080p",
+      "mmtpMode": "mfu",
+      "timescale": 90000,
+      "groupDurationMs": 1000
+    }
+  ]
+}
