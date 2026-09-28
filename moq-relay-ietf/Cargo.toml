@@ -40,7 +40,7 @@ url = "2"
 
 # Async stuff
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -78,7 +78,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 [dev-dependencies]
-# Self-signed localhost certificates for the FETCH relay tests.
+# Self-signed localhost certificates for the FETCH relay and draft-19 drain tests.
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 # Payload chunks in FETCH retention tests.

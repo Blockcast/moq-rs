@@ -7,13 +7,70 @@ mod file_coordinator;
 use std::sync::Arc;
 use std::{net, path::PathBuf};
 
+use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use moq_transport::profile::WireProfile;
 use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
+use moq_relay_ietf::{
+    Coordinator, Draft19Drain, Relay, RelayConfig, SessionConfig, Web, WebConfig,
+};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
+/// SIGINT, and SIGTERM where the platform has it.
+///
+/// Registering replaces the platform's default terminate action for the rest
+/// of the process, not just until the first signal. Whoever holds these must
+/// act on every signal, or the process can only be stopped with SIGKILL.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn register() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    /// Wait for the next shutdown signal.
+    ///
+    /// tokio coalesces a signal kind: several deliveries before this is polled
+    /// yield one notification, so a very fast double Ctrl-C can count as one.
+    /// Supervisors send one SIGTERM and then wait, which is unaffected.
+    async fn recv(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            // `None` means the stream closed, not that a signal arrived.
+            // Reporting it as a signal would stop the relay with exit 0 and
+            // look like a clean shutdown.
+            tokio::select! {
+                Some(()) = self.interrupt.recv() => Ok(()),
+                Some(()) = self.terminate.recv() => Ok(()),
+                else => Err(std::io::Error::other("shutdown signal streams closed")),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum WireProfileArg {
@@ -139,6 +196,31 @@ pub struct Cli {
     /// When set, serves metrics at http://<addr>/metrics
     #[arg(long)]
     pub metrics_addr: Option<net::SocketAddr>,
+
+    /// Redirect draining draft-19 sessions to this URL.
+    ///
+    /// Setting it enables the draft-19 graceful drain: on SIGINT/SIGTERM the
+    /// relay sends every draft-19 session a GOAWAY carrying this New Session
+    /// URI, and redirects new draft-19 sessions the same way instead of
+    /// serving them. Draft-16 sessions are unaffected.
+    ///
+    /// The process keeps running until every draft-19 session has closed,
+    /// either by its peer or with GOAWAY_TIMEOUT once the Timeout counted from
+    /// that session's GOAWAY elapses, then exits cleanly. A second SIGINT or
+    /// SIGTERM stops it early. With a zero Timeout, sessions close only when
+    /// their peers do. Draft-19 sessions that arrive during the drain are
+    /// redirected and waited for too, so a steady stream of them keeps the
+    /// process up until the second signal or the supervisor's kill.
+    #[arg(long)]
+    pub draft19_goaway_uri: Option<Url>,
+
+    /// Milliseconds advertised in the draft-19 GOAWAY Timeout.
+    ///
+    /// Once it elapses with the peer still connected, the relay closes that
+    /// session with GOAWAY_TIMEOUT (0x10). Zero advertises no deadline and
+    /// waits for the peer instead. Only used with --draft19-goaway-uri.
+    #[arg(long, default_value_t = 30_000)]
+    pub draft19_goaway_timeout_ms: u64,
 }
 
 #[tokio::main]
@@ -238,6 +320,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
+    let draft19_drain = cli.draft19_goaway_uri.clone().map(|uri| Draft19Drain {
+        new_session_uri: uri,
+        timeout_ms: cli.draft19_goaway_timeout_ms,
+        signal: CancellationToken::new(),
+        sessions: TaskTracker::new(),
+    });
+
     let relay = Relay::new(RelayConfig {
         tls: tls.clone(),
         bind: None,
@@ -257,7 +346,45 @@ async fn main() -> anyhow::Result<()> {
         // connection as a public client. Embedders that run relay-to-relay
         // meshes supply a tagger to mark internal peers.
         connection_tagger: None,
+        draft19_drain: draft19_drain.clone(),
     })?;
+
+    // Start the draft-19 drain on the first shutdown signal and stop once every
+    // draft-19 session has closed, or on the second signal, when a drain is
+    // configured. Without one no handler is installed and the platform's
+    // default terminate action still applies.
+    let drain_then_stop = match draft19_drain {
+        Some(drain) => {
+            let mut signals =
+                ShutdownSignals::register().context("failed to watch for shutdown signals")?;
+            tracing::info!(
+                new_session_uri = %drain.new_session_uri,
+                timeout_ms = drain.timeout_ms,
+                "draft-19 graceful drain armed: SIGINT/SIGTERM sends GOAWAY"
+            );
+            Some(async move {
+                signals.recv().await?;
+                tracing::info!("shutdown signal received: draining draft-19 sessions");
+                drain.signal.cancel();
+                // Wait for the sessions themselves, not a timer. Each session's
+                // Timeout runs from its own GOAWAY send, which is later than
+                // this signal, so a timer started here would stop the process
+                // before any session could be closed with GOAWAY_TIMEOUT.
+                drain.sessions.close();
+                tokio::select! {
+                    result = signals.recv() => {
+                        result?;
+                        tracing::info!("second shutdown signal received: stopping");
+                    }
+                    () = drain.sessions.wait() => {
+                        tracing::info!("draft-19 drain complete: every session has closed, stopping");
+                    }
+                }
+                Ok::<_, std::io::Error>(())
+            })
+        }
+        None => None,
+    };
 
     if cli.dev {
         // Create a web server too.
@@ -288,7 +415,14 @@ async fn main() -> anyhow::Result<()> {
              --fetch-retention-bytes must be set together"
         ),
     };
-    relay.run().await
+
+    match drain_then_stop {
+        Some(drain_then_stop) => tokio::select! {
+            result = relay.run() => result,
+            result = drain_then_stop => result.context("failed to watch for shutdown signals"),
+        },
+        None => relay.run().await,
+    }
 }
 
 fn enabled_wire_profiles(wire_profile: Option<WireProfileArg>) -> Vec<WireProfile> {

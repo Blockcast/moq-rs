@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    net,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 
@@ -9,6 +16,8 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
 use moq_transport::profile::WireProfile;
 use moq_transport::session::SessionConfig;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use url::Url;
 
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
@@ -68,6 +77,45 @@ pub struct RelayConfig {
     /// Outbound connections the relay dials itself (`--announce`,
     /// [`RemoteManager`]) are always tagged internal and bypass this.
     pub connection_tagger: Option<Arc<dyn ConnectionTagger>>,
+
+    /// Graceful-drain parameters for draft-19 sessions.
+    ///
+    /// When `None` the relay never drains draft-19 sessions and they run until
+    /// the peer disconnects.
+    pub draft19_drain: Option<Draft19Drain>,
+}
+
+/// Graceful-drain parameters for draft-19 sessions.
+///
+/// Cancelling [`Self::signal`] starts the drain. Every live draft-19 session
+/// is sent a GOAWAY carrying [`Self::new_session_uri`] and
+/// [`Self::timeout_ms`], and every draft-19 session established afterwards is
+/// sent the same GOAWAY immediately after SETUP. That redirect is how
+/// draft-ietf-moq-transport-19 §3.6 expects a draining server to turn new
+/// arrivals away: the peer learns where to reconnect instead of seeing a bare
+/// close.
+///
+/// Draining is scoped to draft-19. Draft-16 media routing is unaffected.
+#[derive(Clone, Debug)]
+pub struct Draft19Drain {
+    /// Advertised as the GOAWAY New Session URI. Clients redial here.
+    pub new_session_uri: Url,
+
+    /// Advertised as the GOAWAY millisecond Timeout, and enforced: once it
+    /// elapses with the peer still connected, the relay closes the session
+    /// with `GOAWAY_TIMEOUT` (`0x10`).
+    ///
+    /// Zero advertises no deadline, so the relay waits for the peer instead.
+    pub timeout_ms: u64,
+
+    /// Cancel to begin draining.
+    pub signal: CancellationToken,
+
+    /// Every draft-19 session holds a token from this tracker until it ends,
+    /// so a caller can close the tracker after cancelling [`Self::signal`] and
+    /// wait for it to empty: that is the point at which every session has been
+    /// redirected and closed, by its peer or with `GOAWAY_TIMEOUT`.
+    pub sessions: TaskTracker,
 }
 
 impl RelayConfig {
@@ -180,6 +228,7 @@ impl Relay {
             coordinator,
             session: session_config,
             connection_tagger,
+            draft19_drain,
             ..
         } = config;
 
@@ -337,6 +386,7 @@ impl Relay {
                         let coordinator = coordinator.clone();
                         let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
+                        let draft19_drain = draft19_drain.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -353,7 +403,7 @@ impl Relay {
                             // plane and say so, rather than handing the
                             // connection to a session that would misframe it.
                             if selected_version == WireProfile::Draft19 {
-                                serve_draft19_control_plane(conn).await;
+                                serve_draft19_control_plane(conn, draft19_drain).await;
                                 metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 return Ok(());
                             }
@@ -501,7 +551,18 @@ impl Relay {
 /// conformant SETUP exchange and GOAWAY handling, and every other control
 /// message is refused out loud. Media routing over draft-19 is out of scope;
 /// see the `--wire-profile` help text.
-async fn serve_draft19_control_plane(conn: web_transport::Session) {
+///
+/// When `drain` is supplied and its signal is cancelled, the session is sent a
+/// GOAWAY carrying the configured New Session URI and millisecond Timeout, and
+/// then closed: gracefully once the peer closes, or with `GOAWAY_TIMEOUT`
+/// (`0x10`) once the advertised Timeout elapses. A session that starts after
+/// the signal already fired takes the same path immediately after SETUP.
+pub async fn serve_draft19_control_plane(
+    conn: web_transport::Session,
+    drain: Option<Draft19Drain>,
+) {
+    let _in_flight = drain.as_ref().map(|drain| drain.sessions.token());
+
     use moq_transport::profile::draft19::Setup;
     use moq_transport::session::{Draft19Session, Draft19SessionRole};
 
@@ -527,16 +588,92 @@ async fn serve_draft19_control_plane(conn: web_transport::Session) {
         "draft-19 session established: control plane only, relay media routing is not implemented"
     );
 
+    // Serve until the peer goes away or the relay begins draining.
     loop {
-        match session.receive_control().await {
-            Ok(frame) => tracing::warn!(
-                message_type = frame.message_type,
-                "refusing draft-19 control message: relay media routing is not implemented"
-            ),
-            Err(err) => {
-                tracing::info!(error = %err, "draft-19 session closed");
-                return;
+        tokio::select! {
+            result = session.receive_control() => match result {
+                Ok(frame) => tracing::warn!(
+                    message_type = frame.message_type,
+                    "refusing draft-19 control message: relay media routing is not implemented"
+                ),
+                Err(err) => {
+                    tracing::info!(error = %err, "draft-19 session closed");
+                    return;
+                }
+            },
+            () = drain_signalled(drain.as_ref()) => break,
+        }
+    }
+
+    let Some(drain) = drain else {
+        // `drain_signalled` never completes without a drain configured, so the
+        // loop above cannot break here.
+        unreachable!("drain loop broke without a configured drain");
+    };
+
+    let goaway = moq_transport::profile::draft19::GoAway {
+        new_session_uri: moq_transport::coding::SessionUri(drain.new_session_uri.to_string()),
+        timeout_ms: drain.timeout_ms,
+    };
+    let frame = match goaway.into_frame() {
+        Ok(frame) => frame,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to encode draft-19 drain GOAWAY");
+            return;
+        }
+    };
+    if let Err(err) = session.send_control(&frame).await {
+        tracing::warn!(error = %err, "failed to send draft-19 drain GOAWAY");
+        return;
+    }
+    metrics::counter!("moq_relay_draft19_goaway_sent_total").increment(1);
+    tracing::info!(
+        new_session_uri = %drain.new_session_uri,
+        timeout_ms = drain.timeout_ms,
+        "draft-19 drain: sent GOAWAY"
+    );
+
+    // Wait for the peer to close, bounded by the Timeout we just advertised.
+    let peer_close = async {
+        loop {
+            match session.receive_control().await {
+                Ok(frame) => tracing::warn!(
+                    message_type = frame.message_type,
+                    "refusing draft-19 control message: draining"
+                ),
+                Err(err) => return err,
             }
         }
+    };
+
+    if drain.timeout_ms == 0 {
+        // Timeout=0 advertises no deadline, so there is nothing to enforce.
+        let err = peer_close.await;
+        tracing::info!(error = %err, "draft-19 session closed after GOAWAY");
+        return;
+    }
+
+    let outcome = tokio::time::timeout(Duration::from_millis(drain.timeout_ms), peer_close).await;
+
+    match outcome {
+        Ok(err) => tracing::info!(error = %err, "draft-19 session closed after GOAWAY"),
+        Err(_elapsed) => {
+            // A control-plane-only session never opens a request stream.
+            if session.enforce_control_goaway_timeout(Instant::now(), false) {
+                metrics::counter!("moq_relay_draft19_goaway_timeout_total").increment(1);
+                tracing::warn!(
+                    timeout_ms = drain.timeout_ms,
+                    "draft-19 GOAWAY timeout elapsed without peer close: closing with GOAWAY_TIMEOUT"
+                );
+            }
+        }
+    }
+}
+
+/// Resolve once the drain signal fires, or never when no drain is configured.
+async fn drain_signalled(drain: Option<&Draft19Drain>) {
+    match drain {
+        Some(drain) => drain.signal.cancelled().await,
+        None => std::future::pending().await,
     }
 }
