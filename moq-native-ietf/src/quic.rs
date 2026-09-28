@@ -490,6 +490,40 @@ impl Endpoint {
             tags: config.tags,
         })
     }
+
+    /// A handle for closing this endpoint once its owner is done with it. Take
+    /// it before handing the endpoint off; it stays valid after.
+    pub fn closer(&self) -> EndpointCloser {
+        EndpointCloser {
+            quic: self.client.quic.clone(),
+        }
+    }
+}
+
+/// Closes a QUIC [`Endpoint`] and waits for its closes to reach the network.
+/// See [`Endpoint::closer`].
+#[derive(Clone)]
+pub struct EndpointCloser {
+    quic: quinn::Endpoint,
+}
+
+impl EndpointCloser {
+    /// Close every connection still open on the endpoint with `code` and
+    /// `reason`, refuse new ones, and resolve once every connection is gone.
+    ///
+    /// A connection that is already closed keeps the code it was closed with.
+    ///
+    /// Closing a connection only queues its CONNECTION_CLOSE frame for quinn's
+    /// driver, so a process that exits right after closing can exit before the
+    /// frame is sent. quinn keeps each closed connection until its draining
+    /// period has run, which is long enough for the driver to send the frame,
+    /// and only then releases it. Waiting here for every connection to go is
+    /// the wait quinn documents for exiting gracefully
+    /// (`quinn::Endpoint::wait_idle`).
+    pub async fn close_and_wait_idle(&self, code: u32, reason: &[u8]) {
+        self.quic.close(code.into(), reason);
+        self.quic.wait_idle().await;
+    }
 }
 
 /// Metadata about a connection accepted by [`Server::accept`].

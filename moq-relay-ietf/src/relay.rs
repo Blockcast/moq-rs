@@ -17,7 +17,7 @@ use moq_native_ietf::quic::{self, Endpoint};
 use moq_transport::profile::WireProfile;
 use moq_transport::session::SessionConfig;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{task_tracker::TaskTrackerToken, TaskTracker};
 use url::Url;
 
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
@@ -96,6 +96,9 @@ pub struct RelayConfig {
 /// close.
 ///
 /// Draining is scoped to draft-19. Draft-16 media routing is unaffected.
+///
+/// Each accepted draft-19 connection is [admitted](Self::admit) before it is
+/// served, and [`Self::finished`] reports when the drain is over.
 #[derive(Clone, Debug)]
 pub struct Draft19Drain {
     /// Advertised as the GOAWAY New Session URI. Clients redial here.
@@ -103,7 +106,8 @@ pub struct Draft19Drain {
 
     /// Advertised as the GOAWAY millisecond Timeout, and enforced: once it
     /// elapses with the peer still connected, the relay closes the session
-    /// with `GOAWAY_TIMEOUT` (`0x10`).
+    /// with `GOAWAY_TIMEOUT` (`0x10`). It also bounds the drain; see
+    /// [`Self::finished`].
     ///
     /// Zero advertises no deadline, so the relay waits for the peer instead.
     pub timeout_ms: u64,
@@ -111,11 +115,118 @@ pub struct Draft19Drain {
     /// Cancel to begin draining.
     pub signal: CancellationToken,
 
-    /// Every draft-19 session holds a token from this tracker until it ends,
-    /// so a caller can close the tracker after cancelling [`Self::signal`] and
-    /// wait for it to empty: that is the point at which every session has been
-    /// redirected and closed, by its peer or with `GOAWAY_TIMEOUT`.
-    pub sessions: TaskTracker,
+    /// Every admitted draft-19 connection, from accept until its session ends.
+    sessions: TaskTracker,
+
+    /// The admitted connections that were live when the drain began: the ones
+    /// the drain's GOAWAY broadcast redirects. Arrivals during the drain are
+    /// redirected too, but are not part of the broadcast.
+    broadcast: TaskTracker,
+
+    /// When the broadcast's most recent GOAWAY was sent.
+    last_broadcast_goaway: Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+/// Why [`Draft19Drain::finished`] resolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Draft19DrainEnd {
+    /// Every admitted draft-19 session has ended.
+    Drained,
+
+    /// Every session live when the drain began has been redirected and has
+    /// ended, and the GOAWAY Timeout has since run out from the broadcast's
+    /// last GOAWAY. Sessions that arrived during the drain may still be open.
+    Ceiling,
+}
+
+impl Draft19Drain {
+    pub fn new(new_session_uri: Url, timeout_ms: u64) -> Self {
+        Self {
+            new_session_uri,
+            timeout_ms,
+            signal: CancellationToken::new(),
+            sessions: TaskTracker::new(),
+            broadcast: TaskTracker::new(),
+            last_broadcast_goaway: Default::default(),
+        }
+    }
+
+    /// Admit an accepted draft-19 connection to the drain.
+    ///
+    /// Call at accept time, before the connection's task is spawned or polled,
+    /// and hand the result to [`serve_draft19_control_plane`]. The drain cannot
+    /// be [finished](Self::finished) while the admission is alive, so a
+    /// connection accepted mid-drain is redirected rather than dropped at exit.
+    pub fn admit(&self) -> Draft19Admission {
+        Draft19Admission {
+            drain: self.clone(),
+            _session: self.sessions.token(),
+            broadcast: (!self.signal.is_cancelled()).then(|| self.broadcast.token()),
+        }
+    }
+
+    /// Resolve once the drain is over. Call after cancelling [`Self::signal`].
+    ///
+    /// The drain is over when every admitted session has ended
+    /// ([`Draft19DrainEnd::Drained`]), or at the ceiling
+    /// ([`Draft19DrainEnd::Ceiling`]), whichever comes first. The ceiling is
+    /// [`Self::timeout_ms`] after the last GOAWAY the broadcast sent, or after
+    /// this call if the broadcast sent none, and it waits for every broadcast
+    /// session to end first. Each of those closes by its own Timeout, so none
+    /// is cut short and each keeps its `GOAWAY_TIMEOUT` close. Arrivals during
+    /// the drain cannot move the ceiling, so a steady stream of them cannot
+    /// hold the drain open.
+    ///
+    /// A zero Timeout advertises no deadline, so there is no ceiling and the
+    /// drain ends only once every session, arrivals included, has ended.
+    pub async fn finished(&self) -> Draft19DrainEnd {
+        let began = Instant::now();
+        self.sessions.close();
+        self.broadcast.close();
+
+        let ceiling = async {
+            self.broadcast.wait().await;
+            if self.timeout_ms == 0 {
+                return std::future::pending().await;
+            }
+            let last_goaway = self
+                .last_broadcast_goaway
+                .lock()
+                .expect("drain GOAWAY clock is never poisoned")
+                .map_or(began, |sent| sent.max(began));
+            let deadline = last_goaway + Duration::from_millis(self.timeout_ms);
+            tokio::time::sleep_until(deadline.into()).await;
+        };
+
+        tokio::select! {
+            () = self.sessions.wait() => Draft19DrainEnd::Drained,
+            () = ceiling => Draft19DrainEnd::Ceiling,
+        }
+    }
+}
+
+/// A draft-19 connection's place in a [`Draft19Drain`], from accept until its
+/// session ends. See [`Draft19Drain::admit`].
+#[derive(Debug)]
+pub struct Draft19Admission {
+    drain: Draft19Drain,
+    _session: TaskTrackerToken,
+    /// Held when admitted before the drain began.
+    broadcast: Option<TaskTrackerToken>,
+}
+
+impl Draft19Admission {
+    /// Record that this session's drain GOAWAY has been sent.
+    fn goaway_sent(&self, sent: Instant) {
+        if self.broadcast.is_some() {
+            let mut last = self
+                .drain
+                .last_broadcast_goaway
+                .lock()
+                .expect("drain GOAWAY clock is never poisoned");
+            *last = Some(last.map_or(sent, |last| last.max(sent)));
+        }
+    }
 }
 
 impl RelayConfig {
@@ -386,7 +497,13 @@ impl Relay {
                         let coordinator = coordinator.clone();
                         let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
-                        let draft19_drain = draft19_drain.clone();
+                        // Admit draft-19 connections to the drain here, before
+                        // their task is pushed or polled, so a connection
+                        // accepted while the drain is momentarily empty holds
+                        // it open instead of being dropped at exit.
+                        let draft19_admission = (selected_version == WireProfile::Draft19)
+                            .then(|| draft19_drain.as_ref().map(Draft19Drain::admit))
+                            .flatten();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -403,7 +520,7 @@ impl Relay {
                             // plane and say so, rather than handing the
                             // connection to a session that would misframe it.
                             if selected_version == WireProfile::Draft19 {
-                                serve_draft19_control_plane(conn, draft19_drain).await;
+                                serve_draft19_control_plane(conn, draft19_admission).await;
                                 metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 return Ok(());
                             }
@@ -552,19 +669,22 @@ impl Relay {
 /// message is refused out loud. Media routing over draft-19 is out of scope;
 /// see the `--wire-profile` help text.
 ///
-/// When `drain` is supplied and its signal is cancelled, the session is sent a
-/// GOAWAY carrying the configured New Session URI and millisecond Timeout, and
-/// then closed: gracefully once the peer closes, or with `GOAWAY_TIMEOUT`
-/// (`0x10`) once the advertised Timeout elapses. A session that starts after
-/// the signal already fired takes the same path immediately after SETUP.
+/// When `admission` is supplied and its drain's signal is cancelled, the
+/// session is sent a GOAWAY carrying the configured New Session URI and
+/// millisecond Timeout, and then closed: gracefully once the peer closes, or
+/// with `GOAWAY_TIMEOUT` (`0x10`) once the advertised Timeout elapses. A
+/// session that starts after the signal already fired takes the same path
+/// immediately after SETUP. The admission is held until this returns, which
+/// for a `GOAWAY_TIMEOUT` close is only once the session reports itself closed.
 pub async fn serve_draft19_control_plane(
     conn: web_transport::Session,
-    drain: Option<Draft19Drain>,
+    admission: Option<Draft19Admission>,
 ) {
-    let _in_flight = drain.as_ref().map(|drain| drain.sessions.token());
-
     use moq_transport::profile::draft19::Setup;
     use moq_transport::session::{Draft19Session, Draft19SessionRole};
+
+    let drain = admission.as_ref().map(|admission| &admission.drain);
+    let raw_conn = conn.clone();
 
     let mut session = match Draft19Session::establish(
         conn,
@@ -601,11 +721,11 @@ pub async fn serve_draft19_control_plane(
                     return;
                 }
             },
-            () = drain_signalled(drain.as_ref()) => break,
+            () = drain_signalled(drain) => break,
         }
     }
 
-    let Some(drain) = drain else {
+    let (Some(admission), Some(drain)) = (admission.as_ref(), drain) else {
         // `drain_signalled` never completes without a drain configured, so the
         // loop above cannot break here.
         unreachable!("drain loop broke without a configured drain");
@@ -626,6 +746,7 @@ pub async fn serve_draft19_control_plane(
         tracing::warn!(error = %err, "failed to send draft-19 drain GOAWAY");
         return;
     }
+    admission.goaway_sent(Instant::now());
     metrics::counter!("moq_relay_draft19_goaway_sent_total").increment(1);
     tracing::info!(
         new_session_uri = %drain.new_session_uri,
@@ -665,6 +786,13 @@ pub async fn serve_draft19_control_plane(
                     timeout_ms = drain.timeout_ms,
                     "draft-19 GOAWAY timeout elapsed without peer close: closing with GOAWAY_TIMEOUT"
                 );
+                // `close` only records the code. Wait for the session to
+                // report itself closed before the admission is released. Over
+                // WebTransport that is once the close capsule has been
+                // delivered; over raw QUIC it is at once, and the
+                // CONNECTION_CLOSE frame itself is flushed by the process
+                // waiting for its endpoint to go idle before it exits.
+                raw_conn.closed().await;
             }
         }
     }
@@ -675,5 +803,75 @@ async fn drain_signalled(drain: Option<&Draft19Drain>) {
     match drain {
         Some(drain) => drain.signal.cancelled().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain(timeout_ms: u64) -> Draft19Drain {
+        Draft19Drain::new(
+            Url::parse("https://relay-b.example.net/moq/").unwrap(),
+            timeout_ms,
+        )
+    }
+
+    /// A connection admitted at accept time holds the drain open before its
+    /// task is ever polled, so it cannot be dropped at exit in that window.
+    #[tokio::test]
+    async fn an_admission_holds_the_drain_open_before_its_connection_is_served() {
+        let drain = drain(60_000);
+        drain.signal.cancel();
+
+        let admission = drain.admit();
+        assert_eq!(
+            drain.finished().now_or_never(),
+            None,
+            "an admitted but unserved connection keeps the drain open"
+        );
+
+        drop(admission);
+        assert_eq!(
+            drain.finished().now_or_never(),
+            Some(Draft19DrainEnd::Drained),
+            "the drain is over once its last admission is released"
+        );
+    }
+
+    /// A steady stream of arrivals, each still open when the next comes, cannot
+    /// hold the drain open past the Timeout counted from the broadcast's last
+    /// GOAWAY.
+    #[tokio::test]
+    async fn arrivals_cannot_hold_the_drain_open_past_the_ceiling() {
+        const TIMEOUT_MS: u64 = 200;
+        let drain = drain(TIMEOUT_MS);
+        let live = drain.admit();
+        drain.signal.cancel();
+
+        let sent = Instant::now();
+        live.goaway_sent(sent);
+        drop(live);
+
+        // The first arrival is admitted before the drain is polled, so the
+        // drain is never empty from here on.
+        let mut open = vec![drain.admit()];
+        let arrive = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(TIMEOUT_MS / 4)).await;
+                open.push(drain.admit());
+            }
+        };
+        let end = tokio::select! {
+            end = drain.finished() => end,
+            () = arrive => unreachable!("arrivals never stop"),
+        };
+
+        assert_eq!(end, Draft19DrainEnd::Ceiling);
+        assert!(
+            sent.elapsed() >= Duration::from_millis(TIMEOUT_MS),
+            "the ceiling is the Timeout after the last broadcast GOAWAY, took {:?}",
+            sent.elapsed()
+        );
     }
 }

@@ -15,10 +15,9 @@ use url::Url;
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
 use moq_relay_ietf::{
-    Coordinator, Draft19Drain, Relay, RelayConfig, SessionConfig, Web, WebConfig,
+    Coordinator, Draft19Drain, Draft19DrainEnd, Relay, RelayConfig, SessionConfig, Web, WebConfig,
 };
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use moq_transport::profile::draft19::SessionErrorCode;
 
 /// SIGINT, and SIGTERM where the platform has it.
 ///
@@ -206,11 +205,13 @@ pub struct Cli {
     ///
     /// The process keeps running until every draft-19 session has closed,
     /// either by its peer or with GOAWAY_TIMEOUT once the Timeout counted from
-    /// that session's GOAWAY elapses, then exits cleanly. A second SIGINT or
-    /// SIGTERM stops it early. With a zero Timeout, sessions close only when
-    /// their peers do. Draft-19 sessions that arrive during the drain are
-    /// redirected and waited for too, so a steady stream of them keeps the
-    /// process up until the second signal or the supervisor's kill.
+    /// that session's GOAWAY elapses, then exits cleanly. Draft-19 sessions
+    /// that arrive during the drain are redirected and waited for too, but only
+    /// until the Timeout has run out from the last GOAWAY sent to a session
+    /// that was live when the drain began: a steady stream of arrivals cannot
+    /// hold the process up past that, and any still open are closed at exit.
+    /// A second SIGINT or SIGTERM stops it early. With a zero Timeout, sessions
+    /// close only when their peers do, and the drain has no such bound.
     #[arg(long)]
     pub draft19_goaway_uri: Option<Url>,
 
@@ -300,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
         moq_native_ietf::quic::Config::new(cli.bind, qlog_dir_for_relay.clone(), tls.clone())?
             .with_wire_profiles(enabled_wire_profiles(cli.wire_profile)),
     )?;
+    let media_closer = media_endpoint.closer();
 
     // Build the relay URL from the node or bind address
     let relay_url = cli
@@ -320,12 +322,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
-    let draft19_drain = cli.draft19_goaway_uri.clone().map(|uri| Draft19Drain {
-        new_session_uri: uri,
-        timeout_ms: cli.draft19_goaway_timeout_ms,
-        signal: CancellationToken::new(),
-        sessions: TaskTracker::new(),
-    });
+    let draft19_drain = cli
+        .draft19_goaway_uri
+        .clone()
+        .map(|uri| Draft19Drain::new(uri, cli.draft19_goaway_timeout_ms));
 
     let relay = Relay::new(RelayConfig {
         tls: tls.clone(),
@@ -349,10 +349,10 @@ async fn main() -> anyhow::Result<()> {
         draft19_drain: draft19_drain.clone(),
     })?;
 
-    // Start the draft-19 drain on the first shutdown signal and stop once every
-    // draft-19 session has closed, or on the second signal, when a drain is
-    // configured. Without one no handler is installed and the platform's
-    // default terminate action still applies.
+    // Start the draft-19 drain on the first shutdown signal and stop once it is
+    // finished, or on the second signal, when a drain is configured. Without
+    // one no handler is installed and the platform's default terminate action
+    // still applies.
     let drain_then_stop = match draft19_drain {
         Some(drain) => {
             let mut signals =
@@ -366,19 +366,26 @@ async fn main() -> anyhow::Result<()> {
                 signals.recv().await?;
                 tracing::info!("shutdown signal received: draining draft-19 sessions");
                 drain.signal.cancel();
-                // Wait for the sessions themselves, not a timer. Each session's
-                // Timeout runs from its own GOAWAY send, which is later than
-                // this signal, so a timer started here would stop the process
-                // before any session could be closed with GOAWAY_TIMEOUT.
-                drain.sessions.close();
+                // Wait for the sessions themselves, not a timer started here.
+                // Each session's Timeout runs from its own GOAWAY send, which
+                // is later than this signal, so such a timer would stop the
+                // process before any session could be closed with
+                // GOAWAY_TIMEOUT. The drain's own ceiling waits those out.
                 tokio::select! {
                     result = signals.recv() => {
                         result?;
                         tracing::info!("second shutdown signal received: stopping");
                     }
-                    () = drain.sessions.wait() => {
-                        tracing::info!("draft-19 drain complete: every session has closed, stopping");
-                    }
+                    end = drain.finished() => match end {
+                        Draft19DrainEnd::Drained => tracing::info!(
+                            "draft-19 drain complete: every session has closed, stopping"
+                        ),
+                        Draft19DrainEnd::Ceiling => tracing::info!(
+                            timeout_ms = drain.timeout_ms,
+                            "draft-19 drain ceiling reached: every session live at the signal \
+                             has closed and the Timeout has run out since its last GOAWAY, stopping"
+                        ),
+                    },
                 }
                 Ok::<_, std::io::Error>(())
             })
@@ -417,10 +424,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match drain_then_stop {
-        Some(drain_then_stop) => tokio::select! {
-            result = relay.run() => result,
-            result = drain_then_stop => result.context("failed to watch for shutdown signals"),
-        },
+        Some(drain_then_stop) => {
+            let stopped = tokio::select! {
+                result = relay.run() => return result,
+                result = drain_then_stop => result.context("failed to watch for shutdown signals"),
+            };
+            // The relay and its sessions are dropped by now, but every close
+            // they made is only queued. Returning would end the process before
+            // quinn sends them, so a peer closed with GOAWAY_TIMEOUT would see
+            // no close at all and wait out its idle timeout instead. Close
+            // whatever is left with NO_ERROR, the code quinn itself uses when a
+            // connection's last handle drops, and wait for every close to be
+            // sent.
+            media_closer
+                .close_and_wait_idle(SessionErrorCode::NoError as u32, b"relay shutting down")
+                .await;
+            stopped
+        }
         None => relay.run().await,
     }
 }
