@@ -83,6 +83,8 @@ rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 # Payload chunks in FETCH retention tests.
 bytes = "1"
+# Scratch directories for the draft-19 drain tests' certificates, removed on drop.
+tempfile = "3"
 
 [features]
 default = []
