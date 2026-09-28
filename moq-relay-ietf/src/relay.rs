@@ -792,7 +792,15 @@ pub async fn serve_draft19_control_plane(
                 // delivered; over raw QUIC it is at once, and the
                 // CONNECTION_CLOSE frame itself is flushed by the process
                 // waiting for its endpoint to go idle before it exits.
-                raw_conn.closed().await;
+                //
+                // Bounded by the same Timeout: this wait gates the drain, and
+                // so the exit, on a peer that has just ignored a GOAWAY. If it
+                // runs out, the endpoint closer still flushes the close.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(drain.timeout_ms),
+                    raw_conn.closed(),
+                )
+                .await;
             }
         }
     }
