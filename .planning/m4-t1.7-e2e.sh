@@ -65,12 +65,10 @@ echo "      fingerprint: $(cat "$FP_FILE")"
 echo "[3/8] Write catalog (track v, packetId 1)..."
 cat > "$WORK/catalog.json" <<EOF
 {
-  "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2", "supportsDeltaUpdates": true,
-  "commonTrackFields": {"namespace": "$NAME"},
-  "tracks": [{"name": "v", "packaging": "mmtp", "mmtpMode": "mfu", "timescale": 90000, "groupDurationMs": 1000, "framerate": 15, "selectionParams": {"codec": "avc1.42c01e"}}],
+  "version": 1, "streamingFormat": "mmtp", "streamingFormatVersion": "0.2", "supportsDeltaUpdates": true,
+  "tracks": [{"namespace": "$NAME", "name": "v", "packaging": "mmtp", "mmtpMode": "mfu", "timescale": 90000, "groupDurationMs": 1000, "framerate": 15, "codec": "avc1.42c01e"}],
   "multicast": {
-    "subgroupHistoryGroups": 8,
-    "endpoints": [{"groupAddress": "239.1.1.1", "port": 5000, "tracks": [{"name": "v", "packetId": 1}]}]
+    "endpoints": [{"protocol": "asm", "groupAddress": "239.1.1.1", "port": 5000, "tracks": [{"name": "v", "packetId": 1}]}]
   }
 }
 EOF

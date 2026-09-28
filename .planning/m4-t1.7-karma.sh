@@ -52,12 +52,10 @@ openssl x509 -in dev/localhost.crt -outform DER | sha256sum | awk '{print $1}' >
 echo "[3/6] Catalog..."
 cat > "$WORK/catalog.json" <<EOF
 {
-  "version": 1, "streamingFormat": 1, "streamingFormatVersion": "0.2", "supportsDeltaUpdates": true,
-  "commonTrackFields": {"namespace": "$NAME"},
-  "tracks": [{"name": "v", "packaging": "mmtp", "selectionParams": {"codec": "avc1.synth"}}],
+  "version": 1, "streamingFormat": "mmtp", "streamingFormatVersion": "0.2", "supportsDeltaUpdates": true,
+  "tracks": [{"namespace": "$NAME", "name": "v", "packaging": "mmtp", "mmtpMode": "mfu", "timescale": 90000, "groupDurationMs": 1000, "codec": "avc1.synth"}],
   "multicast": {
-    "subgroupHistoryGroups": 8,
-    "endpoints": [{"groupAddress": "239.1.1.1", "port": 5000, "tracks": [{"name": "v", "packetId": 1}]}]
+    "endpoints": [{"protocol": "asm", "groupAddress": "239.1.1.1", "port": 5000, "tracks": [{"name": "v", "packetId": 1}]}]
   }
 }
 EOF

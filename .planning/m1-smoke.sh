@@ -42,17 +42,16 @@ echo "[2/7] Writing catalog..."
 cat > "$SMOKE/catalog.json" <<EOF
 {
   "version": 1,
-  "streamingFormat": 1,
+  "streamingFormat": "mmtp",
   "streamingFormatVersion": "0.2",
   "supportsDeltaUpdates": true,
-  "commonTrackFields": {"namespace": "$NAME"},
   "tracks": [
-    {"name": "v", "packaging": "mmtp", "mmtpMode": "mpu", "selectionParams": {"codec": "hev1.synth"}},
-    {"name": "a", "packaging": "mmtp", "mmtpMode": "mpu", "selectionParams": {"codec": "mp4a.synth"}}
+    {"namespace": "$NAME", "name": "v", "packaging": "mmtp", "mmtpMode": "mpu", "timescale": 90000, "groupDurationMs": 1000, "codec": "hev1.synth"},
+    {"namespace": "$NAME", "name": "a", "packaging": "mmtp", "mmtpMode": "mpu", "timescale": 48000, "groupDurationMs": 1000, "codec": "mp4a.synth"}
   ],
   "multicast": {
-    "subgroupHistoryGroups": 8,
     "endpoints": [{
+      "protocol": "asm",
       "groupAddress": "239.255.1.1",
       "port": 5004,
       "tracks": [
