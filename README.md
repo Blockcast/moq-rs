@@ -61,6 +61,47 @@ A draft-16 session refuses a draft-19 negotiation with a typed
 `SessionError::ProfileFramingMismatch`, so no session can report
 `selected_version() == moqt-19` while writing draft-16 bytes.
 
+#### Draft-19 preflight attestation
+
+`scripts/draft19-preflight-capture.sh <publisher|relay-root|relay-leaf> artifacts/<role>.json`
+records what a role actually negotiated. It runs the shipped `moq-relay-ietf`
+and `moq-pub-mmtp` binaries against each other over real QUIC and quotes the
+role's own `selected_version=moqt-19` log line, then adds a decoded GOAWAY
+captured by the `draft19-preflight` binary over a draft-19 control stream.
+
+Write the output under `artifacts/`. That directory is ignored, so a capture's
+own output does not count against the next capture's dirty-tree guard.
+
+The GOAWAY half is a session-level capture, not an observed relay drain: no
+shipped binary emits a draft-19 GOAWAY today. Every artifact says so in
+`goaway.caveat` -- do not quote one as evidence of graceful relay drain.
+
+The `sha256` covers `canonical_payload` only, and every field in it is a
+constant, an enum-derived string, or a deterministic function of those. It is
+an encoding fingerprint, not a build fingerprint: the shipped binaries' own
+`selected_version=moqt-19` line lives in `handshake.binary_evidence`, outside
+the digest. Pin the digest to detect a changed profile constant or GOAWAY
+encoding; cite the workflow run and artifact digest to attest the binaries.
+`canonical_payload.attests` states the same split inside the artifact.
+
+The digest is taken over the payload re-serialized compact, in the emitted key
+order, with minimal string escaping (non-ASCII stays raw UTF-8), and one
+trailing LF. The artifact ships that payload pretty-printed, so
+digesting the bytes as they appear gives a different answer. Recompute with
+`jq -c '.canonical_payload' <artifact> | sha256sum`. The artifact's
+`canonical_encoding` field names the same facts for a consumer that reaches
+for a non-`jq` serializer. Python's `json.dumps` needs
+`separators=(',', ':')` and `ensure_ascii=False` to match.
+
+`relay-root` and `relay-leaf` are one observation recorded twice, not two
+independent negotiations: `--node` is the only flag between them and it reaches
+no code the draft-19 accept path runs. Each row names the other in
+`canonical_payload.path_equivalent_to`; do not count them as two.
+
+The `Draft-19 preflight attestation` workflow publishes one artifact per role.
+`Blockcast/pim-multicast-gateway` pins them by source commit, workflow run,
+artifact digest, and canonical payload digest.
+
 ## Interoperability
 
 A public relay instance running the latest `main` branch is available for interop testing at:

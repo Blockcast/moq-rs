@@ -1,0 +1,208 @@
+# SPDX-FileCopyrightText: 2026 Blockcast Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Phase 3 draft-19 preflight attestation for the moq-rs server roles
+# (BLO-35570). Publishes one artifact per role -- publisher, relay root, relay
+# leaf -- each recording the offered profile set, the selected moqt-19 profile
+# as the shipped binary reported it, and a decoded GOAWAY New Session URI plus
+# millisecond Timeout.
+#
+# The artifacts are consumed by Blockcast/pim-multicast-gateway's Phase 3
+# preflight fixture, which pins each row's source commit, workflow run,
+# artifact digest and canonical payload digest. Retention is 7 days, so the
+# vendored canonical payload -- not this archive -- is what stays verifiable.
+
+name: Draft-19 preflight attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to attest
+        required: false
+      head_sha:
+        description: >-
+          Full 40-hex commit SHA to attest. Overrides the PR's current head,
+          which is mutable and may have advanced since dispatch.
+        required: false
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # ARC runners: the image-baked toolchain lives on an overlay lower layer, so
+  # rustup's component rename hits EXDEV. Keep rustup state on the work volume.
+  RUSTUP_HOME: /home/runner/work/_rustup
+
+jobs:
+  resolve-source:
+    name: Resolve immutable source commit
+    runs-on: default
+    permissions:
+      contents: read
+      # Only this job reads the pulls API; keep the scope off every other job.
+      pull-requests: read
+    outputs:
+      source_commit: ${{ steps.source.outputs.source_commit }}
+    steps:
+      - name: Resolve source commit
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          DISPATCH_SHA: ${{ inputs.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          source_commit="$EVENT_SHA"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            source_commit="$PR_HEAD_SHA"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -z "${PR_NUMBER:-}" ]; then
+              echo "::error::workflow_dispatch needs the pr_number input to resolve a head commit." >&2
+              exit 1
+            fi
+            pr_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+            # Fork guard: never check out fork code on self-hosted runners.
+            test "$(jq -r '.head.repo.full_name' <<<"$pr_json")" = "$REPO"
+            pr_head=$(jq -r '.head.sha' <<<"$pr_json")
+            source_commit="$pr_head"
+            if [ -n "${DISPATCH_SHA:-}" ]; then
+              if [[ ! "$DISPATCH_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::head_sha input is not a 40-char hex commit SHA." >&2
+                exit 1
+              fi
+              # An unverified SHA must never reach checkout: fork commits are
+              # reachable in this repo via refs/pull/N/head.
+              if [ "$DISPATCH_SHA" != "$pr_head" ]; then
+                if gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --paginate \
+                     --jq '.[].sha' | grep -qxF "$DISPATCH_SHA"; then
+                  echo "::notice::PR #$PR_NUMBER advanced to $pr_head since dispatch; attesting $DISPATCH_SHA."
+                else
+                  echo "::error::head_sha $DISPATCH_SHA is not a commit of PR #$PR_NUMBER (head is $pr_head)." >&2
+                  exit 1
+                fi
+              fi
+              source_commit="$DISPATCH_SHA"
+            fi
+          fi
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+
+  capture:
+    name: Capture ${{ matrix.role }} draft-19 preflight
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [resolve-source]
+    runs-on: default
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [publisher, relay-root, relay-leaf]
+    env:
+      MOQ_RS_SOURCE_COMMIT: ${{ needs.resolve-source.outputs.source_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.source_commit }}
+
+      - name: Verify immutable checkout
+        run: test "$(git rev-parse HEAD)" = "$MOQ_RS_SOURCE_COMMIT"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Capture attestation
+        run: |
+          bash scripts/draft19-preflight-capture.sh \
+            "${{ matrix.role }}" \
+            "artifacts/draft19-preflight-${{ matrix.role }}.json"
+
+      - name: Verify attestation pins this checkout and a moqt-19 selection
+        env:
+          ARTIFACT: artifacts/draft19-preflight-${{ matrix.role }}.json
+          ROLE: ${{ matrix.role }}
+        run: |
+          set -euo pipefail
+          test "$(jq -r '.source.source_commit' "$ARTIFACT")" = "$MOQ_RS_SOURCE_COMMIT"
+          test "$(jq -r '.role' "$ARTIFACT")" = "$ROLE"
+          test "$(jq -r '.handshake.selected_version' "$ARTIFACT")" = "moqt-19"
+          test "$(jq -r '.handshake.setup_type' "$ARTIFACT")" = "0x2f00"
+          # The relay rows record one negotiation observed twice, so each must
+          # name its counterpart. Recomputing the digest cannot check this: it
+          # reads the same field back out of the same file.
+          case "$ROLE" in
+            publisher)  expect_equiv=null ;;
+            relay-root) expect_equiv=relay-leaf ;;
+            relay-leaf) expect_equiv=relay-root ;;
+            *) echo "unknown role $ROLE" >&2; exit 1 ;;
+          esac
+          test "$(jq -r '.canonical_payload.path_equivalent_to' "$ARTIFACT")" = "$expect_equiv"
+          # `jq -r` prints `null` for an absent field as well as a present-null
+          # one, so the publisher row above passes if the field is dropped
+          # entirely. Check presence separately from value.
+          test "$(jq -r '.canonical_payload | has("path_equivalent_to")' "$ARTIFACT")" = true
+          test "$(jq -r '.goaway.decoded_uri' "$ARTIFACT")" = "moqt://next.example"
+          test "$(jq -r '.goaway.decoded_timeout_ms' "$ARTIFACT")" = "250"
+          # The digest a consumer recomputes offline must match the one shipped.
+          expected="$(jq -c '.canonical_payload' "$ARTIFACT" | sha256sum | cut -d' ' -f1)"
+          test "$(jq -r '.sha256' "$ARTIFACT")" = "$expected"
+          echo "canonical sha256 $expected"
+
+      - name: Upload preflight attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: moq-rs-draft19-preflight-${{ matrix.role }}-${{ needs.resolve-source.outputs.source_commit }}
+          path: artifacts/draft19-preflight-${{ matrix.role }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  report-dispatch-status:
+    name: Report /test status
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: [resolve-source, capture]
+    runs-on: default
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Report status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # The dispatcher's captured SHA is the immutable one; the resolved
+          # output is the fallback when it was omitted.
+          DISPATCH_SHA: ${{ inputs.head_sha }}
+          HEAD_SHA: ${{ needs.resolve-source.outputs.source_commit }}
+          RESULT: ${{ needs.capture.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          sha="${DISPATCH_SHA:-}"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            sha="$HEAD_SHA"
+          fi
+          # Never post attestation state against a ref we could not resolve.
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::no usable commit SHA; refusing to post a status." >&2
+            exit 1
+          fi
+          # Fail closed: only an explicit success is green. "skipped" must not
+          # report success on a commit whose attestation never ran.
+          state=failure
+          if [ "$RESULT" = "success" ]; then
+            state=success
+          fi
+          gh api "repos/$REPO/statuses/$sha" \
+            -f state="$state" \
+            -f context="ci/draft19-preflight.yml" \
+            -f target_url="$RUN_URL" \
+            -f description="capture: $RESULT" >/dev/null
