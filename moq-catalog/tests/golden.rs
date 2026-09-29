@@ -24,7 +24,7 @@ const POSITIVE: [(&str, &str); 6] = [
     ),
 ];
 
-const NEGATIVE: [(&str, &str, Reject); 11] = [
+const NEGATIVE: [(&str, &str, Reject); 10] = [
     (
         "legacy-selection-params",
         include_str!("fixtures/negative/legacy-selection-params.json"),
@@ -65,11 +65,6 @@ const NEGATIVE: [(&str, &str, Reject); 11] = [
         Reject::Validate("priority must be between 192 and 255"),
     ),
     (
-        "fec-repair-container-not-native",
-        include_str!("fixtures/negative/fec-repair-container-not-native.json"),
-        Reject::Validate("repairContainer must be native"),
-    ),
-    (
         "fec-repair-layer-missing-symbols",
         include_str!("fixtures/negative/fec-repair-layer-missing-symbols.json"),
         Reject::Validate("repairLayer >= 1 requires depends, repairSymbols, and priority"),
@@ -88,9 +83,9 @@ const NEGATIVE: [(&str, &str, Reject); 11] = [
 
 /// Negatives that are NOT libmmt mirrors. Each exists because no canonical
 /// vector reaches the rule it covers, so mirroring alone would leave that rule
-/// untested — in both cases confirmed by mutation-testing the rule and watching
+/// untested -- in each case confirmed by mutation-testing the rule and watching
 /// nothing go red.
-const NEGATIVE_LOCAL: [(&str, &str, Reject); 2] = [
+const NEGATIVE_LOCAL: [(&str, &str, Reject); 3] = [
     (
         "endpoint-missing-protocol-and-source",
         include_str!("fixtures/negative-local/endpoint-missing-protocol-and-source.json"),
@@ -100,6 +95,11 @@ const NEGATIVE_LOCAL: [(&str, &str, Reject); 2] = [
         "fec-repair-overlay-missing-companions",
         include_str!("fixtures/negative-local/fec-repair-overlay-missing-companions.json"),
         Reject::Validate("scope requires depends, sourceSymbols, repairSymbols, and priority"),
+    ),
+    (
+        "fec-repair-container-not-native",
+        include_str!("fixtures/negative-local/fec-repair-container-not-native.json"),
+        Reject::Validate("repairContainer must be native"),
     ),
 ];
 

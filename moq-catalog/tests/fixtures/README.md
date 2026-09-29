@@ -33,8 +33,11 @@ because no canonical vector reaches the rule it covers:
 - `fec-repair-overlay-missing-companions.json` — libmmt ships no vector for
   `allOf[1].then.allOf[0]`'s *required* arm (only for its `repairLayer`
   exclusion).
+- `fec-repair-container-not-native.json` -- libmmt pins
+  `repairContainer: {"const":"native"}` but ships no negative exercising it, so
+  no canonical vector reaches the `repairContainer must be native` rule.
 
-Both were found by mutation-testing: the rule was neutralised, and nothing went
+Each was found by mutation-testing: the rule was neutralised, and nothing went
 red. A guard with no failing mutation is a comment — if you add one, delete it
 and confirm the suite fails before trusting it.
 
