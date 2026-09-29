@@ -44,9 +44,11 @@ because libmmt never emitted the shapes they pin:
   that this crate still refuses those shapes. libmmt never emitted them, so it
   has no vector for them and they cannot live in the mirror.
 
-Each was found by mutation-testing: the rule was neutralised, and nothing went
-red. A guard with no failing mutation is a comment — if you add one, delete it
-and confirm the suite fails before trusting it.
+The first three were found by mutation-testing: the rule was neutralised, and
+nothing went red. A guard with no failing mutation is a comment — if you add one,
+delete it and confirm the suite fails before trusting it. The `legacy-*` three
+are parse-level rejections (`deny_unknown_fields` and the type checks do the
+work), so there is no rule to neutralise and nothing to mutation-test.
 
 Not yet mirrored (each needs validation rules this crate does not implement; see
 BLO-37534 follow-ups): `positive/multicast-auth-rotation.json` and the
