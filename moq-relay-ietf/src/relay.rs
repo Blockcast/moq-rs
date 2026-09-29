@@ -662,6 +662,15 @@ impl Relay {
     }
 }
 
+/// How long a `GOAWAY_TIMEOUT` close gets to reach the peer.
+///
+/// Deliberately not the drain's advertised Timeout. That is the deadline given
+/// to the *peer to act on the GOAWAY*; this is the deadline for *our own close
+/// to flush*, an RTT-scale quantity unrelated to it. Reusing the advertised one
+/// would hand any deployment that advertises a sub-RTT Timeout a close that
+/// expires before it can land.
+const GOAWAY_CLOSE_FLUSH_MS: u64 = 1_000;
+
 /// Serve a draft-19 session's control plane, and only that.
 ///
 /// The relay routes media through the draft-16 `Publisher`/`Subscriber` pair,
@@ -676,7 +685,10 @@ impl Relay {
 /// with `GOAWAY_TIMEOUT` (`0x10`) once the advertised Timeout elapses. A
 /// session that starts after the signal already fired takes the same path
 /// immediately after SETUP. The admission is held until this returns, which
-/// for a `GOAWAY_TIMEOUT` close is only once the session reports itself closed.
+/// for a `GOAWAY_TIMEOUT` close is until the session reports itself closed or
+/// `GOAWAY_CLOSE_FLUSH_MS` elapses, whichever is first. So
+/// [`Draft19DrainEnd::Drained`] means every session ended, not that every peer
+/// acknowledged its close.
 pub async fn serve_draft19_control_plane(
     conn: web_transport::Session,
     admission: Option<Draft19Admission>,
@@ -794,13 +806,18 @@ pub async fn serve_draft19_control_plane(
                 // CONNECTION_CLOSE frame itself is flushed by the process
                 // waiting for its endpoint to go idle before it exits.
                 //
-                // Bounded by the same Timeout: this wait gates the admission,
-                // which gates both `Drained` and `Ceiling`, so an unbounded one
-                // lets a single WebTransport peer that never answers the close
-                // capsule hold the whole process open. Timing out here costs
-                // nothing, because the endpoint closer flushes at exit anyway.
+                // Bounded, because this wait gates the admission, which gates
+                // both `Drained` and `Ceiling`: an unbounded one lets a single
+                // WebTransport peer that never answers the close capsule hold
+                // the whole process open. Expiry preserves that liveness and
+                // costs the close code: `session.close()` leaves the QUIC
+                // connection open, so a capsule that never lands leaves the
+                // endpoint closer to close the connection itself with its own
+                // code, and the peer learns that instead of `GOAWAY_TIMEOUT`.
+                // Raw QUIC cannot reach this, since `closed()` is already
+                // resolved by the time it is awaited.
                 let _ = tokio::time::timeout(
-                    Duration::from_millis(drain.timeout_ms),
+                    Duration::from_millis(GOAWAY_CLOSE_FLUSH_MS),
                     raw_conn.closed(),
                 )
                 .await;

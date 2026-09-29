@@ -198,6 +198,9 @@ struct Handshake {
 struct Goaway {
     direction: String,
     stream: &'static str,
+    /// The binary that emitted the GOAWAY. Always the relay, unlike
+    /// `handshake.binary`, which is the role's own binary.
+    binary: &'static str,
     hex: String,
     decoded_uri: String,
     decoded_timeout_ms: String,
@@ -352,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
         goaway: Goaway {
             direction: cli.role.goaway_direction().to_string(),
             stream: "control",
+            binary: "moq-relay-ietf",
             hex: goaway_hex.clone(),
             decoded_uri: goaway.new_session_uri.0.clone(),
             decoded_timeout_ms: timeout_ms.clone(),

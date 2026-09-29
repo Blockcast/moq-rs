@@ -158,12 +158,16 @@ jobs:
           # and it is the absence of `caveat` that is being asserted.
           test "$(jq -r '.goaway | has("caveat")' "$ARTIFACT")" = false
           test "$(jq -r '.goaway | has("binary_evidence")' "$ARTIFACT")" = true
+          # The GOAWAY emitter is the relay for every role, unlike
+          # handshake.binary, which is the role's own binary.
+          test "$(jq -r '.goaway.binary' "$ARTIFACT")" = moq-relay-ietf
           # A log line that named a different URI or Timeout would describe a
-          # different GOAWAY than the bytes above.
+          # different GOAWAY than the bytes above. `\b` so the Timeout test does
+          # not also pass on timeout_ms=2500.
           jq -er '.goaway.binary_evidence
                   | test("draft-19 drain: sent GOAWAY")
                     and test("new_session_uri=moqt://next\\.example")
-                    and test("timeout_ms=250")' "$ARTIFACT" >/dev/null
+                    and test("timeout_ms=250\\b")' "$ARTIFACT" >/dev/null
           # The digest a consumer recomputes offline must match the one shipped.
           expected="$(jq -c '.canonical_payload' "$ARTIFACT" | sha256sum | cut -d' ' -f1)"
           test "$(jq -r '.sha256' "$ARTIFACT")" = "$expected"

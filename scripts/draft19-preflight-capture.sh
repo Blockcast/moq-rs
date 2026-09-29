@@ -96,6 +96,22 @@ relay_listening() { strip_ansi <"$WORK/relay.log" | grep -F "listening on 127.0.
 # all three waits rule it out before reporting the line's own absence.
 relay_alive_or_die() { kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.log" >&2; echo "relay exited early" >&2; exit 1; }; }
 
+# `wait` has no timeout, and every wait here is on a peer that can wedge. Left
+# unbounded they terminate only when a QUIC idle timeout eventually trips, which
+# on CI means spending the job timeout and losing the log dump with it. Reap
+# under a watchdog instead: an overrun becomes a normal non-zero wait, so the
+# caller's failure branch still runs and still dumps `relay.log`.
+WAIT_BUDGET_SECS=30
+wait_bounded() {
+  local pid=$1 rc=0 watchdog
+  ( sleep "$WAIT_BUDGET_SECS"; kill -KILL "$pid" 2>/dev/null ) &
+  watchdog=$!
+  wait "$pid" || rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return "$rc"
+}
+
 for _ in $(seq 1 60); do
   relay_listening && break
   relay_alive_or_die
@@ -185,21 +201,26 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 [ -f "$READY" ] || {
-  wait "$PREFLIGHT_PID" 2>/dev/null || true
+  wait_bounded "$PREFLIGHT_PID" 2>/dev/null || true
   cat "$WORK/relay.log" >&2
   echo "preflight never established a draft-19 session against the relay" >&2; exit 1
 }
 
-# Arm the drain. SIGTERM is what the relay turns into a GOAWAY broadcast.
-kill -TERM "$RELAY_PID"
-wait "$PREFLIGHT_PID" || {
+# Arm the drain. SIGTERM is what the relay turns into a GOAWAY broadcast. A
+# failure here means the relay died between the ready-file check and now, so it
+# gets the same log dump every other failure path in this file gets.
+kill -TERM "$RELAY_PID" || {
+  cat "$WORK/relay.log" >&2
+  echo "relay was gone before the drain could be armed" >&2; exit 1
+}
+wait_bounded "$PREFLIGHT_PID" || {
   cat "$WORK/relay.log" >&2
   echo "preflight did not capture a GOAWAY from the relay" >&2; exit 1
 }
 unset PREFLIGHT_PID
 # The relay stops itself once the drain is over, so this reaps it rather than
 # killing it: an exit here is the drain completing, not a signal landing.
-wait "$RELAY_PID" 2>/dev/null || true
+wait_bounded "$RELAY_PID" 2>/dev/null || true
 unset RELAY_PID
 
 # Quote the relay's own line for the send, the same way the SETUP half is
