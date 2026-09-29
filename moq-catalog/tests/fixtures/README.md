@@ -61,11 +61,11 @@ because libmmt never emitted the shapes they pin:
 - `fec-repair-overlay-missing-companions.json` — libmmt ships no vector for
   `allOf[1].then.allOf[0]`'s *required* arm (only for its `repairLayer`
   exclusion).
-- `fec-repair-container-not-native.json` -- libmmt pins
+- `fec-repair-container-not-native.json` — libmmt pins
   `repairContainer: {"const":"native"}` but ships no negative exercising it, so
   no canonical vector reaches the `repairContainer must be native` rule.
 - `legacy-common-track-fields.json`, `legacy-numeric-streaming-format.json`,
-  `legacy-subgroup-history-groups.json` -- pre-MSF shapes (a `commonTrackFields`
+  `legacy-subgroup-history-groups.json` — pre-MSF shapes (a `commonTrackFields`
   block, a numeric `streamingFormat`, `multicast.subgroupHistoryGroups`) that the
   smoke scripts emitted until #92 moved them to the canonical catalog. They pin
   that this crate still refuses those shapes. libmmt never emitted them, so it

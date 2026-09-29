@@ -83,7 +83,7 @@ const NEGATIVE: [(&str, &str, Reject); 10] = [
 
 /// Negatives that are NOT libmmt mirrors. The first three exist because no
 /// canonical vector reaches the rule each covers, so mirroring alone would leave
-/// that rule untested -- in each case confirmed by mutation-testing the rule and
+/// that rule untested — in each case confirmed by mutation-testing the rule and
 /// watching nothing go red. The `legacy-*` three pin pre-MSF shapes libmmt never
 /// emitted, so it has no vector for them.
 const NEGATIVE_LOCAL: [(&str, &str, Reject); 6] = [
