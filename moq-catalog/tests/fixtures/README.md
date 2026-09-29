@@ -22,8 +22,9 @@ schema too.
 ## `negative-local/` — not mirrors
 
 `negative/` is a byte-identical mirror, so it cannot host a fixture libmmt does
-not have. `negative-local/` holds the few negatives that exist only here, each
-because no canonical vector reaches the rule it covers:
+not have. `negative-local/` holds the few negatives that exist only here: the
+first three because no canonical vector reaches the rule each covers, the last
+because libmmt never emitted the shapes they pin:
 
 - `endpoint-missing-protocol-and-source.json` — libmmt's
   `multicast-endpoint-missing-protocol-and-source.json` is a *double* negative:
@@ -36,6 +37,12 @@ because no canonical vector reaches the rule it covers:
 - `fec-repair-container-not-native.json` -- libmmt pins
   `repairContainer: {"const":"native"}` but ships no negative exercising it, so
   no canonical vector reaches the `repairContainer must be native` rule.
+- `legacy-common-track-fields.json`, `legacy-numeric-streaming-format.json`,
+  `legacy-subgroup-history-groups.json` -- pre-MSF shapes (a `commonTrackFields`
+  block, a numeric `streamingFormat`, `multicast.subgroupHistoryGroups`) that the
+  smoke scripts emitted until #92 moved them to the canonical catalog. They pin
+  that this crate still refuses those shapes. libmmt never emitted them, so it
+  has no vector for them and they cannot live in the mirror.
 
 Each was found by mutation-testing: the rule was neutralised, and nothing went
 red. A guard with no failing mutation is a comment — if you add one, delete it

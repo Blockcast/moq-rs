@@ -24,25 +24,10 @@ const POSITIVE: [(&str, &str); 6] = [
     ),
 ];
 
-const NEGATIVE: [(&str, &str, Reject); 13] = [
+const NEGATIVE: [(&str, &str, Reject); 10] = [
     (
         "legacy-selection-params",
         include_str!("fixtures/negative/legacy-selection-params.json"),
-        Reject::Parse,
-    ),
-    (
-        "legacy-common-track-fields",
-        include_str!("fixtures/negative/legacy-common-track-fields.json"),
-        Reject::Parse,
-    ),
-    (
-        "legacy-numeric-streaming-format",
-        include_str!("fixtures/negative/legacy-numeric-streaming-format.json"),
-        Reject::Parse,
-    ),
-    (
-        "legacy-subgroup-history-groups",
-        include_str!("fixtures/negative/legacy-subgroup-history-groups.json"),
         Reject::Parse,
     ),
     (
@@ -96,11 +81,12 @@ const NEGATIVE: [(&str, &str, Reject); 13] = [
     ),
 ];
 
-/// Negatives that are NOT libmmt mirrors. Each exists because no canonical
-/// vector reaches the rule it covers, so mirroring alone would leave that rule
-/// untested -- in each case confirmed by mutation-testing the rule and watching
-/// nothing go red.
-const NEGATIVE_LOCAL: [(&str, &str, Reject); 3] = [
+/// Negatives that are NOT libmmt mirrors. The first three exist because no
+/// canonical vector reaches the rule each covers, so mirroring alone would leave
+/// that rule untested -- in each case confirmed by mutation-testing the rule and
+/// watching nothing go red. The `legacy-*` three pin pre-MSF shapes libmmt never
+/// emitted, so it has no vector for them.
+const NEGATIVE_LOCAL: [(&str, &str, Reject); 6] = [
     (
         "endpoint-missing-protocol-and-source",
         include_str!("fixtures/negative-local/endpoint-missing-protocol-and-source.json"),
@@ -115,6 +101,21 @@ const NEGATIVE_LOCAL: [(&str, &str, Reject); 3] = [
         "fec-repair-container-not-native",
         include_str!("fixtures/negative-local/fec-repair-container-not-native.json"),
         Reject::Validate("repairContainer must be native"),
+    ),
+    (
+        "legacy-common-track-fields",
+        include_str!("fixtures/negative-local/legacy-common-track-fields.json"),
+        Reject::Parse,
+    ),
+    (
+        "legacy-numeric-streaming-format",
+        include_str!("fixtures/negative-local/legacy-numeric-streaming-format.json"),
+        Reject::Parse,
+    ),
+    (
+        "legacy-subgroup-history-groups",
+        include_str!("fixtures/negative-local/legacy-subgroup-history-groups.json"),
+        Reject::Parse,
     ),
 ];
 
