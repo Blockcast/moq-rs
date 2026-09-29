@@ -223,8 +223,17 @@ wait_bounded "$PREFLIGHT_PID" || {
 }
 unset PREFLIGHT_PID
 # The relay stops itself once the drain is over, so this reaps it rather than
-# killing it: an exit here is the drain completing, not a signal landing.
-wait_bounded "$RELAY_PID" 2>/dev/null || true
+# killing it: a clean exit here is the drain completing, not a signal landing.
+# A non-zero status is not fatal, because the client already decoded and
+# validated the GOAWAY bytes this row attests. It is still reported: rc 137 is
+# the watchdog's SIGKILL, meaning the relay never finished the drain, which
+# would otherwise leave no trace anywhere in the run.
+relay_rc=0
+wait_bounded "$RELAY_PID" 2>/dev/null || relay_rc=$?
+[ "$relay_rc" -eq 0 ] || {
+  cat "$WORK/relay.log" >&2
+  echo "relay drain did not complete cleanly (exit $relay_rc; 137 = SIGKILL at the ${WAIT_BUDGET_SECS}s budget)" >&2
+}
 unset RELAY_PID
 
 # Quote the relay's own line for the send, the same way the SETUP half is
@@ -240,9 +249,12 @@ GOAWAY_EVIDENCE="$(strip_ansi <"$WORK/relay.log" | grep -F 'draft-19 drain: sent
 # on a relay line reading `timeout_ms=2500`, and the URI arm passes on
 # `moqt://next.example.invalid`. Drift is exactly what this guard is for, so it
 # must not match a prefix of the configured value. Glob rather than a regex so
-# the `.` and `/` in the URI stay literal.
+# the `.` and `/` in the URI stay literal. Both field orders are accepted
+# because the order `tracing::info!` emits them in is not part of what this
+# guard checks: only that each field carries the configured value.
 case "$GOAWAY_EVIDENCE " in
-  *"new_session_uri=$GOAWAY_URI "*"timeout_ms=$GOAWAY_TIMEOUT_MS "*) ;;
+  *"new_session_uri=$GOAWAY_URI "*"timeout_ms=$GOAWAY_TIMEOUT_MS "* | \
+  *"timeout_ms=$GOAWAY_TIMEOUT_MS "*"new_session_uri=$GOAWAY_URI "*) ;;
   *) echo "relay GOAWAY line does not carry the configured URI and Timeout: $GOAWAY_EVIDENCE" >&2; exit 1 ;;
 esac
 

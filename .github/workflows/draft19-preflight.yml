@@ -164,10 +164,13 @@ jobs:
           # A log line that named a different URI or Timeout would describe a
           # different GOAWAY than the bytes above. Each test carries a trailing
           # boundary so neither passes on a longer value: `next.example.invalid`
-          # for the URI, `timeout_ms=2500` for the Timeout.
+          # for the URI, `timeout_ms=2500` for the Timeout. The URI's boundary
+          # admits end-of-string as well as whitespace, so that neither arm
+          # depends on which field `tracing::info!` emits last. This mirrors the
+          # order-independent glob in scripts/draft19-preflight-capture.sh.
           jq -er '.goaway.binary_evidence
                   | test("draft-19 drain: sent GOAWAY")
-                    and test("new_session_uri=moqt://next\\.example\\s")
+                    and test("new_session_uri=moqt://next\\.example(\\s|$)")
                     and test("timeout_ms=250\\b")' "$ARTIFACT" >/dev/null
           # The digest a consumer recomputes offline must match the one shipped.
           expected="$(jq -c '.canonical_payload' "$ARTIFACT" | sha256sum | cut -d' ' -f1)"
