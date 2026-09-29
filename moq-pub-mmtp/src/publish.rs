@@ -204,7 +204,9 @@ impl<T: TrackSubgroups> TrackState<T> {
 pub struct RepairSink<T: TrackSubgroups> {
     /// Subgroup factory for the `<source>/repair` MoQ track.
     pub sink: T,
-    /// Catalog priority for repair objects. The canonical profile requires 240.
+    /// Catalog priority for repair objects. Base layer 0 may omit it and
+    /// defaults to `moq_catalog::DEFAULT_REPAIR_PRIORITY` (240); layers 1..n
+    /// and keyframe overlays must declare their own (BLO-37534).
     pub priority: u8,
     /// Currently open repair subgroup — None before first repair on
     /// this track. Replaced when source MPU advances.

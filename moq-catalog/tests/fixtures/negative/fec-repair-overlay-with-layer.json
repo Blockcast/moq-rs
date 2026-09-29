@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "streamingFormat": "mmtp",
+  "streamingFormatVersion": "draft-ramadan-moq-mmt-00",
+  "tracks": [
+    {
+      "name": "video",
+      "packaging": "mmtp",
+      "codec": "avc1.640028",
+      "mmtpMode": "mfu",
+      "timescale": 90000,
+      "groupDurationMs": 1000,
+      "fec": {
+        "algorithm": "raptorq",
+        "sourceSymbols": 64,
+        "repairSymbols": 8,
+        "symbolSize": 1312,
+        "repairTrack": "video/repair"
+      }
+    },
+    { "name": "video/repair", "packaging": "fec-repair", "priority": 240 },
+    {
+      "name": "video/keyframe-repair",
+      "packaging": "fec-repair",
+      "depends": ["video"],
+      "scope": "keyframe",
+      "repairLayer": 1,
+      "sourceSymbols": 256,
+      "repairSymbols": 32,
+      "priority": 242
+    }
+  ]
+}

@@ -24,38 +24,82 @@ const POSITIVE: [(&str, &str); 6] = [
     ),
 ];
 
-const NEGATIVE: [(&str, &str); 8] = [
+const NEGATIVE: [(&str, &str, Reject); 11] = [
     (
         "legacy-selection-params",
         include_str!("fixtures/negative/legacy-selection-params.json"),
+        Reject::Parse,
     ),
     (
         "missing-mmtp-fields",
         include_str!("fixtures/negative/missing-mmtp-fields.json"),
+        Reject::Validate("mmtpMode"),
     ),
     (
         "network-source-object",
         include_str!("fixtures/negative/network-source-object.json"),
+        Reject::Parse,
     ),
     (
         "repair-track-legacy-shape",
         include_str!("fixtures/negative/repair-track-legacy-shape.json"),
+        Reject::Parse,
     ),
     (
         "multicast-endpoint-missing-protocol-and-source",
         include_str!("fixtures/negative/multicast-endpoint-missing-protocol-and-source.json"),
+        // Double negative: libmmt pins `multicast.networkSource` to an array of
+        // objects, so the string `"direct"` is schema-invalid on its own and
+        // serde refuses it before the endpoint rule is ever reached. That rule
+        // keeps its coverage in NEGATIVE_LOCAL below.
+        Reject::Parse,
     ),
     (
         "raptorq-unaligned-symbol",
         include_str!("fixtures/negative/raptorq-unaligned-symbol.json"),
+        Reject::Validate("symbolSize"),
     ),
     (
         "fec-repair-priority-out-of-band",
         include_str!("fixtures/negative/fec-repair-priority-out-of-band.json"),
+        Reject::Validate("priority must be between 192 and 255"),
     ),
     (
         "fec-repair-container-not-native",
         include_str!("fixtures/negative/fec-repair-container-not-native.json"),
+        Reject::Validate("repairContainer must be native"),
+    ),
+    (
+        "fec-repair-layer-missing-symbols",
+        include_str!("fixtures/negative/fec-repair-layer-missing-symbols.json"),
+        Reject::Validate("repairLayer >= 1 requires depends, repairSymbols, and priority"),
+    ),
+    (
+        "fec-repair-overlay-with-layer",
+        include_str!("fixtures/negative/fec-repair-overlay-with-layer.json"),
+        Reject::Validate("scope and repairLayer are mutually exclusive"),
+    ),
+    (
+        "fec-repair-source-symbols-without-scope",
+        include_str!("fixtures/negative/fec-repair-source-symbols-without-scope.json"),
+        Reject::Validate("sourceSymbols requires scope"),
+    ),
+];
+
+/// Negatives that are NOT libmmt mirrors. Each exists because no canonical
+/// vector reaches the rule it covers, so mirroring alone would leave that rule
+/// untested — in both cases confirmed by mutation-testing the rule and watching
+/// nothing go red.
+const NEGATIVE_LOCAL: [(&str, &str, Reject); 2] = [
+    (
+        "endpoint-missing-protocol-and-source",
+        include_str!("fixtures/negative-local/endpoint-missing-protocol-and-source.json"),
+        Reject::Validate("endpoint requires protocol or sourceAddress"),
+    ),
+    (
+        "fec-repair-overlay-missing-companions",
+        include_str!("fixtures/negative-local/fec-repair-overlay-missing-companions.json"),
+        Reject::Validate("scope requires depends, sourceSymbols, repairSymbols, and priority"),
     ),
 ];
 
@@ -111,11 +155,44 @@ fn golden_positive_fixtures_validate_and_round_trip_without_loss() {
 
 #[test]
 fn golden_negative_fixtures_are_rejected() {
-    for (name, json) in NEGATIVE {
-        let rejected = match serde_json::from_str::<Root>(json) {
-            Ok(catalog) => catalog.validate().is_err(),
-            Err(_) => true,
-        };
-        assert!(rejected, "{name} unexpectedly passed");
+    for (name, json, expected) in NEGATIVE.iter().chain(&NEGATIVE_LOCAL) {
+        assert_rejected(name, json, expected);
+    }
+}
+
+/// Which layer must reject a negative fixture.
+///
+/// The old harness collapsed both into `is_err()`, so it could not tell "the
+/// rule under test refused this" from "serde refused the shape first". Four of
+/// the eight negatives were silently in the second bucket, and one rule lost its
+/// only coverage without any test going red (BLO-37534).
+enum Reject {
+    /// serde refuses the shape; `validate()` never runs.
+    Parse,
+    /// `validate()` refuses it, and says so — the substring must appear in the
+    /// rendered error, so a fixture that starts failing for a different reason
+    /// fails the test instead of quietly passing.
+    Validate(&'static str),
+}
+
+fn assert_rejected(name: &str, json: &str, expected: &Reject) {
+    match (serde_json::from_str::<Root>(json), expected) {
+        (Err(_), Reject::Parse) => {}
+        (Err(error), Reject::Validate(reason)) => panic!(
+            "{name} was expected to reach validate() and fail on `{reason}`, \
+             but serde rejected it first: {error}"
+        ),
+        (Ok(_), Reject::Parse) => panic!("{name} parsed, but was expected to fail serde"),
+        (Ok(catalog), Reject::Validate(reason)) => match catalog.validate() {
+            Ok(()) => panic!("{name} unexpectedly validated; expected `{reason}`"),
+            Err(error) => {
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains(reason),
+                    "{name} was rejected for the wrong reason: \
+                     expected `{reason}`, got `{rendered}`"
+                );
+            }
+        },
     }
 }

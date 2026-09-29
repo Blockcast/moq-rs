@@ -12,6 +12,15 @@ pub use multicast::{
     NetworkSource,
 };
 
+/// Delivery priority a `fec-repair` track carries when `priority` is absent.
+///
+/// libmmt's schema states the default in the field's own description: *"Optional
+/// on base layer 0 (240 when absent); required on layers 1..n and overlays."*
+/// `validate_repair_track` enforces the second half, so an absent `priority` can
+/// only mean base layer 0 — consumers resolve it through this constant rather
+/// than unwrapping (BLO-37534).
+pub const DEFAULT_REPAIR_PRIORITY: u8 = 240;
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Root {
@@ -405,6 +414,49 @@ impl Root {
                 reason: "MMTP timing and fec fields are forbidden",
             });
         }
+        // libmmt makes `priority` *conditionally* optional, not optional:
+        // `allOf[1].then.allOf` requires it (with its companions) on overlays
+        // and on layers 1..n, leaving base layer 0 as the only shape that may
+        // omit it. Widening to `Option` without these three conditions accepted
+        // catalogs libmmt rejects (BLO-37534).
+        let require = |present: bool, missing: bool, reason| {
+            if present && missing {
+                Err(CatalogValidationError::InvalidRepairTrack {
+                    track_name: track.name.clone(),
+                    reason,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        // allOf[1].then.allOf[0]: a keyframe overlay is fully specified, and is
+        // mutually exclusive with a layer index.
+        let overlay = track.scope.is_some();
+        require(
+            overlay,
+            track.depends.is_none()
+                || track.source_symbols.is_none()
+                || track.repair_symbols.is_none()
+                || track.priority.is_none(),
+            "scope requires depends, sourceSymbols, repairSymbols, and priority",
+        )?;
+        require(
+            overlay,
+            track.repair_layer.is_some(),
+            "scope and repairLayer are mutually exclusive",
+        )?;
+        // allOf[1].then.allOf[1]: sourceSymbols is an overlay-only quantity.
+        require(
+            track.source_symbols.is_some(),
+            track.scope.is_none(),
+            "sourceSymbols requires scope",
+        )?;
+        // allOf[1].then.allOf[2]: layers above the base carry their own rank.
+        require(
+            matches!(track.repair_layer, Some(layer) if layer >= 1),
+            track.depends.is_none() || track.repair_symbols.is_none() || track.priority.is_none(),
+            "repairLayer >= 1 requires depends, repairSymbols, and priority",
+        )?;
         Ok(())
     }
 

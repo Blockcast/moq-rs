@@ -19,8 +19,28 @@ single catalog the fleet actually emits — including the output of hang's own
 the emitter hang actually ships stays parseable. It validates against libmmt's
 schema too.
 
+## `negative-local/` — not mirrors
+
+`negative/` is a byte-identical mirror, so it cannot host a fixture libmmt does
+not have. `negative-local/` holds the few negatives that exist only here, each
+because no canonical vector reaches the rule it covers:
+
+- `endpoint-missing-protocol-and-source.json` — libmmt's
+  `multicast-endpoint-missing-protocol-and-source.json` is a *double* negative:
+  its `"networkSource": "direct"` is a string where the schema pins an array of
+  objects, so serde rejects it before the endpoint rule runs. This one omits
+  `networkSource` entirely so the endpoint rule is what fails.
+- `fec-repair-overlay-missing-companions.json` — libmmt ships no vector for
+  `allOf[1].then.allOf[0]`'s *required* arm (only for its `repairLayer`
+  exclusion).
+
+Both were found by mutation-testing: the rule was neutralised, and nothing went
+red. A guard with no failing mutation is a comment — if you add one, delete it
+and confirm the suite fails before trusting it.
+
 Not yet mirrored (each needs validation rules this crate does not implement; see
 BLO-37534 follow-ups): `positive/multicast-auth-rotation.json` and the
-`fec-repair-*`, `multicast-auth-*`, `multicast-packet-id-signaling`,
-`media-track-repair-layer`, `raptorq-source-symbols-over-max` and `track-role-*`
-negatives.
+`fec-enhancement-repair-removed`, `fec-repair-layer-geometry`,
+`fec-repair-multiple-depends`, `multicast-auth-*`,
+`multicast-packet-id-signaling`, `media-track-repair-layer`,
+`raptorq-source-symbols-over-max` and `track-role-*` negatives.
