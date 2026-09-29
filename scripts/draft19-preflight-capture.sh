@@ -104,7 +104,11 @@ relay_alive_or_die() { kill -0 "$RELAY_PID" 2>/dev/null || { cat "$WORK/relay.lo
 WAIT_BUDGET_SECS=30
 wait_bounded() {
   local pid=$1 rc=0 watchdog
-  ( sleep "$WAIT_BUDGET_SECS"; kill -KILL "$pid" 2>/dev/null ) &
+  # Redirected, because killing the watchdog reaps only the subshell: its
+  # `sleep` child is orphaned and would otherwise keep the script's stdout and
+  # stderr open for the rest of the budget. A runner that waits for the step's
+  # output pipe to reach EOF sits on that.
+  ( sleep "$WAIT_BUDGET_SECS"; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   watchdog=$!
   wait "$pid" || rc=$?
   kill "$watchdog" 2>/dev/null || true
@@ -231,8 +235,14 @@ GOAWAY_EVIDENCE="$(strip_ansi <"$WORK/relay.log" | grep -F 'draft-19 drain: sent
   cat "$WORK/relay.log" >&2
   echo "relay logged no draft-19 GOAWAY send" >&2; exit 1
 }
-case "$GOAWAY_EVIDENCE" in
-  *"new_session_uri=$GOAWAY_URI"*"timeout_ms=$GOAWAY_TIMEOUT_MS"*) ;;
+# The trailing space in each pattern, and the one appended to the subject, are
+# what make this a whole-field match: without them `timeout_ms=250` also passes
+# on a relay line reading `timeout_ms=2500`, and the URI arm passes on
+# `moqt://next.example.invalid`. Drift is exactly what this guard is for, so it
+# must not match a prefix of the configured value. Glob rather than a regex so
+# the `.` and `/` in the URI stay literal.
+case "$GOAWAY_EVIDENCE " in
+  *"new_session_uri=$GOAWAY_URI "*"timeout_ms=$GOAWAY_TIMEOUT_MS "*) ;;
   *) echo "relay GOAWAY line does not carry the configured URI and Timeout: $GOAWAY_EVIDENCE" >&2; exit 1 ;;
 esac
 

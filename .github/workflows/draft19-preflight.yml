@@ -162,11 +162,12 @@ jobs:
           # handshake.binary, which is the role's own binary.
           test "$(jq -r '.goaway.binary' "$ARTIFACT")" = moq-relay-ietf
           # A log line that named a different URI or Timeout would describe a
-          # different GOAWAY than the bytes above. `\b` so the Timeout test does
-          # not also pass on timeout_ms=2500.
+          # different GOAWAY than the bytes above. Each test carries a trailing
+          # boundary so neither passes on a longer value: `next.example.invalid`
+          # for the URI, `timeout_ms=2500` for the Timeout.
           jq -er '.goaway.binary_evidence
                   | test("draft-19 drain: sent GOAWAY")
-                    and test("new_session_uri=moqt://next\\.example")
+                    and test("new_session_uri=moqt://next\\.example\\s")
                     and test("timeout_ms=250\\b")' "$ARTIFACT" >/dev/null
           # The digest a consumer recomputes offline must match the one shipped.
           expected="$(jq -c '.canonical_payload' "$ARTIFACT" | sha256sum | cut -d' ' -f1)"

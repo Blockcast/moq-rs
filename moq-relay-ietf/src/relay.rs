@@ -669,6 +669,13 @@ impl Relay {
 /// to flush*, an RTT-scale quantity unrelated to it. Reusing the advertised one
 /// would hand any deployment that advertises a sub-RTT Timeout a close that
 /// expires before it can land.
+///
+/// Chosen to sit above web-transport-quinn's own `max(3 * RTT, 100ms)` close
+/// budget at ordinary RTTs, so on the paths that library bounds it is the
+/// library that fires first. The two cross at RTT ~= 333ms; above that this
+/// bound fires first and releases the admission while the library's spawned
+/// close is still running, which is benign because that task still force-closes
+/// with the right code afterwards.
 const GOAWAY_CLOSE_FLUSH_MS: u64 = 1_000;
 
 /// Serve a draft-19 session's control plane, and only that.
@@ -807,15 +814,23 @@ pub async fn serve_draft19_control_plane(
                 // waiting for its endpoint to go idle before it exits.
                 //
                 // Bounded, because this wait gates the admission, which gates
-                // both `Drained` and `Ceiling`: an unbounded one lets a single
-                // WebTransport peer that never answers the close capsule hold
-                // the whole process open. Expiry preserves that liveness and
-                // costs the close code: `session.close()` leaves the QUIC
-                // connection open, so a capsule that never lands leaves the
-                // endpoint closer to close the connection itself with its own
-                // code, and the peer learns that instead of `GOAWAY_TIMEOUT`.
-                // Raw QUIC cannot reach this, since `closed()` is already
-                // resolved by the time it is awaited.
+                // both `Drained` and `Ceiling`. A peer that simply never
+                // answers the capsule is already bounded inside
+                // web-transport-quinn: `close` spawns a task that writes the
+                // capsule, waits `max(3 * RTT, 100ms)` for the connection to
+                // close, and then force-closes it with the
+                // `GOAWAY_TIMEOUT`-derived code. The residual unbounded path is
+                // narrower than that: the capsule's `write_all` stalled on
+                // flow-control credit never errors, so none of that task's
+                // force-close branches is reached and its own timeout is never
+                // armed. That stall is what this bound catches.
+                //
+                // So expiry costs nothing observable on the paths the library
+                // bounds, only an early admission release. On the stall path it
+                // costs the close code, because the connection is still open
+                // and the endpoint closer then closes it with its own. Raw QUIC
+                // reaches none of this, since `closed()` is already resolved by
+                // the time it is awaited.
                 let _ = tokio::time::timeout(
                     Duration::from_millis(GOAWAY_CLOSE_FLUSH_MS),
                     raw_conn.closed(),
