@@ -37,7 +37,17 @@ Two things the check deliberately does *not* do. It does not require every libmm
 vector to be mirrored — the unmirrored ones are listed at the bottom of this file
 and each needs a validation rule this crate has yet to implement. And it reads
 the directories rather than `golden.rs`'s `include_str!` tables, because a merge
-can add a file to `negative/` without registering it and that is still drift.
+can add a file to `negative/` without registering it and `mirror.rs` still has to
+judge whether it is a mirror.
+
+That directory read does not, by itself, catch an *unregistered* fixture: a file
+that is a genuine libmmt vector by name and SHA is a legitimate mirror, so
+`mirror.rs` passes it, and `golden.rs` never sees it because it iterates its own
+tables. `golden.rs`'s `every_fixture_file_is_registered` closes that gap — it
+reads all three fixture directories and fails on any file no table names, so a
+fixture cannot sit in the tree testing nothing while looking covered. Deletions
+were already caught, because `include_str!` fails to compile; only additions were
+silent.
 
 This exists because prose did not hold. The contract was broken twice and caught
 by review both times, never by a red test: once by a hand edit, and once by the
