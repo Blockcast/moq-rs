@@ -24,10 +24,25 @@ const POSITIVE: [(&str, &str); 6] = [
     ),
 ];
 
-const NEGATIVE: [(&str, &str, Reject); 10] = [
+const NEGATIVE: [(&str, &str, Reject); 13] = [
     (
         "legacy-selection-params",
         include_str!("fixtures/negative/legacy-selection-params.json"),
+        Reject::Parse,
+    ),
+    (
+        "legacy-common-track-fields",
+        include_str!("fixtures/negative/legacy-common-track-fields.json"),
+        Reject::Parse,
+    ),
+    (
+        "legacy-numeric-streaming-format",
+        include_str!("fixtures/negative/legacy-numeric-streaming-format.json"),
+        Reject::Parse,
+    ),
+    (
+        "legacy-subgroup-history-groups",
+        include_str!("fixtures/negative/legacy-subgroup-history-groups.json"),
         Reject::Parse,
     ),
     (
