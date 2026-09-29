@@ -60,17 +60,18 @@ wait_for_log "$RELAY_PID" "$TMP/relay.log" "listening on 127.0.0.1:4443"
   >"$TMP/publisher.log" 2>&1 &
 PUB_PID=$!
 wait_for_log "$PUB_PID" "$TMP/publisher.log" "listening for datagrams"
-# "listening for datagrams" is logged before the publisher connects to the
-# relay. Start the subscriber only once the relay has registered the namespace,
-# or its SUBSCRIBE can land first and be refused as not found. The coordinator
-# line is logged after the local route source is registered (consumer.rs serve).
-# Match the message only: tracing puts colour codes between target and message.
-wait_for_log "$PUB_PID" "$TMP/relay.log" "registering namespace: "
 
+# "listening for datagrams" is logged before the publisher connects to the
+# relay, so its PUBLISH_NAMESPACE may not have reached the relay yet. With
+# --await-namespace the subscriber sends SUBSCRIBE_NAMESPACE for solana-shreds
+# and sends SUBSCRIBE only after the relay answers with NAMESPACE for it, which
+# the relay does once the publisher's PUBLISH_NAMESPACE is registered as the
+# route for the namespace.
 "$ROOT/target/debug/moq-sub-raw" moqt://localhost:4443 \
   --name solana-shreds \
   --track shreds \
   --output "$TMP/output.bin" \
+  --await-namespace \
   --bind 127.0.0.1:0 \
   --tls-disable-verify \
   >"$TMP/subscriber.log" 2>&1 &
