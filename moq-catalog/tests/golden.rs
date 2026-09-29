@@ -12,10 +12,22 @@ const POSITIVE: [(&str, &str); 3] = [
     ),
 ];
 
-const NEGATIVE: [(&str, &str); 6] = [
+const NEGATIVE: [(&str, &str); 9] = [
     (
         "legacy-selection-params",
         include_str!("fixtures/negative/legacy-selection-params.json"),
+    ),
+    (
+        "legacy-common-track-fields",
+        include_str!("fixtures/negative/legacy-common-track-fields.json"),
+    ),
+    (
+        "legacy-numeric-streaming-format",
+        include_str!("fixtures/negative/legacy-numeric-streaming-format.json"),
+    ),
+    (
+        "legacy-subgroup-history-groups",
+        include_str!("fixtures/negative/legacy-subgroup-history-groups.json"),
     ),
     (
         "missing-mmtp-fields",
