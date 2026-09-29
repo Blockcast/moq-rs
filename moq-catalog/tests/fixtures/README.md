@@ -19,6 +19,33 @@ single catalog the fleet actually emits — including the output of hang's own
 the emitter hang actually ships stays parseable. It validates against libmmt's
 schema too.
 
+## The mirror is enforced — `tests/mirror.rs`
+
+`libmmt-negative.manifest` vendors libmmt's `catalog/negative/` listing as
+`<git blob SHA>  <name>`, and `tests/mirror.rs` checks both directions of the
+contract against it: nothing in `negative/` may be missing from or differ from
+libmmt, and nothing in `negative-local/` may be byte-identical to a libmmt
+vector. A blob SHA is a content hash, so equality is byte-identity. Vendoring the
+listing keeps this a pure local comparison — no network, and no requirement that
+libmmt be checked out beside this repo.
+
+The manifest is the thing you update when you deliberately sync; regenerate it
+from a libmmt checkout with the command in its header. It records the libmmt
+commit it came from.
+
+Two things the check deliberately does *not* do. It does not require every libmmt
+vector to be mirrored — the unmirrored ones are listed at the bottom of this file
+and each needs a validation rule this crate has yet to implement. And it reads
+the directories rather than `golden.rs`'s `include_str!` tables, because a merge
+can add a file to `negative/` without registering it and that is still drift.
+
+This exists because prose did not hold. The contract was broken twice and caught
+by review both times, never by a red test: once by a hand edit, and once by the
+merge at `1c9f26fb`, which carried three local-only negatives into `negative/`
+while every local signal — directory/registry consistency, arities, and the
+fixtures still being rejected — stayed green. No amount of care at authoring time
+covers a merge.
+
 ## `negative-local/` — not mirrors
 
 `negative/` is a byte-identical mirror, so it cannot host a fixture libmmt does
