@@ -116,6 +116,7 @@ evidence() { strip_ansi <"$EVIDENCE_LOG" | grep -F "$MARKER" | tail -1; }
 # merely late. Killing the relay to flush it would not help either: SIGTERM can
 # land before the relay task reaches the log call, losing the line.
 EVIDENCE=""
+NEGOTIATED=0
 ATTEMPTS=8
 for attempt in $(seq 1 "$ATTEMPTS"); do
   # Expected to exit non-zero: the publisher reports the negotiated profile and
@@ -131,9 +132,15 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
     # publisher's line the same budget as the relay's: a miss is only a
     # regression once the last attempt has also missed.
     if [ "$attempt" -lt "$ATTEMPTS" ]; then continue; fi
+    # An earlier attempt did negotiate, so the unmet condition is the role's
+    # establishment line, not the negotiation. Fall through to the diagnostic
+    # below, which names that condition and dumps `$EVIDENCE_LOG` (relay.log for
+    # the relay roles) instead of claiming a negotiation regression over pub.log.
+    if [ "$NEGOTIATED" = 1 ]; then break; fi
     cat "$WORK/pub.log" >&2
     echo "publisher did not report a moqt-19 negotiation in $ATTEMPTS attempts" >&2; exit 1
   fi
+  NEGOTIATED=1
   for _ in $(seq 1 10); do
     EVIDENCE="$(evidence)" || true
     if [ -n "$EVIDENCE" ]; then break; fi
