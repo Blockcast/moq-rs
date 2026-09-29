@@ -5,32 +5,35 @@
 //!
 //! Records, for one server role, the exact wire profile a real QUIC
 //! negotiation selected and the exact GOAWAY bytes a draft-19 control stream
-//! carried. It drives the same library entry points the shipped binaries call:
-//! [`moq_native_ietf::quic::Client::connect_with_profile`] plus
-//! [`Draft19Session::establish`] in the [`Draft19SessionRole::Client`] role for
-//! `moq-pub-mmtp`, and the [`Draft19SessionRole::Server`] role for
-//! `moq-relay-ietf`'s `serve_draft19_control_plane`.
+//! carried.
 //!
-//! Scope, stated in the artifact and not softened here: neither shipped binary
-//! emits a GOAWAY today, so the GOAWAY half is a session-level capture over a
-//! real QUIC connection rather than an observation of a production drain.
-//! `scripts/draft19-preflight-capture.sh` pairs this with a run of the real
-//! binaries, which is what attests the negotiation half end to end.
+//! Both halves are observations of the shipped binaries. This process is only
+//! the draft-19 *client*: it dials a running `moq-relay-ietf --wire-profile
+//! draft19` through [`moq_native_ietf::quic::Client::connect_with_profile`] and
+//! [`Draft19Session::establish`], exactly as `moq-pub-mmtp`'s draft-19 branch
+//! does, and then reads the control stream. The GOAWAY it decodes is the one
+//! `serve_draft19_control_plane` emitted when the relay was signalled to drain,
+//! so the artifact attests a production drain rather than a session-level
+//! capture. `scripts/draft19-preflight-capture.sh` runs the relay, arms the
+//! drain, and adds the relay's own GOAWAY log line to the emitted artifact as
+//! `goaway.binary_evidence`, the same way it adds `sha256`: both are provenance
+//! the script observes after this process exits, and both sit outside the
+//! canonical digest.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use moq_native_ietf::{quic, tls};
-use moq_transport::coding::{Encode, SessionUri};
-use moq_transport::profile::draft19::{Frame, GoAway, Setup, SETUP_TYPE};
+use moq_transport::coding::Encode;
+use moq_transport::profile::draft19::{Frame, GoAway, Setup, GOAWAY_TYPE, SETUP_TYPE};
 use moq_transport::profile::WireProfile;
 use moq_transport::session::{Draft19Session, Draft19SessionRole};
 use serde::Serialize;
 use url::Url;
 
-/// The URI and timeout the capture puts on the wire.
+/// The URI and timeout the relay is configured to advertise, and which this
+/// capture requires the received GOAWAY to carry.
 ///
 /// The URI matches the Phase 3 client rows so the server and client hex are
 /// directly comparable. The timeout is deliberately non-zero and multi-byte
@@ -135,6 +138,16 @@ struct Cli {
     #[arg(long)]
     output: PathBuf,
 
+    /// The running `moq-relay-ietf --wire-profile draft19` to dial.
+    #[arg(long)]
+    relay_url: Url,
+
+    /// Touched once the draft-19 session is established and admitted to the
+    /// relay's drain. The caller waits for it before signalling the relay, so
+    /// the drain cannot fire while SETUP is still in flight.
+    #[arg(long)]
+    ready_file: PathBuf,
+
     /// TLS material for the in-process QUIC pair.
     #[command(flatten)]
     tls: tls::Args,
@@ -188,7 +201,6 @@ struct Goaway {
     hex: String,
     decoded_uri: String,
     decoded_timeout_ms: String,
-    caveat: &'static str,
 }
 
 #[derive(Serialize)]
@@ -220,73 +232,66 @@ fn endpoint(tls: &tls::Config, bind: &str) -> anyhow::Result<quic::Endpoint> {
     quic::Endpoint::new(config)
 }
 
-/// Runs the real negotiation and the real control-stream GOAWAY exchange, and
-/// returns what the wire actually carried.
-async fn capture(tls: &tls::Config) -> anyhow::Result<(WireProfile, GoAway, Vec<u8>)> {
-    let mut server = endpoint(tls, "127.0.0.1:0")?
-        .server
-        .context("QUIC server endpoint requires a certificate")?;
-    let addr: SocketAddr = server.local_addr()?;
+/// Dial the running relay and record the GOAWAY it sends when it drains.
+///
+/// Returns what the wire actually carried. This process never sends a GOAWAY:
+/// the bytes below are the ones `serve_draft19_control_plane` wrote.
+async fn capture(
+    tls: &tls::Config,
+    relay_url: &Url,
+    ready_file: &Path,
+) -> anyhow::Result<(WireProfile, GoAway, Vec<u8>)> {
     let client = endpoint(tls, "127.0.0.1:0")?.client;
 
-    let accept = tokio::spawn(async move { server.accept().await });
-
-    // Bind is 127.0.0.1, so the URL host must be too: resolving `localhost`
-    // can hand back ::1 and the connection then never reaches this endpoint.
-    let url = Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))?;
-    let (client_session, _id, _transport, client_selected) = client
-        .connect_with_profile(&url, Some(addr), WireProfile::Draft19)
+    // The same two calls the `moq-pub-mmtp` draft-19 branch makes.
+    let (conn, _id, _transport, selected) = client
+        .connect_with_profile(relay_url, None, WireProfile::Draft19)
         .await
-        .context("draft-19 client connect failed")?;
-
-    let (server_session, info) = accept
-        .await?
-        .context("QUIC server accepted no connection")?;
-
+        .context("draft-19 connect to the relay failed")?;
     anyhow::ensure!(
-        client_selected == WireProfile::Draft19 && info.selected_version == WireProfile::Draft19,
-        "expected both peers to select {}, got client={client_selected} server={}",
+        selected == WireProfile::Draft19,
+        "expected the relay to select {}, got {selected}",
         WireProfile::Draft19,
-        info.selected_version,
     );
 
-    // The same two calls `serve_draft19_control_plane` and the `moq-pub-mmtp`
-    // draft-19 branch make.
-    let server_task = tokio::spawn(Draft19Session::establish(
-        server_session,
-        Draft19SessionRole::Server,
-        WireProfile::Draft19,
-        Setup::default(),
-    ));
-    let mut client_session = Draft19Session::establish(
-        client_session,
+    let mut session = Draft19Session::establish(
+        conn,
         Draft19SessionRole::Client,
         WireProfile::Draft19,
         Setup::default(),
     )
     .await
-    .context("draft-19 client session establish failed")?;
-    let mut server_session = server_task
-        .await?
-        .context("draft-19 server session establish failed")?;
+    .context("draft-19 session establish failed")?;
 
-    let sent = GoAway {
-        new_session_uri: SessionUri(GOAWAY_URI.to_string()),
-        timeout_ms: GOAWAY_TIMEOUT_MS,
+    // Only now is this connection admitted to the relay's drain, so only now
+    // can the caller signal the relay without racing the SETUP exchange.
+    std::fs::write(ready_file, b"ready")
+        .with_context(|| format!("failed to write ready file {}", ready_file.display()))?;
+
+    let frame: Frame = loop {
+        let frame = session
+            .receive_control()
+            .await
+            .context("control stream ended before the relay sent a GOAWAY")?;
+        if frame.message_type == GOAWAY_TYPE {
+            break frame;
+        }
+        tracing::debug!(
+            message_type = frame.message_type,
+            "ignoring non-GOAWAY control frame while waiting for the drain"
+        );
     };
-    server_session
-        .send_control(&sent.clone().into_frame()?)
-        .await
-        .context("failed to send draft-19 GOAWAY")?;
-
-    let frame: Frame = client_session
-        .receive_control()
-        .await
-        .context("failed to receive draft-19 GOAWAY")?;
     let decoded = GoAway::from_frame(&frame).context("received frame is not a GOAWAY")?;
+
+    // Fail closed rather than attest bytes that disagree with the relay's
+    // configuration: that the two match is the whole claim of this row.
     anyhow::ensure!(
-        decoded == sent,
-        "GOAWAY did not survive the control stream intact"
+        decoded.new_session_uri.0 == GOAWAY_URI && decoded.timeout_ms == GOAWAY_TIMEOUT_MS,
+        "relay sent GOAWAY uri={} timeout_ms={}, but was configured with uri={} timeout_ms={}",
+        decoded.new_session_uri.0,
+        decoded.timeout_ms,
+        GOAWAY_URI,
+        GOAWAY_TIMEOUT_MS,
     );
 
     // Re-encoding the frame the client decoded yields the bytes the control
@@ -294,7 +299,7 @@ async fn capture(tls: &tls::Config) -> anyhow::Result<(WireProfile, GoAway, Vec<
     let mut wire = Vec::new();
     frame.encode(&mut wire)?;
 
-    Ok((info.selected_version, decoded, wire))
+    Ok((selected, decoded, wire))
 }
 
 #[tokio::main]
@@ -317,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
         WireProfile::Draft19.name()
     );
 
-    let (selected, goaway, wire) = capture(&cli.tls.load()?).await?;
+    let (selected, goaway, wire) = capture(&cli.tls.load()?, &cli.relay_url, &cli.ready_file).await?;
 
     let offered: Vec<String> = OFFERED.iter().map(|p| p.name().to_string()).collect();
     let selected_version = selected.name().to_string();
@@ -336,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
             source_commit: cli.source_commit.clone(),
         },
         handshake: Handshake {
-            peer: "in-process-draft19-peer-over-real-quic",
+            peer: "moq-relay-ietf --wire-profile draft19, shipped binary, over real QUIC",
             binary: cli.role.binary().to_string(),
             binary_invocation: cli.binary_invocation.clone(),
             binary_evidence: cli.binary_evidence.clone(),
@@ -350,10 +355,6 @@ async fn main() -> anyhow::Result<()> {
             hex: goaway_hex.clone(),
             decoded_uri: goaway.new_session_uri.0.clone(),
             decoded_timeout_ms: timeout_ms.clone(),
-            caveat: "No shipped moq-rs binary emits a draft-19 GOAWAY today: \
-                     serve_draft19_control_plane only receives control messages and \
-                     moq-pub-mmtp exits after SETUP. These bytes are a session-level \
-                     capture over a real QUIC connection, not an observed relay drain.",
         },
         capture: CaptureMeta {
             captured_at: cli.captured_at.clone(),
@@ -374,19 +375,24 @@ async fn main() -> anyhow::Result<()> {
             goaway_timeout_ms: timeout_ms,
             goaway_hex,
             attests: "The draft-19 constants this repository encodes with at \
-                      source_commit, and the GOAWAY bytes this capture wrote \
-                      and read back over a real QUIC control stream. It does \
-                      not cover the shipped binaries: their own negotiation is \
-                      quoted in handshake.binary_evidence, which is outside \
-                      this digest because the log line carries a timestamp, a \
-                      temporary directory and an ephemeral port. Two commits \
-                      therefore share this digest unless the GOAWAY encoder or \
-                      a profile constant changes. Authenticity of the shipped \
-                      binary half rests on the workflow run and the artifact \
-                      digest, not on this sha256. The byte encoding to \
-                      recompute this digest over is named in \
-                      canonical_encoding, one level up, which is outside the \
-                      digest because it describes it.",
+                      source_commit, and the GOAWAY bytes a shipped \
+                      moq-relay-ietf emitted from serve_draft19_control_plane \
+                      when it was signalled to drain, read off a real QUIC \
+                      control stream by this process acting only as the \
+                      draft-19 client. It does not cover the binaries' own \
+                      negotiation: that is quoted in \
+                      handshake.binary_evidence, and the relay's GOAWAY log \
+                      line in goaway.binary_evidence. Both sit outside this \
+                      digest because a log line carries a timestamp, a \
+                      temporary directory and an ephemeral port. The bytes \
+                      here are a deterministic function of the encoder and \
+                      the configured URI and Timeout, so two commits share \
+                      this digest unless the GOAWAY encoder or a profile \
+                      constant changes. Authenticity of the shipped binary \
+                      half rests on the workflow run and the artifact digest, \
+                      not on this sha256. The byte encoding to recompute this \
+                      digest over is named in canonical_encoding, one level \
+                      up, which is outside the digest because it describes it.",
         },
         // Names the serialization, not just the charset: the artifact ships
         // this payload pretty-printed, so digesting the bytes as they appear

@@ -170,12 +170,13 @@ impl Draft19Drain {
     /// The drain is over when every admitted session has ended
     /// ([`Draft19DrainEnd::Drained`]), or at the ceiling
     /// ([`Draft19DrainEnd::Ceiling`]), whichever comes first. The ceiling is
-    /// [`Self::timeout_ms`] after the last GOAWAY the broadcast sent, or after
-    /// this call if the broadcast sent none, and it waits for every broadcast
-    /// session to end first. Each of those closes by its own Timeout, so none
-    /// is cut short and each keeps its `GOAWAY_TIMEOUT` close. Arrivals during
-    /// the drain cannot move the ceiling, so a steady stream of them cannot
-    /// hold the drain open.
+    /// [`Self::timeout_ms`] after the last GOAWAY the broadcast sent, but never
+    /// earlier than [`Self::timeout_ms`] after this call, so a broadcast whose
+    /// last GOAWAY predates it still gets the full window. It waits for every
+    /// broadcast session to end first. Each of those closes by its own Timeout,
+    /// so none is cut short and each keeps its `GOAWAY_TIMEOUT` close. Arrivals
+    /// during the drain cannot move the ceiling, so a steady stream of them
+    /// cannot hold the drain open.
     ///
     /// A zero Timeout advertises no deadline, so there is no ceiling and the
     /// drain ends only once every session, arrivals included, has ended.
@@ -792,7 +793,17 @@ pub async fn serve_draft19_control_plane(
                 // delivered; over raw QUIC it is at once, and the
                 // CONNECTION_CLOSE frame itself is flushed by the process
                 // waiting for its endpoint to go idle before it exits.
-                raw_conn.closed().await;
+                //
+                // Bounded by the same Timeout: this wait gates the admission,
+                // which gates both `Drained` and `Ceiling`, so an unbounded one
+                // lets a single WebTransport peer that never answers the close
+                // capsule hold the whole process open. Timing out here costs
+                // nothing, because the endpoint closer flushes at exit anyway.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(drain.timeout_ms),
+                    raw_conn.closed(),
+                )
+                .await;
             }
         }
     }

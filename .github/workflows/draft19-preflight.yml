@@ -152,6 +152,18 @@ jobs:
           test "$(jq -r '.canonical_payload | has("path_equivalent_to")' "$ARTIFACT")" = true
           test "$(jq -r '.goaway.decoded_uri' "$ARTIFACT")" = "moqt://next.example"
           test "$(jq -r '.goaway.decoded_timeout_ms' "$ARTIFACT")" = "250"
+          # The GOAWAY is sourced from the relay binary, so the row carries the
+          # relay's own log line for the send and no caveat. `has` rather than a
+          # value test: an absent field and a null one read alike through -r,
+          # and it is the absence of `caveat` that is being asserted.
+          test "$(jq -r '.goaway | has("caveat")' "$ARTIFACT")" = false
+          test "$(jq -r '.goaway | has("binary_evidence")' "$ARTIFACT")" = true
+          # A log line that named a different URI or Timeout would describe a
+          # different GOAWAY than the bytes above.
+          jq -er '.goaway.binary_evidence
+                  | test("draft-19 drain: sent GOAWAY")
+                    and test("new_session_uri=moqt://next\\.example")
+                    and test("timeout_ms=250")' "$ARTIFACT" >/dev/null
           # The digest a consumer recomputes offline must match the one shipped.
           expected="$(jq -c '.canonical_payload' "$ARTIFACT" | sha256sum | cut -d' ' -f1)"
           test "$(jq -r '.sha256' "$ARTIFACT")" = "$expected"

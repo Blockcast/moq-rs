@@ -13,9 +13,12 @@
 #      artifact. This is what makes the row about the binaries and not about a
 #      library call.
 #
-#   2. GOAWAY, captured at the session layer by `draft19-preflight`. No shipped
-#      binary emits a draft-19 GOAWAY today, so this half is explicitly
-#      caveated in the artifact rather than dressed up as a production drain.
+#   2. GOAWAY, also attested by the SHIPPED RELAY BINARY. The relay is launched
+#      with a drain configured, a `draft19-preflight` client establishes a
+#      draft-19 session against it, and the relay is then signalled. The GOAWAY
+#      the client decodes is the one `serve_draft19_control_plane` emitted, and
+#      the relay's own log line for that send is lifted into the artifact as
+#      `goaway.binary_evidence`. No session-level stand-in is involved.
 #
 # Usage: scripts/draft19-preflight-capture.sh <publisher|relay-root|relay-leaf> <output.json>
 set -euo pipefail
@@ -38,7 +41,16 @@ SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 }
 BIN_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
 WORK="$(mktemp -d)"
-trap 'kill "${RELAY_PID:-}" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+# SIGKILL, not the default SIGTERM: with the drain armed below, SIGTERM starts a
+# graceful drain rather than stopping the relay, so an error path would leave it
+# running. The happy path unsets these before the trap can see them.
+trap 'kill -KILL "${PREFLIGHT_PID:-}" 2>/dev/null || true; kill -KILL "${RELAY_PID:-}" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+
+# Must match `GOAWAY_URI` and `GOAWAY_TIMEOUT_MS` in
+# moq-relay-ietf/src/bin/draft19-preflight/main.rs, which fails closed if the
+# GOAWAY the relay sends carries anything else.
+GOAWAY_URI="moqt://next.example"
+GOAWAY_TIMEOUT_MS=250
 
 cargo build -p moq-relay-ietf -p moq-pub-mmtp \
   --bin moq-relay-ietf --bin moq-pub-mmtp --bin draft19-preflight
@@ -64,7 +76,9 @@ RELAY_URL="https://127.0.0.1:$PORT"
 # the digest-covered `canonical_payload.path_equivalent_to`.
 RELAY_ARGS=(--bind "127.0.0.1:$PORT" --wire-profile draft19
             --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" --tls-disable-verify
-            --coordinator-file "$WORK/coordinator-$ROLE.json")
+            --coordinator-file "$WORK/coordinator-$ROLE.json"
+            --draft19-goaway-uri "$GOAWAY_URI"
+            --draft19-goaway-timeout-ms "$GOAWAY_TIMEOUT_MS")
 if [ "$ROLE" = "relay-root" ]; then
   RELAY_ARGS+=(--node "$RELAY_URL")
 fi
@@ -148,10 +162,10 @@ case "$EVIDENCE" in
   *) echo "evidence line does not carry selected_version=moqt-19: $EVIDENCE" >&2; exit 1 ;;
 esac
 
-kill "$RELAY_PID" 2>/dev/null || true
-wait "$RELAY_PID" 2>/dev/null || true
-unset RELAY_PID
-
+# The GOAWAY half. The preflight client must be established -- and so admitted
+# to the relay's drain -- before the signal: a drain that starts with no live
+# draft-19 session has nothing to redirect and the relay exits immediately.
+READY="$WORK/preflight.ready"
 "$BIN_DIR/draft19-preflight" \
   --role "$ROLE" \
   --source-commit "$SOURCE_COMMIT" \
@@ -159,13 +173,57 @@ unset RELAY_PID
   --binary-invocation "$INVOCATION" \
   --captured-at "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
   --output "$WORK/attestation.json" \
-  --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" --tls-disable-verify
+  --relay-url "$RELAY_URL" \
+  --ready-file "$READY" \
+  --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" --tls-disable-verify &
+PREFLIGHT_PID=$!
+
+for _ in $(seq 1 60); do
+  [ -f "$READY" ] && break
+  kill -0 "$PREFLIGHT_PID" 2>/dev/null || break
+  relay_alive_or_die
+  sleep 0.5
+done
+[ -f "$READY" ] || {
+  wait "$PREFLIGHT_PID" 2>/dev/null || true
+  cat "$WORK/relay.log" >&2
+  echo "preflight never established a draft-19 session against the relay" >&2; exit 1
+}
+
+# Arm the drain. SIGTERM is what the relay turns into a GOAWAY broadcast.
+kill -TERM "$RELAY_PID"
+wait "$PREFLIGHT_PID" || {
+  cat "$WORK/relay.log" >&2
+  echo "preflight did not capture a GOAWAY from the relay" >&2; exit 1
+}
+unset PREFLIGHT_PID
+# The relay stops itself once the drain is over, so this reaps it rather than
+# killing it: an exit here is the drain completing, not a signal landing.
+wait "$RELAY_PID" 2>/dev/null || true
+unset RELAY_PID
+
+# Quote the relay's own line for the send, the same way the SETUP half is
+# quoted. Validated before it is attested: a line that names a different URI or
+# Timeout would describe a different GOAWAY than the one captured above.
+GOAWAY_EVIDENCE="$(strip_ansi <"$WORK/relay.log" | grep -F 'draft-19 drain: sent GOAWAY' | tail -1)" || true
+[ -n "$GOAWAY_EVIDENCE" ] || {
+  cat "$WORK/relay.log" >&2
+  echo "relay logged no draft-19 GOAWAY send" >&2; exit 1
+}
+case "$GOAWAY_EVIDENCE" in
+  *"new_session_uri=$GOAWAY_URI"*"timeout_ms=$GOAWAY_TIMEOUT_MS"*) ;;
+  *) echo "relay GOAWAY line does not carry the configured URI and Timeout: $GOAWAY_EVIDENCE" >&2; exit 1 ;;
+esac
 
 # Digest the canonical payload exactly as a consumer recomputes it: compact
 # JSON in the emitted key order, one trailing LF. `jq -c` preserves input key
 # order, which is what makes this reproducible from the artifact alone.
 DIGEST="$(jq -c '.canonical_payload' "$WORK/attestation.json" | sha256sum | cut -d' ' -f1)"
 mkdir -p "$(dirname "$OUTPUT")"
-jq --arg sha256 "$DIGEST" '. + {sha256: $sha256}' "$WORK/attestation.json" >"$OUTPUT"
+# Both additions are provenance the capture observes after `draft19-preflight`
+# exits, so both sit outside the digest, which is computed above.
+jq --arg sha256 "$DIGEST" --arg goaway_evidence "$GOAWAY_EVIDENCE" \
+  '.goaway += {binary_evidence: $goaway_evidence} | . + {sha256: $sha256}' \
+  "$WORK/attestation.json" >"$OUTPUT"
 
 echo "captured $ROLE at $SOURCE_COMMIT -> $OUTPUT (canonical sha256 $DIGEST)"

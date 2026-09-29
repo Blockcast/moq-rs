@@ -10,8 +10,6 @@
 
 use std::time::{Duration, Instant};
 
-use futures::FutureExt;
-
 use moq_native_ietf::quic::{Config, Endpoint};
 use moq_native_ietf::tls;
 use moq_relay_ietf::{serve_draft19_control_plane, Draft19Drain};
@@ -225,14 +223,14 @@ async fn goaway_timeout_closes_the_session_with_no_open_requests() {
     );
 
     // The serve path returning is what releases the session's hold on the
-    // drain, and so what lets the process exit. By then the close must already
-    // have reached this client, so read it without waiting: a relay that
-    // released the session as soon as it had asked for the close would get
-    // here with the close capsule not yet written.
-    let error = raw
-        .closed()
-        .now_or_never()
-        .expect("the client has seen the relay's close by the time the relay releases the session");
+    // drain, and so what lets the process exit. The relay closes locally, so
+    // the frame can still be in flight across loopback when the serve task
+    // returns. Wait for it with a bound rather than at the instant the task
+    // returns: a relay that released the session without ever sending the close
+    // still fails here, without the assertion depending on scheduler timing.
+    let error = tokio::time::timeout(Duration::from_secs(1), raw.closed())
+        .await
+        .expect("the relay's close reaches this client after it releases the session");
 
     // Assert on the session close code, not merely that the session ended.
     // Letting the relay task return would also tear the connection down, so a
