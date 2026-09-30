@@ -325,7 +325,8 @@ async fn main() -> anyhow::Result<()> {
         WireProfile::Draft19.name()
     );
 
-    let (selected, goaway, wire) = capture(&cli.tls.load()?, &cli.relay_url, &cli.ready_file).await?;
+    let (selected, goaway, wire) =
+        capture(&cli.tls.load()?, &cli.relay_url, &cli.ready_file).await?;
 
     let offered: Vec<String> = OFFERED.iter().map(|p| p.name().to_string()).collect();
     let selected_version = selected.name().to_string();
