@@ -116,19 +116,31 @@ evidence() { strip_ansi <"$EVIDENCE_LOG" | grep -F "$MARKER" | tail -1; }
 # merely late. Killing the relay to flush it would not help either: SIGTERM can
 # land before the relay task reaches the log call, losing the line.
 EVIDENCE=""
+NEGOTIATED=0
 ATTEMPTS=8
-for _ in $(seq 1 "$ATTEMPTS"); do
+for attempt in $(seq 1 "$ATTEMPTS"); do
   # Expected to exit non-zero: the publisher reports the negotiated profile and
   # then refuses to put draft-16 MMTP bytes on a moqt-19 connection.
   RUST_LOG=info "$BIN_DIR/moq-pub-mmtp" "${PUB_ARGS[@]}" >"$WORK/pub.log" 2>&1 || true
-  strip_ansi <"$WORK/pub.log" | grep -F "negotiated moqt-19, but MMTP publish is draft-16 only" >/dev/null || {
+  if ! strip_ansi <"$WORK/pub.log" | grep -F "negotiated moqt-19, but MMTP publish is draft-16 only" >/dev/null; then
     # The relay is only exercised by this connection, so a relay that dies does
     # so during the run above and takes the publisher's negotiation down with
     # it. Rule that out before blaming the publisher, or a dead relay reports
     # as a negotiation regression with only `pub.log` to read.
     relay_alive_or_die
-    cat "$WORK/pub.log" >&2; echo "publisher did not report a moqt-19 negotiation" >&2; exit 1
-  }
+    # The handshake both sides race is the reason this loop exists, so give the
+    # publisher's line the same budget as the relay's: a miss is only a
+    # regression once the last attempt has also missed.
+    if [ "$attempt" -lt "$ATTEMPTS" ]; then continue; fi
+    # An earlier attempt did negotiate, so the unmet condition is the role's
+    # establishment line, not the negotiation. Fall through to the diagnostic
+    # below, which names that condition and dumps `$EVIDENCE_LOG` (relay.log for
+    # the relay roles) instead of claiming a negotiation regression over pub.log.
+    if [ "$NEGOTIATED" = 1 ]; then break; fi
+    cat "$WORK/pub.log" >&2
+    echo "publisher did not report a moqt-19 negotiation in $ATTEMPTS attempts" >&2; exit 1
+  fi
+  NEGOTIATED=1
   for _ in $(seq 1 10); do
     EVIDENCE="$(evidence)" || true
     if [ -n "$EVIDENCE" ]; then break; fi

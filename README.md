@@ -69,8 +69,11 @@ and `moq-pub-mmtp` binaries against each other over real QUIC and quotes the
 role's own `selected_version=moqt-19` log line, then adds a decoded GOAWAY
 captured by the `draft19-preflight` binary over a draft-19 control stream.
 
-Write the output under `artifacts/`. That directory is ignored, so a capture's
-own output does not count against the next capture's dirty-tree guard.
+Write the output under the repository root's `artifacts/`, and run the script
+from the repository root so a relative path lands there. Only `/artifacts/` is
+ignored: a run from a subdirectory writes an untracked `<subdir>/artifacts/...`,
+and the next capture then fails its dirty-tree guard with a misdirecting
+`working tree is dirty`.
 
 The GOAWAY half is a session-level capture, not an observed relay drain: no
 shipped binary emits a draft-19 GOAWAY today. Every artifact says so in
