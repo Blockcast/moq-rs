@@ -13,10 +13,18 @@
 # and no dependency on libmmt being checked out beside this repo.
 #
 # This file is the thing you update when you deliberately sync. Regenerate it
-# from a libmmt checkout (it prints exactly the payload lines below):
+# from a libmmt checkout -- this emits the `# Source:` line and the payload
+# lines below, in that order:
 #
-#   git ls-tree origin/main -- packages/container/test-vectors/catalog/negative/ \
-#     | awk '{ n = $4; sub(/.*\//, "", n); print $3 "  " n }' | sort -k2
+#   { echo "# Source: Blockcast/libmmt @ $(git rev-parse origin/main) (main)"; \
+#     git ls-tree origin/main -- packages/container/test-vectors/catalog/negative/ \
+#       | awk '{ n = $4; sub(/.*\//, "", n); print $3 "  " n }' | sort -k2; }
+#
+# The command resolves `origin/main` rather than recording it, because a moving
+# ref cannot answer "is this snapshot current?". It still cannot detect that
+# libmmt has moved *since* -- that is the price of checking offline -- so the
+# resolved commit is the only handle `tests/mirror.rs` can cite when a fixture
+# is absent from the listing, and it asserts the line is present and 40-hex.
 #
 # Source: Blockcast/libmmt @ 10a8b91bb731f83e7f16004e7ec1b38ab73bd904 (main)
 575aa9ebb881ede239b15951ab02ffb48ff6c8ef  fec-enhancement-repair-removed.json

@@ -68,6 +68,42 @@ fn libmmt_corpus() -> BTreeMap<&'static str, &'static str> {
     entries
 }
 
+/// The libmmt commit this manifest snapshots, from its `# Source:` header.
+///
+/// Load-bearing rather than decoration: the drift message below cites it, so a
+/// reader can tell "libmmt does not ship this vector" from "this snapshot
+/// predates it". A vendored listing cannot detect that libmmt has moved --
+/// that is the price of the offline check -- so naming the commit it was taken
+/// at is the only handle it can offer.
+///
+/// Asserted, not defaulted. A missing or malformed header would quietly turn
+/// the message back into the unconditional claim it replaces, which is the one
+/// failure this function exists to prevent.
+fn manifest_source_commit() -> &'static str {
+    let commit = MANIFEST
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("# Source: Blockcast/libmmt @")?
+                .split_whitespace()
+                .next()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "manifest carries no `# Source: Blockcast/libmmt @ <sha>` header -- \
+                 the drift message needs it to name the snapshot's commit; \
+                 regenerate the manifest with the command in its header"
+            )
+        });
+
+    assert!(
+        commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "manifest `# Source:` header does not carry a 40-hex commit: {commit}"
+    );
+
+    commit
+}
+
 /// The manifest entry carrying these bytes, whatever name libmmt files it under.
 fn libmmt_name_for_sha<'a>(corpus: &BTreeMap<&'a str, &'a str>, sha: &str) -> Option<&'a str> {
     corpus
@@ -118,6 +154,7 @@ fn hashed_fixtures(dir: &str) -> Vec<(String, String)> {
 #[test]
 fn negative_fixtures_are_byte_identical_mirrors_of_libmmt() {
     let corpus = libmmt_corpus();
+    let source = manifest_source_commit();
 
     let drift: Vec<String> = hashed_fixtures("negative")
         .into_iter()
@@ -131,8 +168,10 @@ fn negative_fixtures_are_byte_identical_mirrors_of_libmmt() {
                      restore the libmmt name"
                 ),
                 None => format!(
-                    "{name}: libmmt ships no vector by this name -- \
-                     it belongs in negative-local/, not the mirror"
+                    "{name}: not in the manifest, which snapshots libmmt at \
+                     {source} -- if libmmt has added this vector since, \
+                     regenerate the manifest (command in its header); \
+                     otherwise it belongs in negative-local/, not the mirror"
                 ),
             }),
             Some(&expected) if expected != sha => Some(format!(
