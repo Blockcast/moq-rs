@@ -1,4 +1,7 @@
 use moq_catalog::Root;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
 
 const POSITIVE: [(&str, &str); 6] = [
     ("flat-av", include_str!("fixtures/positive/flat-av.json")),
@@ -83,7 +86,7 @@ const NEGATIVE: [(&str, &str, Reject); 10] = [
 
 /// Negatives that are NOT libmmt mirrors. The first three exist because no
 /// canonical vector reaches the rule each covers, so mirroring alone would leave
-/// that rule untested -- in each case confirmed by mutation-testing the rule and
+/// that rule untested — in each case confirmed by mutation-testing the rule and
 /// watching nothing go red. The `legacy-*` three pin pre-MSF shapes libmmt never
 /// emitted, so it has no vector for them.
 const NEGATIVE_LOCAL: [(&str, &str, Reject); 6] = [
@@ -173,6 +176,63 @@ fn golden_positive_fixtures_validate_and_round_trip_without_loss() {
 fn golden_negative_fixtures_are_rejected() {
     for (name, json, expected) in NEGATIVE.iter().chain(&NEGATIVE_LOCAL) {
         assert_rejected(name, json, expected);
+    }
+}
+
+#[test]
+fn every_fixture_file_is_registered() {
+    let dirs: [(&str, Vec<&str>); 3] = [
+        ("positive", POSITIVE.iter().map(|(name, _)| *name).collect()),
+        (
+            "negative",
+            NEGATIVE.iter().map(|(name, _, _)| *name).collect(),
+        ),
+        (
+            "negative-local",
+            NEGATIVE_LOCAL.iter().map(|(name, _, _)| *name).collect(),
+        ),
+    ];
+
+    for (dir, names) in dirs {
+        let registered: BTreeSet<&str> = names.into_iter().collect();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(dir);
+
+        let on_disk: BTreeSet<String> = fs::read_dir(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+            .map(|entry| {
+                entry
+                    .expect("cannot stat fixture")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter_map(|name| name.strip_suffix(".json").map(str::to_owned))
+            .collect();
+
+        assert!(
+            !on_disk.is_empty(),
+            "no fixtures found in {} -- the check would pass vacuously",
+            path.display()
+        );
+
+        // Only the unregistered direction is checked: a table naming a file that
+        // does not exist cannot reach this test, because `include_str!` fails to
+        // compile first.
+        let unregistered: Vec<&str> = on_disk
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !registered.contains(name))
+            .collect();
+
+        assert!(
+            unregistered.is_empty(),
+            "{dir}/ holds fixtures that no table in this file registers:\n  {}\n\
+             They are compiled into no test, so they assert nothing while looking covered. \
+             Add them to the table, or delete them.",
+            unregistered.join("\n  ")
+        );
     }
 }
 
