@@ -161,6 +161,13 @@ jobs:
           # and it is the absence of `caveat` that is being asserted.
           test "$(jq -r '.goaway | has("caveat")' "$ARTIFACT")" = false
           test "$(jq -r '.goaway | has("binary_evidence")' "$ARTIFACT")" = true
+          # The goaway block is assembled in two languages: the binary emits
+          # every key but binary_evidence, which the capture script appends. Pin
+          # the whole emitted set so neither half can add or drop a key without
+          # the schema_version bump that tells a pinned consumer to re-read.
+          test "$(jq -cr '.goaway | keys_unsorted | sort' "$ARTIFACT")" = \
+            '["binary","binary_evidence","decoded_timeout_ms","decoded_uri","direction","hex","stream"]'
+          test "$(jq -r '.schema_version' "$ARTIFACT")" = 2
           # The GOAWAY emitter is the relay for every role, unlike
           # handshake.binary, which is the role's own binary.
           test "$(jq -r '.goaway.binary' "$ARTIFACT")" = moq-relay-ietf

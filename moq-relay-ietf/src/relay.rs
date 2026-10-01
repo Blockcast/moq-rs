@@ -174,9 +174,10 @@ impl Draft19Drain {
     /// earlier than [`Self::timeout_ms`] after this call, so a broadcast whose
     /// last GOAWAY predates it still gets the full window. It waits for every
     /// broadcast session to end first. Each of those closes by its own Timeout,
-    /// so none is cut short and each keeps its `GOAWAY_TIMEOUT` close. Arrivals
-    /// during the drain cannot move the ceiling, so a steady stream of them
-    /// cannot hold the drain open.
+    /// so none is cut short, and each keeps its `GOAWAY_TIMEOUT` close unless
+    /// the close flush itself expires first; see `GOAWAY_CLOSE_FLUSH_MS`.
+    /// Arrivals during the drain cannot move the ceiling, so a steady stream of
+    /// them cannot hold the drain open.
     ///
     /// A zero Timeout advertises no deadline, so there is no ceiling and the
     /// drain ends only once every session, arrivals included, has ended.

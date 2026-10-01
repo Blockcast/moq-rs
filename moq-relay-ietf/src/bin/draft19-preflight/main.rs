@@ -148,7 +148,7 @@ struct Cli {
     #[arg(long)]
     ready_file: PathBuf,
 
-    /// TLS material for the in-process QUIC pair.
+    /// TLS material for dialing the relay.
     #[command(flatten)]
     tls: tls::Args,
 }
@@ -185,6 +185,10 @@ struct Source {
 
 #[derive(Serialize)]
 struct Handshake {
+    /// The counterpart this capture connected to, which is the relay for every
+    /// role. Not necessarily the counterpart `binary_evidence` handshook with:
+    /// for the relay roles that line is the relay's own SETUP with
+    /// `moq-pub-mmtp`.
     peer: &'static str,
     binary: String,
     binary_invocation: String,
@@ -194,6 +198,10 @@ struct Handshake {
     setup_type: String,
 }
 
+/// Serialized one key short of the emitted shape: the capture script appends
+/// `binary_evidence` (the relay's own GOAWAY log line) after this process
+/// exits, because it is provenance only the script observes. The workflow pins
+/// the full emitted key set so the two halves cannot drift apart silently.
 #[derive(Serialize)]
 struct Goaway {
     direction: String,
@@ -216,6 +224,11 @@ struct CaptureMeta {
 
 #[derive(Serialize)]
 struct Attestation {
+    /// Bumped whenever the emitted shape changes in a way that breaks a pinned
+    /// consumer. 2 removed `goaway.caveat` and added `goaway.binary`, which a
+    /// consumer reading `.goaway.caveat` cannot detect on its own: the field
+    /// sits outside `canonical_payload`, so the digest does not move, and an
+    /// absent field reads as `null` exactly like a present-null one.
     schema_version: u8,
     role: String,
     source: Source,
@@ -338,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
     let timeout_ms = goaway.timeout_ms.to_string();
 
     let attestation = Attestation {
-        schema_version: 1,
+        schema_version: 2,
         role: cli.role.name().to_string(),
         source: Source {
             repository: "Blockcast/moq-rs",
