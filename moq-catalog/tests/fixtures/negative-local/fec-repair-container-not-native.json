@@ -6,21 +6,19 @@
     {
       "name": "video",
       "packaging": "mmtp",
+      "role": "video",
       "mmtpMode": "mfu",
       "timescale": 90000,
       "groupDurationMs": 1000,
       "fec": {
         "algorithm": "raptorq",
-        "sourceSymbols": 32,
-        "repairSymbols": 8,
-        "symbolSize": 1310,
-        "repairTrack": "video-repair"
+        "sourceSymbols": 4,
+        "repairSymbols": 2,
+        "symbolSize": 1320,
+        "repairTrack": "video-repair",
+        "repairContainer": "mmtp"
       }
     },
-    {
-      "name": "video-repair",
-      "packaging": "fec-repair",
-      "priority": 240
-    }
+    { "name": "video-repair", "packaging": "fec-repair", "priority": 240 }
   ]
 }

@@ -1,0 +1,19 @@
+{
+  "streamingFormat": "mmtp",
+  "streamingFormatVersion": "draft-ramadan-moq-mmt-00",
+  "tracks": [
+    {
+      "codec": "avc3.42c01e",
+      "groupDurationTicks": 90000,
+      "height": 720,
+      "isLive": true,
+      "mmtpMode": "mfu",
+      "name": "video0.mmtp",
+      "packaging": "mmtp",
+      "role": "video",
+      "timescale": 90000,
+      "width": 1280
+    }
+  ],
+  "version": 1
+}

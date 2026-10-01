@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "streamingFormat": "mmtp",
+  "streamingFormatVersion": "draft-ramadan-moq-mmt-00",
+  "tracks": [
+    {
+      "name": "video",
+      "packaging": "mmtp",
+      "codec": "avc1.640028",
+      "mmtpMode": "mfu",
+      "timescale": 90000,
+      "groupDurationMs": 1000,
+      "fec": {
+        "algorithm": "raptorq",
+        "sourceSymbols": 64,
+        "repairSymbols": 8,
+        "symbolSize": 1312,
+        "interleaveDepthMs": 1000,
+        "reorderToleranceMs": 40,
+        "repairTrack": "video/repair"
+      }
+    },
+    {
+      "name": "video/repair",
+      "packaging": "fec-repair",
+      "depends": ["video"],
+      "repairLayer": 0,
+      "priority": 240
+    },
+    {
+      "name": "video/repair/1",
+      "packaging": "fec-repair",
+      "depends": ["video"],
+      "repairLayer": 1,
+      "repairSymbols": 16,
+      "priority": 244
+    },
+    {
+      "name": "video/repair/2",
+      "packaging": "fec-repair",
+      "depends": ["video"],
+      "repairLayer": 2,
+      "repairSymbols": 32,
+      "priority": 248
+    },
+    {
+      "name": "video/keyframe-repair",
+      "packaging": "fec-repair",
+      "depends": ["video"],
+      "scope": "keyframe",
+      "sourceSymbols": 256,
+      "repairSymbols": 32,
+      "priority": 242
+    },
+    {
+      "name": "audio",
+      "packaging": "mmtp",
+      "codec": "mp4a.40.2",
+      "mmtpMode": "mfu",
+      "timescale": 48000,
+      "groupDurationMs": 1000,
+      "fec": {
+        "algorithm": "raptorq",
+        "sourceSymbols": 47,
+        "repairSymbols": 4,
+        "symbolSize": 1312,
+        "interleaveDepthMs": 1000,
+        "repairTrack": "audio-repair"
+      }
+    },
+    {
+      "name": "audio-repair",
+      "packaging": "fec-repair"
+    }
+  ],
+  "multicast": {
+    "endpoints": [
+      {
+        "sourceAddress": "192.0.2.10",
+        "groupAddress": "232.1.1.1",
+        "port": 5000,
+        "tracks": [
+          { "name": "video", "packetId": 1 },
+          { "name": "audio", "packetId": 2 },
+          { "name": "video/repair", "packetId": 3 },
+          { "name": "audio-repair", "packetId": 4 }
+        ]
+      },
+      {
+        "sourceAddress": "192.0.2.10",
+        "groupAddress": "232.1.1.2",
+        "port": 5000,
+        "tracks": [
+          { "name": "video/repair/1", "packetId": 5 },
+          { "name": "video/repair/2", "packetId": 6 },
+          { "name": "video/keyframe-repair", "packetId": 7 }
+        ]
+      }
+    ],
+    "networkSource": [
+      { "type": "amt", "discovery": "driad" }
+    ]
+  }
+}

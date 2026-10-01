@@ -5,8 +5,9 @@
 name: pr
 
 on:
+  # No base-branch filter: a stacked PR targeting a feature branch needs the same
+  # checks as one targeting main, and gets none while a `branches:` filter is set.
   pull_request:
-    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always

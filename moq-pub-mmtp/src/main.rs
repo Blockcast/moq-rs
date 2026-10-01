@@ -559,7 +559,7 @@ fn build_state_map(
                     .expect("Root::validate resolved fec.repairTrack");
                 let priority = repair_track
                     .priority
-                    .expect("Root::validate requires repair priority");
+                    .unwrap_or(moq_catalog::DEFAULT_REPAIR_PRIORITY);
                 let repair_writer = tracks_writer.create(&fec.repair_track).ok_or_else(|| {
                     anyhow::anyhow!(
                         "TracksWriter::create returned None for `{}` (broadcast already closed?)",
@@ -807,7 +807,11 @@ mod tests {
     fn endpoint(track_refs: Vec<(&str, u16)>) -> MulticastEndpoint {
         MulticastEndpoint {
             protocol: None,
-            source_address: None,
+            // An endpoint needs protocol or sourceAddress to validate, and
+            // absent protocol defaults to SSM when a source is present. Without
+            // this these helpers built catalogs `validate()` rejects, so any
+            // test that wanted to assert on a *valid* catalog could not.
+            source_address: Some("198.51.100.7".into()),
             group_address: "232.0.1.1".into(),
             port: 5004,
             tracks: track_refs
@@ -1078,6 +1082,8 @@ mod tests {
             symbol_size: 1312,
             interleave_depth_ms: None,
             repair_track: "v/fec-custom".into(),
+            reorder_tolerance_ms: None,
+            repair_container: None,
             mode: None,
         });
         let mut repair = track("v/fec-custom", Some(TrackPackaging::FecRepair));
@@ -1102,6 +1108,49 @@ mod tests {
         assert!(
             tr.get_track_reader(&ns(), "v/repair").is_none(),
             "the `<source>/repair` convention name is not used when fec names one"
+        );
+    }
+
+    #[test]
+    fn build_state_map_defaults_base_layer_repair_priority_to_240() {
+        // libmmt makes `priority` optional on base layer 0 and defaults it to
+        // 240, so a catalog can validate with it absent. This path used to
+        // `.expect()` it and panicked on exactly that shape — including on the
+        // canonical `fec-layered-repair` vector (BLO-37534).
+        let mut v = track("v", Some(TrackPackaging::Mmtp));
+        v.fec = Some(FecDescriptor {
+            algorithm: FecAlgorithm::RaptorQ,
+            source_symbols: 32,
+            repair_symbols: 8,
+            symbol_size: 1312,
+            interleave_depth_ms: None,
+            repair_track: "v/repair".into(),
+            reorder_tolerance_ms: None,
+            repair_container: None,
+            mode: None,
+        });
+        let mut repair = track("v/repair", Some(TrackPackaging::FecRepair));
+        repair.priority = None;
+        let cat = catalog_with(
+            vec![v, repair],
+            Some(MulticastConfig {
+                endpoints: Some(vec![endpoint(vec![("v", 17)])]),
+                network_source: None,
+            }),
+        );
+        cat.validate()
+            .expect("a base-layer repair track without priority is a valid catalog");
+        let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
+        let map = build_state_map(&mut tw, &cat).unwrap();
+        assert_eq!(
+            map.get(&17)
+                .expect("source track present")
+                .repair
+                .as_ref()
+                .expect("fec-declaring track gets a repair sink")
+                .priority,
+            moq_catalog::DEFAULT_REPAIR_PRIORITY,
+            "absent priority resolves to the schema default, not a panic"
         );
     }
 
@@ -1445,6 +1494,8 @@ mod tests {
             symbol_size: 1312,
             interleave_depth_ms: None,
             repair_track: "v/repair".into(),
+            reorder_tolerance_ms: None,
+            repair_container: None,
             mode: None,
         });
         let mut repair = track("v/repair", Some(TrackPackaging::FecRepair));

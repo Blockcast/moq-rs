@@ -1,0 +1,51 @@
+# libmmt's canonical negative catalog corpus, as `<git blob SHA>  <file name>`.
+#
+# `negative/` is declared a byte-identical mirror of libmmt's
+# packages/container/test-vectors/catalog/negative/, and `negative-local/` holds
+# only negatives libmmt does NOT ship. Both were prose contracts until this file
+# existed: nothing compared the directories against libmmt's actual listing, and
+# the mirror was broken twice — once by a hand edit, once by a merge that
+# carried three local-only fixtures into `negative/` with every local signal
+# (directory/registry consistency, arity, rejection behaviour) still green.
+#
+# A git blob SHA is a content hash, so equality here is byte-identity. Vendoring
+# the listing keeps the check a pure local comparison — no network at test time,
+# and no dependency on libmmt being checked out beside this repo.
+#
+# This file is the thing you update when you deliberately sync. Regenerate it
+# from a libmmt checkout -- this emits the `# Source:` line and the payload
+# lines below, in that order:
+#
+#   { echo "# Source: Blockcast/libmmt @ $(git rev-parse origin/main) (main)"; \
+#     git ls-tree origin/main -- packages/container/test-vectors/catalog/negative/ \
+#       | awk '{ n = $4; sub(/.*\//, "", n); print $3 "  " n }' | sort -k2; }
+#
+# The command resolves `origin/main` rather than recording it, because a moving
+# ref cannot answer "is this snapshot current?". It still cannot detect that
+# libmmt has moved *since* -- that is the price of checking offline -- so the
+# resolved commit is the only handle `tests/mirror.rs` can cite when a fixture
+# is absent from the listing, and it asserts the line is present and 40-hex.
+#
+# Source: Blockcast/libmmt @ 8b24257eca1526b0221085413e94ce307fb8f1e1 (main)
+575aa9ebb881ede239b15951ab02ffb48ff6c8ef  fec-enhancement-repair-removed.json
+5ba26ae4214888337777b8a90eaac37bd56fb56f  fec-repair-layer-geometry.json
+6c83905a67cc7497137ec5990108f620e3e6a964  fec-repair-layer-missing-symbols.json
+7f57c1995ef09db8e1b545a2e635475f8f389c6e  fec-repair-multiple-depends.json
+28bb5fc0d1f7a3081a1565a50268681fc0ca2f7f  fec-repair-overlay-with-layer.json
+ffdaf9633d3eaa5a7decf2e68d5bade936fe3280  fec-repair-priority-out-of-band.json
+2f876df0cb447d2a393f9a361d54b5c204066474  fec-repair-source-symbols-without-scope.json
+73c88a9d7753c1a05d7dea927278770ec4b5ecf7  legacy-selection-params.json
+8bbc0220e14cd391a777753d8f7795bdd28efc01  media-track-repair-layer.json
+0020d9143a24bc6d901d1d764a03b5988bca6c08  missing-mmtp-fields.json
+526b89afe31ee7459375f441f453fa388c16492a  multicast-auth-padded-key.json
+100936cf4adb459b1b46394f30e2e78a37fad750  multicast-auth-reused-track-format.json
+328742257a3170e7f4fe9996b7a6a75c22f30a3b  multicast-auth-trailing-pad-bits.json
+aa6955028846466b935130f71a879920a93688ae  multicast-endpoint-missing-protocol-and-source.json
+25304185084d481cc82b758186f46ba8b4ecaf31  multicast-network-source-empty.json
+528c07e6191c3e2b578b37cdd781f8321104d8a8  multicast-packet-id-signaling.json
+657c36b761c9a81ce1d3ad31b301ab29fb0e1d95  network-source-object.json
+a1188110de5dd7d813e829ba9a553e92c1522328  raptorq-source-symbols-over-max.json
+e60cd69abfc1bd08aea96220d1cdb7e976e3ecf4  raptorq-unaligned-symbol.json
+bda482d1548162e3b2898b3d1013aa7a57779bb2  repair-track-legacy-shape.json
+5e7f1f985f39c582c8622720f5402bf11a658988  track-role-empty.json
+05cd298c78ae39bf39f8a5deece51fdd50f6290a  track-role-non-string.json

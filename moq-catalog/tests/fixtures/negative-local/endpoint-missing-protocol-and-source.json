@@ -14,12 +14,10 @@
   "multicast": {
     "endpoints": [
       {
-        "protocol": "asm",
-        "groupAddress": "239.1.1.1",
+        "groupAddress": "232.1.1.1",
         "port": 5000,
         "tracks": [{ "name": "video", "packetId": 1 }]
       }
-    ],
-    "networkSource": { "type": "amt", "discovery": "driad" }
+    ]
   }
 }
