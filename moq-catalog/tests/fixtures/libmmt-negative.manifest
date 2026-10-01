@@ -26,7 +26,7 @@
 # resolved commit is the only handle `tests/mirror.rs` can cite when a fixture
 # is absent from the listing, and it asserts the line is present and 40-hex.
 #
-# Source: Blockcast/libmmt @ 10a8b91bb731f83e7f16004e7ec1b38ab73bd904 (main)
+# Source: Blockcast/libmmt @ 8b24257eca1526b0221085413e94ce307fb8f1e1 (main)
 575aa9ebb881ede239b15951ab02ffb48ff6c8ef  fec-enhancement-repair-removed.json
 5ba26ae4214888337777b8a90eaac37bd56fb56f  fec-repair-layer-geometry.json
 6c83905a67cc7497137ec5990108f620e3e6a964  fec-repair-layer-missing-symbols.json
@@ -41,6 +41,7 @@ ffdaf9633d3eaa5a7decf2e68d5bade936fe3280  fec-repair-priority-out-of-band.json
 100936cf4adb459b1b46394f30e2e78a37fad750  multicast-auth-reused-track-format.json
 328742257a3170e7f4fe9996b7a6a75c22f30a3b  multicast-auth-trailing-pad-bits.json
 aa6955028846466b935130f71a879920a93688ae  multicast-endpoint-missing-protocol-and-source.json
+25304185084d481cc82b758186f46ba8b4ecaf31  multicast-network-source-empty.json
 528c07e6191c3e2b578b37cdd781f8321104d8a8  multicast-packet-id-signaling.json
 657c36b761c9a81ce1d3ad31b301ab29fb0e1d95  network-source-object.json
 a1188110de5dd7d813e829ba9a553e92c1522328  raptorq-source-symbols-over-max.json

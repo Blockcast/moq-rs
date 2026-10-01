@@ -25,7 +25,7 @@ const MANIFEST: &str = include_str!("fixtures/libmmt-negative.manifest");
 /// silently weakening the `negative-local/` direction -- the precise vacuity this
 /// guard exists to prevent. The manifest is regenerated wholesale on every
 /// deliberate sync, so the count is updated in the same edit that changes it.
-const MANIFEST_ENTRIES: usize = 21;
+const MANIFEST_ENTRIES: usize = 22;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

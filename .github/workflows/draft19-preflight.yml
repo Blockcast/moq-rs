@@ -102,6 +102,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: [resolve-source]
     runs-on: default
+    # A cargo build plus up to 8 publisher invocations, each with a 5s inner poll. A wedged
+    # capture would otherwise hold an ARC runner for the 6h default.
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -152,6 +155,33 @@ jobs:
           test "$(jq -r '.canonical_payload | has("path_equivalent_to")' "$ARTIFACT")" = true
           test "$(jq -r '.goaway.decoded_uri' "$ARTIFACT")" = "moqt://next.example"
           test "$(jq -r '.goaway.decoded_timeout_ms' "$ARTIFACT")" = "250"
+          # The GOAWAY is sourced from the relay binary, so the row carries the
+          # relay's own log line for the send and no caveat. `has` rather than a
+          # value test: an absent field and a null one read alike through -r,
+          # and it is the absence of `caveat` that is being asserted.
+          test "$(jq -r '.goaway | has("caveat")' "$ARTIFACT")" = false
+          test "$(jq -r '.goaway | has("binary_evidence")' "$ARTIFACT")" = true
+          # The goaway block is assembled in two languages: the binary emits
+          # every key but binary_evidence, which the capture script appends. Pin
+          # the whole emitted set so neither half can add or drop a key without
+          # the schema_version bump that tells a pinned consumer to re-read.
+          test "$(jq -cr '.goaway | keys_unsorted | sort' "$ARTIFACT")" = \
+            '["binary","binary_evidence","decoded_timeout_ms","decoded_uri","direction","hex","stream"]'
+          test "$(jq -r '.schema_version' "$ARTIFACT")" = 2
+          # The GOAWAY emitter is the relay for every role, unlike
+          # handshake.binary, which is the role's own binary.
+          test "$(jq -r '.goaway.binary' "$ARTIFACT")" = moq-relay-ietf
+          # A log line that named a different URI or Timeout would describe a
+          # different GOAWAY than the bytes above. Each test carries a trailing
+          # boundary so neither passes on a longer value: `next.example.invalid`
+          # for the URI, `timeout_ms=2500` for the Timeout. The URI's boundary
+          # admits end-of-string as well as whitespace, so that neither arm
+          # depends on which field `tracing::info!` emits last. This mirrors the
+          # order-independent glob in scripts/draft19-preflight-capture.sh.
+          jq -er '.goaway.binary_evidence
+                  | test("draft-19 drain: sent GOAWAY")
+                    and test("new_session_uri=moqt://next\\.example(\\s|$)")
+                    and test("timeout_ms=250\\b")' "$ARTIFACT" >/dev/null
           # The digest a consumer recomputes offline must match the one shipped.
           expected="$(jq -c '.canonical_payload' "$ARTIFACT" | sha256sum | cut -d' ' -f1)"
           test "$(jq -r '.sha256' "$ARTIFACT")" = "$expected"

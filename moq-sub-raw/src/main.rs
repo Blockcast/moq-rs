@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use moq_native_ietf::quic;
-use moq_transport::{coding::TrackNamespace, serve::Tracks, session::Subscriber};
+use moq_transport::{
+    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
+    message::SubscribeOptions,
+    serve::Tracks,
+    session::{SubscribeNamespace, Subscriber},
+};
 
 mod cli;
 mod subscribe;
 
 use cli::Args;
-use subscribe::{drain_track_to_writer, validate_track_output_pairs};
+use subscribe::{drain_track_to_writer, namespace_published, validate_track_output_pairs};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,11 +42,29 @@ async fn main() -> Result<()> {
         Subscriber::connect_negotiated(session, transport, selected_version)
             .await
             .context("failed to create MoQ Transport subscriber session")?;
+    // The session's run loop carries every request below, so each wait for a
+    // reply has to run alongside it.
+    let session = session.run();
+    tokio::pin!(session);
 
     // Per the M.0 finding (.planning/moq-rs-m0-results.md): the
     // namespace lives in the URL-path-derived tenant scope on the
     // relay, not as a connect-URL path. Stay on the root path.
     let namespace = TrackNamespace::from_utf8_path(&args.name);
+
+    // Held until the process exits: dropping it cancels the SUBSCRIBE_NAMESPACE.
+    let _namespace_subscription = if args.await_namespace {
+        tokio::select! {
+            res = &mut session => {
+                res.context("session error")?;
+                bail!("session closed before the relay published `{namespace}`");
+            }
+            res = await_namespace(subscriber.clone(), &namespace) => Some(res?),
+        }
+    } else {
+        None
+    };
+
     let (mut tracks_writer, _request, mut tracks_reader) = Tracks::new(namespace.clone()).produce();
 
     // For each (track, output) pair: create the producer-side
@@ -85,7 +108,7 @@ async fn main() -> Result<()> {
     }
 
     tokio::select! {
-        res = session.run() => res.context("session error")?,
+        res = &mut session => res.context("session error")?,
         res = wait_tasks(&mut tasks) => {
             res?;
             tracing::info!("all drain tasks finished");
@@ -93,6 +116,50 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Wait until the relay reports `namespace` as published.
+///
+/// Sends SUBSCRIBE_NAMESPACE with the namespace itself as the prefix and
+/// returns once the relay answers with NAMESPACE for exactly that namespace.
+/// moq-relay-ietf sends NAMESPACE only for namespaces in its registry, and a
+/// publisher's PUBLISH_NAMESPACE enters the registry together with the route
+/// that forwards a SUBSCRIBE to that publisher. A SUBSCRIBE sent after this
+/// returns is therefore routed rather than refused as not found. The wait has
+/// no deadline of its own; the caller bounds it. The returned request cancels
+/// the SUBSCRIBE_NAMESPACE when dropped.
+async fn await_namespace(
+    mut subscriber: Subscriber,
+    namespace: &TrackNamespace,
+) -> Result<SubscribeNamespace> {
+    let prefix = TrackNamespacePrefix {
+        fields: namespace.fields.clone(),
+    };
+    let request = subscriber
+        .subscribe_namespace(
+            prefix,
+            SubscribeOptions::Namespace,
+            KeyValuePairs::default(),
+        )
+        .await
+        .with_context(|| format!("sending SUBSCRIBE_NAMESPACE for `{namespace}`"))?;
+    request
+        .ok()
+        .await
+        .with_context(|| format!("relay refused SUBSCRIBE_NAMESPACE for `{namespace}`"))?;
+    tracing::info!(%namespace, "waiting for the relay to publish the namespace");
+
+    while let Some(event) = request
+        .next()
+        .await
+        .with_context(|| format!("reading SUBSCRIBE_NAMESPACE responses for `{namespace}`"))?
+    {
+        if namespace_published(&event, namespace) {
+            tracing::info!(%namespace, "relay published the namespace");
+            return Ok(request);
+        }
+    }
+    bail!("SUBSCRIBE_NAMESPACE for `{namespace}` ended before the relay published it")
 }
 
 /// Wait for all spawned drain tasks to complete, returning the first drain

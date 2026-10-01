@@ -3,11 +3,15 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-const POSITIVE: [(&str, &str); 6] = [
+const POSITIVE: [(&str, &str); 7] = [
     ("flat-av", include_str!("fixtures/positive/flat-av.json")),
     (
         "fec-multicast",
         include_str!("fixtures/positive/fec-multicast.json"),
+    ),
+    (
+        "multicast-native-ssm-no-network-source",
+        include_str!("fixtures/positive/multicast-native-ssm-no-network-source.json"),
     ),
     (
         "ticks-and-mixed-timescales",
@@ -27,7 +31,7 @@ const POSITIVE: [(&str, &str); 6] = [
     ),
 ];
 
-const NEGATIVE: [(&str, &str, Reject); 10] = [
+const NEGATIVE: [(&str, &str, Reject); 11] = [
     (
         "legacy-selection-params",
         include_str!("fixtures/negative/legacy-selection-params.json"),
@@ -42,6 +46,11 @@ const NEGATIVE: [(&str, &str, Reject); 10] = [
         "network-source-object",
         include_str!("fixtures/negative/network-source-object.json"),
         Reject::Parse,
+    ),
+    (
+        "multicast-network-source-empty",
+        include_str!("fixtures/negative/multicast-network-source-empty.json"),
+        Reject::Validate("networkSource must not be empty when present"),
     ),
     (
         "repair-track-legacy-shape",
