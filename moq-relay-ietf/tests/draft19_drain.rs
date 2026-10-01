@@ -222,13 +222,15 @@ async fn goaway_timeout_closes_the_session_with_no_open_requests() {
         started.elapsed()
     );
 
-    // The relay's close still has to cross loopback and be processed by this
-    // client's endpoint driver, so give it a bounded wait rather than reading
-    // it the instant the serve task returns. A relay that released the session
-    // without ever sending the close still fails the code assertion below.
+    // The serve path returning is what releases the session's hold on the
+    // drain, and so what lets the process exit. The relay closes locally, so
+    // the frame can still be in flight across loopback when the serve task
+    // returns. Wait for it with a bound rather than at the instant the task
+    // returns: a relay that released the session without ever sending the close
+    // still fails here, without the assertion depending on scheduler timing.
     let error = tokio::time::timeout(Duration::from_secs(1), raw.closed())
         .await
-        .expect("the client sees the relay's close");
+        .expect("the relay's close reaches this client after it releases the session");
 
     // Assert on the session close code, not merely that the session ended.
     // Letting the relay task return would also tear the connection down, so a
@@ -423,35 +425,32 @@ async fn single_shutdown_signal_stops_a_relay_with_no_sessions() {
     assert!(status.success(), "relay stops cleanly, got {status}");
 }
 
-/// The supervisor path must still close an idle draft-19 client with
-/// `GOAWAY_TIMEOUT` (0x10). One SIGTERM drains the binary; the client takes the
-/// GOAWAY and stays silent. The relay may only exit once that session has been
-/// closed with the code, not when a timer started at the signal runs out: each
-/// session's Timeout runs from its own GOAWAY send, which is later.
+/// Drain the relay binary with `timeout_ms` advertised, and assert an idle
+/// draft-19 client is closed with `GOAWAY_TIMEOUT` (0x10) before the relay
+/// exits.
 #[cfg(unix)]
-#[tokio::test]
-async fn single_shutdown_signal_closes_an_idle_client_with_goaway_timeout_before_exit() {
+async fn idle_client_closed_with_goaway_timeout(tag: &str, timeout_ms: u64) {
     let DrainingRelay {
         process: mut relay,
         mut lines,
         _dir,
     } = spawn_draining_relay(
-        "idle-client",
+        tag,
         &[
             "--wire-profile=draft19".to_string(),
-            format!("--draft19-goaway-timeout-ms={TIMEOUT_MS}"),
+            format!("--draft19-goaway-timeout-ms={timeout_ms}"),
         ],
     )
     .await;
     let addr = await_listen_addr(&mut lines).await;
-    let (mut session, raw) = connect_client(addr, "idle-client-client").await;
+    let (mut session, raw) = connect_client(addr, &format!("{tag}-client")).await;
 
     let signalled = Instant::now();
     sigterm(&relay);
     let goaway = tokio::time::timeout(Duration::from_secs(10), await_goaway(&mut session))
         .await
         .expect("GOAWAY arrives");
-    assert_eq!(goaway.timeout_ms, TIMEOUT_MS);
+    assert_eq!(goaway.timeout_ms, timeout_ms);
 
     // Stay silent. The relay has to close this session itself, and the close
     // has to reach this client before the relay exits: closing only queues the
@@ -467,7 +466,7 @@ async fn single_shutdown_signal_closes_an_idle_client_with_goaway_timeout_before
         "relay closed with GOAWAY_TIMEOUT (0x10) before exiting, got: {rendered}"
     );
     assert!(
-        signalled.elapsed() >= Duration::from_millis(TIMEOUT_MS),
+        signalled.elapsed() >= Duration::from_millis(timeout_ms),
         "relay waited out the advertised Timeout, took {:?}",
         signalled.elapsed()
     );
@@ -477,6 +476,36 @@ async fn single_shutdown_signal_closes_an_idle_client_with_goaway_timeout_before
         .expect("relay exits once its draining session is closed")
         .expect("relay exit status is readable");
     assert!(status.success(), "relay stops cleanly, got {status}");
+}
+
+/// The supervisor path must still close an idle draft-19 client with
+/// `GOAWAY_TIMEOUT` (0x10). One SIGTERM drains the binary; the client takes the
+/// GOAWAY and stays silent. The relay may only exit once that session has been
+/// closed with the code, not when a timer started at the signal runs out: each
+/// session's Timeout runs from its own GOAWAY send, which is later.
+#[cfg(unix)]
+#[tokio::test]
+async fn single_shutdown_signal_closes_an_idle_client_with_goaway_timeout_before_exit() {
+    idle_client_closed_with_goaway_timeout("idle-client", TIMEOUT_MS).await;
+}
+
+/// The same path with a Timeout of 1ms, which is a legal configuration and is
+/// shorter than a loopback round trip.
+///
+/// This pins that a Timeout too short to wait out does not cost the close code:
+/// the relay still closes with 0x10 and still gets the frame out before exit.
+///
+/// It does not guard `GOAWAY_CLOSE_FLUSH_MS`. That was checked by mutation:
+/// reverting the flush bound to the advertised Timeout leaves this test passing,
+/// because the relay's endpoint closer flushes the queued CONNECTION_CLOSE on
+/// the way out whether or not the admission was released early. The bound exists
+/// for the flow-control stall path instead, where the capsule's `write_all`
+/// never errors, and reaching that needs a peer that withholds stream credit
+/// rather than one that is merely idle. No test covers it.
+#[cfg(unix)]
+#[tokio::test]
+async fn sub_rtt_goaway_timeout_still_closes_an_idle_client_with_the_code() {
+    idle_client_closed_with_goaway_timeout("idle-client-sub-rtt", 1).await;
 }
 
 /// Record how `raw` closes, as it closes.

@@ -170,12 +170,14 @@ impl Draft19Drain {
     /// The drain is over when every admitted session has ended
     /// ([`Draft19DrainEnd::Drained`]), or at the ceiling
     /// ([`Draft19DrainEnd::Ceiling`]), whichever comes first. The ceiling is
-    /// [`Self::timeout_ms`] after the last GOAWAY the broadcast sent, or after
-    /// this call if the broadcast sent none, and it waits for every broadcast
-    /// session to end first. Each of those closes by its own Timeout, so none
-    /// is cut short and each keeps its `GOAWAY_TIMEOUT` close. Arrivals during
-    /// the drain cannot move the ceiling, so a steady stream of them cannot
-    /// hold the drain open.
+    /// [`Self::timeout_ms`] after the last GOAWAY the broadcast sent, but never
+    /// earlier than [`Self::timeout_ms`] after this call, so a broadcast whose
+    /// last GOAWAY predates it still gets the full window. It waits for every
+    /// broadcast session to end first. Each of those closes by its own Timeout,
+    /// so none is cut short, and each keeps its `GOAWAY_TIMEOUT` close unless
+    /// the close flush itself expires first; see `GOAWAY_CLOSE_FLUSH_MS`.
+    /// Arrivals during the drain cannot move the ceiling, so a steady stream of
+    /// them cannot hold the drain open.
     ///
     /// A zero Timeout advertises no deadline, so there is no ceiling and the
     /// drain ends only once every session, arrivals included, has ended.
@@ -661,6 +663,22 @@ impl Relay {
     }
 }
 
+/// How long a `GOAWAY_TIMEOUT` close gets to reach the peer.
+///
+/// Deliberately not the drain's advertised Timeout. That is the deadline given
+/// to the *peer to act on the GOAWAY*; this is the deadline for *our own close
+/// to flush*, an RTT-scale quantity unrelated to it. Reusing the advertised one
+/// would hand any deployment that advertises a sub-RTT Timeout a close that
+/// expires before it can land.
+///
+/// Chosen to sit above web-transport-quinn's own `max(3 * RTT, 100ms)` close
+/// budget at ordinary RTTs, so on the paths that library bounds it is the
+/// library that fires first. The two cross at RTT ~= 333ms; above that this
+/// bound fires first and releases the admission while the library's spawned
+/// close is still running, which is benign because that task still force-closes
+/// with the right code afterwards.
+const GOAWAY_CLOSE_FLUSH_MS: u64 = 1_000;
+
 /// Serve a draft-19 session's control plane, and only that.
 ///
 /// The relay routes media through the draft-16 `Publisher`/`Subscriber` pair,
@@ -675,7 +693,10 @@ impl Relay {
 /// with `GOAWAY_TIMEOUT` (`0x10`) once the advertised Timeout elapses. A
 /// session that starts after the signal already fired takes the same path
 /// immediately after SETUP. The admission is held until this returns, which
-/// for a `GOAWAY_TIMEOUT` close is only once the session reports itself closed.
+/// for a `GOAWAY_TIMEOUT` close is until the session reports itself closed or
+/// `GOAWAY_CLOSE_FLUSH_MS` elapses, whichever is first. So
+/// [`Draft19DrainEnd::Drained`] means every session ended, not that every peer
+/// acknowledged its close.
 pub async fn serve_draft19_control_plane(
     conn: web_transport::Session,
     admission: Option<Draft19Admission>,
@@ -793,11 +814,26 @@ pub async fn serve_draft19_control_plane(
                 // CONNECTION_CLOSE frame itself is flushed by the process
                 // waiting for its endpoint to go idle before it exits.
                 //
-                // Bounded by the same Timeout: this wait gates the drain, and
-                // so the exit, on a peer that has just ignored a GOAWAY. If it
-                // runs out, the endpoint closer still flushes the close.
+                // Bounded, because this wait gates the admission, which gates
+                // both `Drained` and `Ceiling`. A peer that simply never
+                // answers the capsule is already bounded inside
+                // web-transport-quinn: `close` spawns a task that writes the
+                // capsule, waits `max(3 * RTT, 100ms)` for the connection to
+                // close, and then force-closes it with the
+                // `GOAWAY_TIMEOUT`-derived code. The residual unbounded path is
+                // narrower than that: the capsule's `write_all` stalled on
+                // flow-control credit never errors, so none of that task's
+                // force-close branches is reached and its own timeout is never
+                // armed. That stall is what this bound catches.
+                //
+                // So expiry costs nothing observable on the paths the library
+                // bounds, only an early admission release. On the stall path it
+                // costs the close code, because the connection is still open
+                // and the endpoint closer then closes it with its own. Raw QUIC
+                // reaches none of this, since `closed()` is already resolved by
+                // the time it is awaited.
                 let _ = tokio::time::timeout(
-                    Duration::from_millis(drain.timeout_ms),
+                    Duration::from_millis(GOAWAY_CLOSE_FLUSH_MS),
                     raw_conn.closed(),
                 )
                 .await;
