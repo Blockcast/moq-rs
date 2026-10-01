@@ -1,0 +1,29 @@
+{
+  "streamingFormat": "cmaf",
+  "streamingFormatVersion": "0.2",
+  "tracks": [
+    {
+      "bitrate": 2000000,
+      "codec": "avc1.640028",
+      "framerate": 30.0,
+      "height": 720,
+      "isLive": true,
+      "keyframeIntervalMs": 2000,
+      "name": "video0",
+      "packaging": "cmaf",
+      "role": "video",
+      "width": 1280
+    },
+    {
+      "channelConfig": "2",
+      "codec": "mp4a.40.2",
+      "groupDurationMs": 22,
+      "isLive": true,
+      "name": "audio0",
+      "packaging": "cmaf",
+      "role": "audio",
+      "samplerate": 48000
+    }
+  ],
+  "version": 1
+}
