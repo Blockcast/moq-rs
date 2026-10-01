@@ -1,10 +1,14 @@
 use moq_catalog::Root;
 
-const POSITIVE: [(&str, &str); 3] = [
+const POSITIVE: [(&str, &str); 4] = [
     ("flat-av", include_str!("fixtures/positive/flat-av.json")),
     (
         "fec-multicast",
         include_str!("fixtures/positive/fec-multicast.json"),
+    ),
+    (
+        "multicast-native-ssm-no-network-source",
+        include_str!("fixtures/positive/multicast-native-ssm-no-network-source.json"),
     ),
     (
         "ticks-and-mixed-timescales",
@@ -12,7 +16,7 @@ const POSITIVE: [(&str, &str); 3] = [
     ),
 ];
 
-const NEGATIVE: [(&str, &str); 9] = [
+const NEGATIVE: [(&str, &str); 10] = [
     (
         "legacy-selection-params",
         include_str!("fixtures/negative/legacy-selection-params.json"),
@@ -36,6 +40,10 @@ const NEGATIVE: [(&str, &str); 9] = [
     (
         "network-source-object",
         include_str!("fixtures/negative/network-source-object.json"),
+    ),
+    (
+        "multicast-network-source-empty",
+        include_str!("fixtures/negative/multicast-network-source-empty.json"),
     ),
     (
         "repair-track-legacy-shape",
