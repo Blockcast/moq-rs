@@ -48,9 +48,16 @@ const POSITIVE: [(&str, &str); 7] = [
 /// what decides, and a subscriber that cannot even deserialize the catalog never
 /// reaches that gate. That is not hypothetical -- before #93 this exact capture
 /// failed on `deny_unknown_fields` at `keyframeIntervalMs`.
-const NON_MSF: [(&str, &str); 1] = [(
+///
+/// The third element is the substring the rejection must carry, for the same
+/// reason `Reject::Validate` carries one: `Root::validate()` is a chain of early
+/// returns, so asserting only that *something* refused the fixture lets any later
+/// gate that starts firing keep the test green while the envelope discrimination
+/// this fixture exists to pin loses its only coverage.
+const NON_MSF: [(&str, &str, &str); 1] = [(
     "hang-legacy-catalog-to-string",
     include_str!("fixtures/non-msf/hang-legacy-catalog-to-string.json"),
+    "streamingFormat must be mmtp",
 )];
 
 const NEGATIVE: [(&str, &str, Reject); 11] = [
@@ -205,7 +212,7 @@ fn golden_positive_fixtures_validate_and_round_trip_without_loss() {
 
 #[test]
 fn non_msf_fixtures_parse_and_round_trip_but_are_not_valid_msf() {
-    for (name, json) in NON_MSF {
+    for (name, json, reason) in NON_MSF {
         let expected: serde_json::Value = serde_json::from_str(json).unwrap();
         let catalog: Root = serde_json::from_str(json)
             .unwrap_or_else(|error| panic!("{name} did not deserialize: {error}"));
@@ -218,12 +225,21 @@ fn non_msf_fixtures_parse_and_round_trip_but_are_not_valid_msf() {
             "{name} is registered as non-MSF but claims the MSF envelope"
         );
 
-        // The MMTP-only validator must refuse it. This is the determination
-        // itself: such a catalog never claims to be an MSF catalog, so accepting
-        // it here would mean `Root::validate()` had stopped discriminating.
-        catalog.validate().expect_err(&format!(
-            "{name} must not validate as MSF: Root::validate has stopped discriminating on the envelope"
-        ));
+        // The MMTP-only validator must refuse it, and say which rule refused it.
+        // This is the determination itself: such a catalog never claims to be an
+        // MSF catalog, so accepting it here would mean `Root::validate()` had
+        // stopped discriminating. Matching on the reason is what keeps a later
+        // gate firing first from standing in for the one under test.
+        let rendered = catalog
+            .validate()
+            .expect_err(&format!(
+                "{name} must not validate as MSF: Root::validate has stopped discriminating on the envelope"
+            ))
+            .to_string();
+        assert!(
+            rendered.contains(reason),
+            "{name} was rejected for the wrong reason: expected `{reason}`, got `{rendered}`"
+        );
 
         // ...yet moq-sub must still accept it, because `validate_catalog()` gates
         // `Root::validate()` on the envelope. Mirrors moq-sub/src/media.rs.
@@ -248,7 +264,10 @@ fn golden_negative_fixtures_are_rejected() {
 fn every_fixture_file_is_registered() {
     let dirs: [(&str, Vec<&str>); 4] = [
         ("positive", POSITIVE.iter().map(|(name, _)| *name).collect()),
-        ("non-msf", NON_MSF.iter().map(|(name, _)| *name).collect()),
+        (
+            "non-msf",
+            NON_MSF.iter().map(|(name, _, _)| *name).collect(),
+        ),
         (
             "negative",
             NEGATIVE.iter().map(|(name, _, _)| *name).collect(),

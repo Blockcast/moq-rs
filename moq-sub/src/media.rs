@@ -284,4 +284,28 @@ mod tests {
         assert!(validate_catalog(&cmaf_catalog(2)).is_err());
         assert!(validate_catalog(&cmaf_catalog(1)).is_ok());
     }
+
+    /// moq-catalog's golden suite pins that this capture parses and does not
+    /// validate as MSF, but it can only *mirror* the envelope gate by hand --
+    /// `moq-sub` depends on `moq-catalog`, not the reverse, so if this function
+    /// ever stops gating on `streamingFormat` that suite stays green while this
+    /// consumer breaks on this exact catalog. Assert it where the gate lives.
+    #[test]
+    fn accepts_the_legacy_container_capture_hang_emits() {
+        let json = include_str!(
+            "../../moq-catalog/tests/fixtures/non-msf/hang-legacy-catalog-to-string.json"
+        );
+        let catalog: moq_catalog::Root = serde_json::from_str(json).unwrap();
+
+        assert_ne!(
+            catalog.streaming_format, "mmtp",
+            "fixture drifted into the MSF envelope; this test would pass for the wrong reason"
+        );
+        assert!(
+            catalog.validate().is_err(),
+            "fixture is no longer a non-MSF capture; the gate below is untested"
+        );
+
+        validate_catalog(&catalog).expect("moq-sub must consume a legacy-container hang catalog");
+    }
 }

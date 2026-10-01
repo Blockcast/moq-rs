@@ -119,6 +119,22 @@ nothing else* in this suite, reverting `src/lib.rs` to pre-#93 turns the
 deserialize red, and an unregistered file in `non-msf/` turns
 `every_fixture_file_is_registered` red.
 
+`moq-sub` asserts the other half where the gate actually lives:
+`accepts_the_legacy_container_capture_hang_emits` (`moq-sub/src/media.rs`) feeds
+this same fixture through `validate_catalog()` and expects `Ok`. The dependency
+edge only runs one way, so this crate cannot see a change to that function.
+
+### Provenance
+
+`hang-legacy-catalog-to-string.json` is the byte-for-byte `to_string()` output of
+the legacy capture pinned by `a_legacy_container_capture_is_refused_the_msf_envelope`
+in hang-mmt-fec `rs/moq-msf-fixtures/tests/mux_catalog_conformance.rs`, captured
+from that repo's `main` at `8f158edc`. It is **hand-regenerated**: nothing in this
+workspace produces it, because `hang` is not a workspace member here. Regenerating
+it from `hang::CatalogRoot::to_string()` in CI is tracked separately on BLO-37925's
+follow-ups -- that would be a new dependency edge into a crate outside this
+workspace, not a tightening of this test.
+
 Not yet mirrored (each needs validation rules this crate does not implement; see
 BLO-37534 follow-ups): `positive/multicast-auth-rotation.json` and the
 `fec-enhancement-repair-removed`, `fec-repair-layer-geometry`,
