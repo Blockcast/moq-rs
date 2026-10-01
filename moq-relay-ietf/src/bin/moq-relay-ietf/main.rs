@@ -425,10 +425,9 @@ async fn main() -> anyhow::Result<()> {
 
     match drain_then_stop {
         Some(drain_then_stop) => {
-            // Both arms fall through to the flush below. The accept loop
-            // returning is the abnormal exit, and it is the one that most needs
-            // the flush: it can land mid-drain, after sessions have already
-            // been closed with GOAWAY_TIMEOUT.
+            // Both arms fall through to the closer: the accept loop can end
+            // mid-drain, after sessions were closed with GOAWAY_TIMEOUT, and
+            // those closes need flushing as much as the drain's own.
             let stopped = tokio::select! {
                 result = relay.run() => result,
                 result = drain_then_stop => result.context("failed to watch for shutdown signals"),

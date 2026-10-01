@@ -32,6 +32,14 @@ pub struct Args {
     #[arg(long = "output", value_name = "PATH")]
     pub output: Vec<PathBuf>,
 
+    /// Subscribe only once the relay has published the --name namespace.
+    /// Sends SUBSCRIBE_NAMESPACE for it first and waits, with no deadline of
+    /// its own, for the relay's NAMESPACE, so the subscriber can start before
+    /// its publisher. Without it, a SUBSCRIBE that reaches the relay before the
+    /// publisher's PUBLISH_NAMESPACE is refused as not found.
+    #[arg(long)]
+    pub await_namespace: bool,
+
     /// Client-side UDP bind for the QUIC/WebTransport connection.
     #[arg(long, default_value = "[::]:0")]
     pub bind: std::net::SocketAddr,

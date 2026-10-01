@@ -102,6 +102,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: [resolve-source]
     runs-on: default
+    # A cargo build plus up to 8 publisher invocations, each with a 5s inner poll. A wedged
+    # capture would otherwise hold an ARC runner for the 6h default.
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:

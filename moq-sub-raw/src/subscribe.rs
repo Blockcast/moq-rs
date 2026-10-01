@@ -9,7 +9,11 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use moq_transport::serve::{TrackReader, TrackReaderMode};
+use moq_transport::{
+    coding::TrackNamespace,
+    serve::{TrackReader, TrackReaderMode},
+    session::NamespaceEvent,
+};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// Drain a track's payload bytes into `out`, in arrival order.
@@ -60,6 +64,15 @@ pub async fn drain_track_to_writer<W: AsyncWrite + Unpin>(
     }
     out.flush().await.context("flush output")?;
     Ok(bytes_written)
+}
+
+/// Whether a SUBSCRIBE_NAMESPACE event reports `namespace` itself as published.
+///
+/// `--await-namespace` uses the namespace as its own prefix, so the relay also
+/// reports any longer namespace under it. Those do not route a SUBSCRIBE for
+/// `namespace`, and a NAMESPACE_DONE never does.
+pub fn namespace_published(event: &NamespaceEvent, namespace: &TrackNamespace) -> bool {
+    matches!(event, NamespaceEvent::Added(published) if published == namespace)
 }
 
 /// Validate `--track` and `--output` arguments are paired 1:1 and
@@ -113,6 +126,26 @@ mod tests {
         let tracks = vec!["v".to_string(), "a".to_string()];
         let outputs = vec![PathBuf::from("v.bin"), PathBuf::from("a.bin")];
         validate_track_output_pairs(&tracks, &outputs).expect("matched counts OK");
+    }
+
+    // ---- namespace_published ----
+
+    #[test]
+    fn namespace_published_matches_the_exact_namespace() {
+        let event = NamespaceEvent::Added(ns());
+        assert!(namespace_published(&event, &ns()));
+    }
+
+    #[test]
+    fn namespace_published_ignores_a_longer_namespace() {
+        let event = NamespaceEvent::Added(TrackNamespace::from_utf8_path("test-broadcast/other"));
+        assert!(!namespace_published(&event, &ns()));
+    }
+
+    #[test]
+    fn namespace_published_ignores_namespace_done() {
+        let event = NamespaceEvent::Removed(ns());
+        assert!(!namespace_published(&event, &ns()));
     }
 
     // ---- drain_track_to_writer ----
