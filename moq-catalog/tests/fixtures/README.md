@@ -19,6 +19,9 @@ single catalog the fleet actually emits — including the output of hang's own
 the emitter hang actually ships stays parseable. It validates against libmmt's
 schema too.
 
+`non-msf/` is the other exception, and it is not a third mirror direction: see
+its own section below.
+
 ## The mirror is enforced — `tests/mirror.rs`
 
 `libmmt-negative.manifest` vendors libmmt's `catalog/negative/` listing as
@@ -86,6 +89,51 @@ nothing went red. A guard with no failing mutation is a comment — if you add o
 delete it and confirm the suite fails before trusting it. The `legacy-*` three
 are parse-level rejections (`deny_unknown_fields` and the type checks do the
 work), so there is no rule to neutralise and nothing to mutation-test.
+
+## `non-msf/` — parse yes, validate no
+
+These are catalogs this crate must **deserialize and round-trip** but must
+**not** accept as MSF, so they fit neither `positive/` nor `negative/`.
+
+`hang::CatalogRoot::to_string()` serializes every capture hang holds, including a
+`Container::Legacy` one. A legacy track is varint-framed, carries no MMTP
+packetization, and has no MSF `packaging` value it could honestly claim, so the
+emitter gives it `streamingFormat: "cmaf"` rather than the MSF envelope
+(BLO-37925). libmmt's schema pins `streamingFormat` to the constant `"mmtp"` and
+*defines* the MSF wire, so such a catalog is outside that schema's scope rather
+than in violation of it. That is why these cannot be mirrored in either
+direction: `positive/`'s contract is that both implementations accept them, and
+calling them `negative/` would assert libmmt ships a vector rejecting them, which
+it does not and should not.
+
+moq-sub still has to consume one. `validate_catalog()`
+(`moq-sub/src/media.rs`) applies the MMTP-only `Root::validate()` *only* when
+`streamingFormat == "mmtp"`, so the envelope is what decides — but a subscriber
+that cannot even deserialize the catalog never reaches that gate. Before #93 this
+exact capture failed on `deny_unknown_fields` at `keyframeIntervalMs`.
+
+`golden.rs`'s `non_msf_fixtures_parse_and_round_trip_but_are_not_valid_msf`
+asserts all three legs, and each was mutation-tested: neutralising the
+`streamingFormat must be mmtp` rule in `Root::validate()` turns it red *and
+nothing else* in this suite, reverting `src/lib.rs` to pre-#93 turns the
+deserialize red, and an unregistered file in `non-msf/` turns
+`every_fixture_file_is_registered` red.
+
+`moq-sub` asserts the other half where the gate actually lives:
+`accepts_the_legacy_container_capture_hang_emits` (`moq-sub/src/media.rs`) feeds
+this same fixture through `validate_catalog()` and expects `Ok`. The dependency
+edge only runs one way, so this crate cannot see a change to that function.
+
+### Provenance
+
+`hang-legacy-catalog-to-string.json` is the byte-for-byte `to_string()` output of
+the legacy capture pinned by `a_legacy_container_capture_is_refused_the_msf_envelope`
+in hang-mmt-fec `rs/moq-msf-fixtures/tests/mux_catalog_conformance.rs`, captured
+from that repo's `main` at `8f158edc`. It is **hand-regenerated**: nothing in this
+workspace produces it, because `hang` is not a workspace member here. Regenerating
+it from `hang::CatalogRoot::to_string()` in CI is tracked separately on BLO-37925's
+follow-ups -- that would be a new dependency edge into a crate outside this
+workspace, not a tightening of this test.
 
 Not yet mirrored (each needs validation rules this crate does not implement; see
 BLO-37534 follow-ups): `positive/multicast-auth-rotation.json` and the

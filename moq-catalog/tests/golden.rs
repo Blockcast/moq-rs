@@ -31,6 +31,35 @@ const POSITIVE: [(&str, &str); 7] = [
     ),
 ];
 
+/// Catalogs this crate must *parse* but must not accept as MSF.
+///
+/// `hang::CatalogRoot::to_string()` serializes every capture it holds, including
+/// a `Container::Legacy` one. A legacy track is varint-framed, carries no MMTP
+/// packetization, and has no MSF `packaging` value it could honestly claim, so
+/// the emitter gives it `streamingFormat: "cmaf"` rather than the MSF envelope
+/// (BLO-37925). libmmt's `catalog.schema.json` pins `streamingFormat` to the
+/// constant `"mmtp"` and *defines* the MSF wire, so such a catalog is outside
+/// that schema's scope rather than in violation of it -- which is why these
+/// cannot live in `positive/`, whose contract is that both implementations
+/// accept them.
+///
+/// moq-sub still has to consume one: `validate_catalog()` applies the MMTP-only
+/// `Root::validate()` only when `streamingFormat == "mmtp"`, so the envelope is
+/// what decides, and a subscriber that cannot even deserialize the catalog never
+/// reaches that gate. That is not hypothetical -- before #93 this exact capture
+/// failed on `deny_unknown_fields` at `keyframeIntervalMs`.
+///
+/// The third element is the substring the rejection must carry, for the same
+/// reason `Reject::Validate` carries one: `Root::validate()` is a chain of early
+/// returns, so asserting only that *something* refused the fixture lets any later
+/// gate that starts firing keep the test green while the envelope discrimination
+/// this fixture exists to pin loses its only coverage.
+const NON_MSF: [(&str, &str, &str); 1] = [(
+    "hang-legacy-catalog-to-string",
+    include_str!("fixtures/non-msf/hang-legacy-catalog-to-string.json"),
+    "streamingFormat must be mmtp",
+)];
+
 const NEGATIVE: [(&str, &str, Reject); 11] = [
     (
         "legacy-selection-params",
@@ -182,6 +211,49 @@ fn golden_positive_fixtures_validate_and_round_trip_without_loss() {
 }
 
 #[test]
+fn non_msf_fixtures_parse_and_round_trip_but_are_not_valid_msf() {
+    for (name, json, reason) in NON_MSF {
+        let expected: serde_json::Value = serde_json::from_str(json).unwrap();
+        let catalog: Root = serde_json::from_str(json)
+            .unwrap_or_else(|error| panic!("{name} did not deserialize: {error}"));
+
+        // Assert the shape the rest of this test leans on, rather than trusting
+        // the fixture was authored as intended: a fixture that quietly became an
+        // MMTP catalog would make every assertion below pass for the wrong reason.
+        assert_ne!(
+            catalog.streaming_format, "mmtp",
+            "{name} is registered as non-MSF but claims the MSF envelope"
+        );
+
+        // The MMTP-only validator must refuse it, and say which rule refused it.
+        // This is the determination itself: such a catalog never claims to be an
+        // MSF catalog, so accepting it here would mean `Root::validate()` had
+        // stopped discriminating. Matching on the reason is what keeps a later
+        // gate firing first from standing in for the one under test.
+        let rendered = catalog
+            .validate()
+            .expect_err(&format!(
+                "{name} must not validate as MSF: Root::validate has stopped discriminating on the envelope"
+            ))
+            .to_string();
+        assert!(
+            rendered.contains(reason),
+            "{name} was rejected for the wrong reason: expected `{reason}`, got `{rendered}`"
+        );
+
+        // ...yet moq-sub must still accept it, because `validate_catalog()` gates
+        // `Root::validate()` on the envelope. Mirrors moq-sub/src/media.rs.
+        assert_eq!(
+            catalog.version, 1,
+            "{name} must carry a version moq-sub accepts"
+        );
+
+        let emitted = serde_json::to_value(catalog).unwrap();
+        assert_json_equivalent(&emitted, &expected, name);
+    }
+}
+
+#[test]
 fn golden_negative_fixtures_are_rejected() {
     for (name, json, expected) in NEGATIVE.iter().chain(&NEGATIVE_LOCAL) {
         assert_rejected(name, json, expected);
@@ -190,8 +262,12 @@ fn golden_negative_fixtures_are_rejected() {
 
 #[test]
 fn every_fixture_file_is_registered() {
-    let dirs: [(&str, Vec<&str>); 3] = [
+    let dirs: [(&str, Vec<&str>); 4] = [
         ("positive", POSITIVE.iter().map(|(name, _)| *name).collect()),
+        (
+            "non-msf",
+            NON_MSF.iter().map(|(name, _, _)| *name).collect(),
+        ),
         (
             "negative",
             NEGATIVE.iter().map(|(name, _, _)| *name).collect(),
