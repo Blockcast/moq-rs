@@ -42,7 +42,19 @@ env:
 jobs:
   resolve-source:
     name: Resolve immutable source commit
-    runs-on: default
+    # BLO-39688: measured 9-26s of work over 10 green runs, against 0.7h-8.5h
+    # queued on `default`. One `gh api` call and a regex -- no toolchain, no
+    # docker, no checkout. Moved to `arc-light` on work shape, not on a claim
+    # about that pool's latency.
+    runs-on: arc-light
+    # arc-light uses ARC's `eventual` update strategy: on a spec change no new
+    # job for the scale set starts org-wide until the old EphemeralRunnerSet
+    # drains, and this cap is the longest one job can pin that drain. The
+    # lane's rule is max(ceil(W95/(F*60)), ceil(6*T_best/60)) over CPU-seconds,
+    # not wall-clock -- 26s upper bound at F=0.21 yields 3. 5 carries margin
+    # and stays well inside the 30m tolerance (ArcWorkflowJobQueuedCritical).
+    # Absent, this would inherit GitHub's 360m default: 12x that tolerance.
+    timeout-minutes: 5
     permissions:
       contents: read
       # Only this job reads the pulls API; keep the scope off every other job.
@@ -199,7 +211,11 @@ jobs:
     name: Report /test status
     if: always() && github.event_name == 'workflow_dispatch'
     needs: [resolve-source, capture]
-    runs-on: default
+    # BLO-39688: one `gh api .../statuses` POST. Measured 0s of work on every
+    # run that reached it. Same reasoning as resolve-source above.
+    runs-on: arc-light
+    # Same arc-light drain-tolerance cap as resolve-source; see the note there.
+    timeout-minutes: 5
     permissions:
       contents: read
       statuses: write
