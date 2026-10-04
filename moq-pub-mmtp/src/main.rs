@@ -801,6 +801,7 @@ mod tests {
             supports_delta_updates: Some(true),
             tracks,
             multicast,
+            multicast_auth: None,
         }
     }
 

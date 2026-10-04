@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "streamingFormat": "mmtp",
+  "streamingFormatVersion": "draft-ramadan-moq-mmt-00",
+  "tracks": [
+    {
+      "name": "video/base",
+      "packaging": "mmtp",
+      "codec": "avc1.640028",
+      "mmtpMode": "mfu",
+      "timescale": 90000,
+      "groupDurationMs": 1000
+    },
+    {
+      "name": "video/manifest",
+      "packaging": "mmtp",
+      "codec": "application/x-bc-provenance",
+      "mmtpMode": "mfu",
+      "timescale": 1000,
+      "groupDurationMs": 1000
+    },
+    {
+      "name": "video/recovery-manifest",
+      "packaging": "mmtp",
+      "codec": "application/x-bc-provenance",
+      "mmtpMode": "mfu",
+      "timescale": 1000,
+      "groupDurationMs": 1000
+    }
+  ],
+  "multicast.auth": {
+    "scheme": "bc-provenance",
+    "hash": "blake3",
+    "sig": "ed25519",
+    "publicKey": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+    "keyId": "2026-08",
+    "previousKey": "mm4Ae7fTOTrOb2d_zK9mlXVV2YgeBBvBncabOQRh1Z4",
+    "compaction": "merkle",
+    "enforcement": "shadow",
+    "tracks": [
+      {
+        "mediaTrack": "video/base",
+        "manifestTrack": "video/manifest",
+        "authScope": "vzeasoXcabuvmWJ2X9DmT_z0gU381kdYRVwL0RAuhok",
+        "sourceSymbolFormat": "full-mmtp-packet"
+      },
+      {
+        "mediaTrack": "video/base",
+        "manifestTrack": "video/recovery-manifest",
+        "authScope": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+        "sourceSymbolFormat": "fec-padded-recovery"
+      }
+    ]
+  }
+}

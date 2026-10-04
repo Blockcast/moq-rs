@@ -38,6 +38,38 @@ pub struct Root {
     pub tracks: Vec<Track>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multicast: Option<MulticastConfig>,
+    /// `bc-provenance` signing block, carried opaquely.
+    ///
+    /// A literal dotted key at the root, beside `multicast` rather than nested
+    /// inside it — that is libmmt's shape, and both hang emitters produce it, so
+    /// it is the wire shape regardless of how it reads (BLO-39866).
+    ///
+    /// Deliberately untyped. This crate is the relay's model, and the relay does
+    /// not verify provenance: there is no ed25519, blake3 or signature check
+    /// anywhere in `moq-rs`. Mirroring libmmt's `$defs` here would therefore add
+    /// a second definition of a security-relevant schema that nothing in this
+    /// repo consumes — and keeping two definitions in step is the exact failure
+    /// BLO-37534 was. Two of libmmt's three `multicast.auth` negatives turn on
+    /// base64url subtleties (`=` padding, and the trailing-pad-bits constraint
+    /// that separates `...Mbg` from `...Mbh`); a relay that re-implements those
+    /// slightly wrong would *claim* to validate signing keys while accepting
+    /// malformed ones, which is worse than declining to look.
+    ///
+    /// So the guarantee here is the same one `role` carries: the field survives
+    /// a round-trip *semantically* intact — every key and value is preserved,
+    /// but not the byte stream. `serde_json::Map` is `BTreeMap`-backed
+    /// (`preserve_order` is off across this workspace), so re-serializing sorts
+    /// the block's keys. That moves toward RFC 8785 JCS canonical order rather
+    /// than away, and nothing here verifies over catalog bytes — but anyone who
+    /// does eventually verify a signature must not assume byte-identity.
+    /// Validation of this block belongs to whoever actually verifies the
+    /// signature, against libmmt's schema.
+    #[serde(
+        rename = "multicast.auth",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub multicast_auth: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
