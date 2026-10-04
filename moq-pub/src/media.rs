@@ -277,6 +277,7 @@ impl Media {
             supports_delta_updates: Some(true),
             tracks,
             multicast: None,
+            multicast_auth: None,
         };
 
         let catalog_str = serde_json::to_string_pretty(&catalog)?;

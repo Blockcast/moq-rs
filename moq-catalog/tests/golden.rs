@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-const POSITIVE: [(&str, &str); 7] = [
+const POSITIVE: [(&str, &str); 10] = [
     ("flat-av", include_str!("fixtures/positive/flat-av.json")),
     (
         "fec-multicast",
@@ -28,6 +28,18 @@ const POSITIVE: [(&str, &str); 7] = [
     (
         "hang-catalog-to-string",
         include_str!("fixtures/positive/hang-catalog-to-string.json"),
+    ),
+    (
+        "multicast-auth-rotation",
+        include_str!("fixtures/positive/multicast-auth-rotation.json"),
+    ),
+    (
+        "hang-schema-fixture-to-string",
+        include_str!("fixtures/positive/hang-schema-fixture-to-string.json"),
+    ),
+    (
+        "hang-schema-fixture-to-mmtp-json",
+        include_str!("fixtures/positive/hang-schema-fixture-to-mmtp-json.json"),
     ),
 ];
 

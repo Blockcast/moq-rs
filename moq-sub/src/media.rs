@@ -276,6 +276,7 @@ mod tests {
                 ..Default::default()
             }],
             multicast: None,
+            multicast_auth: None,
         }
     }
 

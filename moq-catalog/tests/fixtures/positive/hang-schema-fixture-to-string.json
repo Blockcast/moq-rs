@@ -1,0 +1,128 @@
+{
+  "multicast.auth": {
+    "compaction": "merkle",
+    "hash": "blake3",
+    "keyId": "fixture-key-1",
+    "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "scheme": "bc-provenance",
+    "sig": "ed25519",
+    "tracks": [
+      {
+        "authScope": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA",
+        "manifestTrack": "audio/manifest",
+        "mediaTrack": "audio",
+        "sourceSymbolFormat": "fec-padded-recovery"
+      },
+      {
+        "authScope": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA",
+        "manifestTrack": "video/manifest",
+        "mediaTrack": "video",
+        "sourceSymbolFormat": "fec-padded-recovery"
+      }
+    ]
+  },
+  "streamingFormat": "mmtp",
+  "streamingFormatVersion": "draft-ramadan-moq-mmt-00",
+  "tracks": [
+    {
+      "bitrate": 6000000,
+      "codec": "avc1.640028",
+      "fec": {
+        "algorithm": "raptorq",
+        "interleaveDepthMs": 133,
+        "repairContainer": "native",
+        "repairSymbols": 8,
+        "repairTrack": "video/repair",
+        "sourceSymbols": 32,
+        "symbolSize": 1312
+      },
+      "framerate": 30.0,
+      "groupDurationTicks": 33333,
+      "height": 1080,
+      "isLive": true,
+      "mmtpMode": "mfu",
+      "name": "video",
+      "packaging": "mmtp",
+      "role": "video",
+      "timescale": 1000000,
+      "width": 1920
+    },
+    {
+      "bitrate": 128000,
+      "channelConfig": "2",
+      "codec": "mp4a.40.2",
+      "fec": {
+        "algorithm": "raptorq",
+        "interleaveDepthMs": 133,
+        "repairContainer": "native",
+        "repairSymbols": 4,
+        "repairTrack": "audio/repair",
+        "sourceSymbols": 16,
+        "symbolSize": 1312
+      },
+      "groupDurationTicks": 21334,
+      "isLive": true,
+      "mmtpMode": "mfu",
+      "name": "audio",
+      "packaging": "mmtp",
+      "role": "audio",
+      "samplerate": 48000,
+      "timescale": 1000000
+    },
+    {
+      "codec": "application/raptorq",
+      "isLive": true,
+      "name": "audio/repair",
+      "packaging": "fec-repair"
+    },
+    {
+      "codec": "application/raptorq",
+      "depends": [
+        "audio"
+      ],
+      "isLive": true,
+      "name": "audio/repair-1",
+      "packaging": "fec-repair",
+      "priority": 240,
+      "repairLayer": 1,
+      "repairSymbols": 2
+    },
+    {
+      "codec": "application/raptorq",
+      "isLive": true,
+      "name": "video/repair",
+      "packaging": "fec-repair"
+    },
+    {
+      "codec": "application/raptorq",
+      "depends": [
+        "video"
+      ],
+      "isLive": true,
+      "name": "video/repair-1",
+      "packaging": "fec-repair",
+      "priority": 240,
+      "repairLayer": 1,
+      "repairSymbols": 4
+    },
+    {
+      "codec": "application/x-bc-provenance",
+      "groupDurationTicks": 21334,
+      "isLive": true,
+      "mmtpMode": "mfu",
+      "name": "audio/manifest",
+      "packaging": "mmtp",
+      "timescale": 1000000
+    },
+    {
+      "codec": "application/x-bc-provenance",
+      "groupDurationTicks": 33333,
+      "isLive": true,
+      "mmtpMode": "mfu",
+      "name": "video/manifest",
+      "packaging": "mmtp",
+      "timescale": 1000000
+    }
+  ],
+  "version": 1
+}

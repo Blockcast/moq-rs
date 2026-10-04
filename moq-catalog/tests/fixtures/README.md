@@ -19,6 +19,26 @@ single catalog the fleet actually emits — including the output of hang's own
 the emitter hang actually ships stays parseable. It validates against libmmt's
 schema too.
 
+`hang-schema-fixture-to-string.json` and `hang-schema-fixture-to-mmtp-json.json`
+are the same kind of exception, and there are two of them for a reason. hang has
+**two** independent catalog emitters — `hang::Catalog::to_string()` and
+`to_msf`/`to_mmtp_json` — and they emit different field sets: the golden
+serializer strips `role` and `fec.repairContainer`, and requires `trackRole`.
+Checking one is not checking the wire. These are the byte output of
+`rs/moq-mux/examples/catalog_schema_fixture.rs` at hang-mmt-fec `main`
+`12e2455e`, one catalog per emitter, 8 tracks each, captured with
+`cargo run -p moq-mux --example catalog_schema_fixture`. That example is the
+same one hang's own CI gate feeds to `validate-rust-catalog-schema.mjs`
+(`.github/workflows/check.yml`), so it is the canonical pair rather than a
+hand-built fixture — which is what makes them worth pinning here: whatever those
+two emit is, by definition, what a relay receives. Like the capture above they
+are hand-regenerated, because `hang` is not a workspace member here.
+
+They were added for BLO-39866: both emitters produce a root `multicast.auth`
+block that this crate rejected under `deny_unknown_fields`, and the single-track
+`hang-catalog-to-string.json` capture does not carry one, so nothing here caught
+it. That divergence survived BLO-37534 by exactly one week.
+
 `non-msf/` is the other exception, and it is not a third mirror direction: see
 its own section below.
 
@@ -136,8 +156,34 @@ follow-ups -- that would be a new dependency edge into a crate outside this
 workspace, not a tightening of this test.
 
 Not yet mirrored (each needs validation rules this crate does not implement; see
-BLO-37534 follow-ups): `positive/multicast-auth-rotation.json` and the
-`fec-enhancement-repair-removed`, `fec-repair-layer-geometry`,
-`fec-repair-multiple-depends`, `multicast-auth-*`,
+BLO-37534 follow-ups): the `fec-enhancement-repair-removed`,
+`fec-repair-layer-geometry`, `fec-repair-multiple-depends`,
 `multicast-packet-id-signaling`, `media-track-repair-layer`,
 `raptorq-source-symbols-over-max` and `track-role-*` negatives.
+
+`positive/multicast-auth-rotation.json` came off that list in BLO-39866 and is
+now mirrored above.
+
+The `multicast-auth-*` negatives are a different case, and they are listed
+separately because they are **not** pending work. BLO-39866 ruled that
+`multicast.auth` is carried opaquely — `Root` guarantees the block survives a
+round-trip and deliberately does not interpret it, because nothing in `moq-rs`
+verifies provenance. A crate that implements no rule over a block cannot reject
+anything for violating one, so these three can never move into `negative/`,
+whose contract is that *both* implementations reject the file:
+
+- `multicast-auth-padded-key` — `publicKey` carries `=` padding.
+- `multicast-auth-trailing-pad-bits` — `publicKey` ends `...Mbh` where the
+  schema's final-character class allows only `...Mbg`; the trailing two bits of
+  the 43rd base64url character must be zero for a 32-byte key.
+- `multicast-auth-reused-track-format` — duplicate
+  `(mediaTrack, sourceSymbolFormat)` binding, caught by the schema's own
+  `uniqueMulticastAuthTrackBindings` keyword.
+
+Those first two are the argument for the ruling rather than an exception to it:
+re-deriving base64url-unpadded-with-zero-trailing-bits in Rust, slightly wrong,
+would make the relay *claim* to validate signing keys while accepting malformed
+ones. libmmt's schema is where those vectors are enforced, and it does enforce
+all three — verified against this crate's three `multicast.auth` positives in the
+same change. If `moq-rs` ever grows real signature verification, that is the
+change that earns these negatives, and it should mirror them then.
