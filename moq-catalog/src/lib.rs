@@ -61,9 +61,12 @@ pub struct Root {
     /// a round-trip *semantically* intact — every key and value is preserved,
     /// but not the byte stream. `serde_json::Map` is `BTreeMap`-backed
     /// (`preserve_order` is off across this workspace), so re-serializing sorts
-    /// the block's keys. That moves toward RFC 8785 JCS canonical order rather
-    /// than away, and nothing here verifies over catalog bytes — but anyone who
-    /// does eventually verify a signature must not assume byte-identity.
+    /// the block's keys. That moves toward — though it is not identical to —
+    /// RFC 8785 JCS canonical order rather than away: JCS §3.2.3 sorts by UTF-16
+    /// code unit and `BTreeMap<String, _>` by UTF-8 bytes, which agree on all of
+    /// ASCII and diverge only on supplementary-plane keys. Nothing here verifies
+    /// over catalog bytes — but anyone who does eventually verify a signature
+    /// must not assume byte-identity.
     /// Validation of this block belongs to whoever actually verifies the
     /// signature, against libmmt's schema.
     ///
