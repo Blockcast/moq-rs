@@ -56,8 +56,14 @@ pub struct Root {
     /// malformed ones, which is worse than declining to look.
     ///
     /// So the guarantee here is the same one `role` carries: the field survives
-    /// a round-trip intact. Validation of this block belongs to whoever actually
-    /// verifies the signature, against libmmt's schema.
+    /// a round-trip *semantically* intact — every key and value is preserved,
+    /// but not the byte stream. `serde_json::Map` is `BTreeMap`-backed
+    /// (`preserve_order` is off across this workspace), so re-serializing sorts
+    /// the block's keys. That moves toward RFC 8785 JCS canonical order rather
+    /// than away, and nothing here verifies over catalog bytes — but anyone who
+    /// does eventually verify a signature must not assume byte-identity.
+    /// Validation of this block belongs to whoever actually verifies the
+    /// signature, against libmmt's schema.
     #[serde(
         rename = "multicast.auth",
         default,

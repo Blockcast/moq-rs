@@ -56,6 +56,14 @@ The manifest is the thing you update when you deliberately sync; regenerate it
 from a libmmt checkout with the command in its header. It records the libmmt
 commit it came from.
 
+**Enforcement is negatives-only.** The manifest vendors libmmt's
+`catalog/negative/` listing and nothing else, and `mirror.rs` reads only
+`negative/` and `negative-local/`. So where this file calls a `positive/` fixture
+a byte-identical libmmt mirror, that is a one-time manual verification with no
+regression guard: a later libmmt edit to such a vector drifts undetected here.
+Extending the manifest to the positive corpus would close it, and is the obvious
+upgrade if positive mirrors stop being a one-off.
+
 Two things the check deliberately does *not* do. It does not require every libmmt
 vector to be mirrored — the unmirrored ones are listed at the bottom of this file
 and each needs a validation rule this crate has yet to implement. And it reads
@@ -162,7 +170,8 @@ BLO-37534 follow-ups): the `fec-enhancement-repair-removed`,
 `raptorq-source-symbols-over-max` and `track-role-*` negatives.
 
 `positive/multicast-auth-rotation.json` came off that list in BLO-39866 and is
-now mirrored above.
+now mirrored above — byte-identically, but verified by hand, since enforcement is
+negatives-only (see "The mirror is enforced").
 
 The `multicast-auth-*` negatives are a different case, and they are listed
 separately because they are **not** pending work. BLO-39866 ruled that
@@ -183,7 +192,13 @@ whose contract is that *both* implementations reject the file:
 Those first two are the argument for the ruling rather than an exception to it:
 re-deriving base64url-unpadded-with-zero-trailing-bits in Rust, slightly wrong,
 would make the relay *claim* to validate signing keys while accepting malformed
-ones. libmmt's schema is where those vectors are enforced, and it does enforce
-all three — verified against this crate's three `multicast.auth` positives in the
-same change. If `moq-rs` ever grows real signature verification, that is the
-change that earns these negatives, and it should mirror them then.
+ones. The third is a different kind — `uniqueMulticastAuthTrackBindings` is a
+plain structural uniqueness check with no cryptography in it, so the base64url
+argument does not reach it. It is excluded by the opaque-carry ruling itself: a
+crate that interprets none of the block has no rule to enforce, and implementing
+this one in isolation would mean claiming to check `multicast.auth` while
+checking the one constraint that was never the risk. libmmt's schema is where
+those vectors are enforced, and it does enforce all three — verified against this
+crate's three `multicast.auth` positives in the same change. If `moq-rs` ever
+grows real signature verification, that is the change that earns these negatives,
+and it should mirror them then.
