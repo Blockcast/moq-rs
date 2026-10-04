@@ -45,8 +45,10 @@ pub struct Root {
     /// it is the wire shape regardless of how it reads (BLO-39866).
     ///
     /// Deliberately untyped. This crate is the relay's model, and the relay does
-    /// not verify provenance: there is no ed25519, blake3 or signature check
-    /// anywhere in `moq-rs`. Mirroring libmmt's `$defs` here would therefore add
+    /// not verify provenance: there is no ed25519, blake3 or provenance
+    /// signature check anywhere in `moq-rs`. (The `Signature`/`Verifier` hits in
+    /// `moq-native-ietf` and `moq-relay-ietf` are rustls transport TLS, not
+    /// application-layer provenance.) Mirroring libmmt's `$defs` here would add
     /// a second definition of a security-relevant schema that nothing in this
     /// repo consumes — and keeping two definitions in step is the exact failure
     /// BLO-37534 was. Two of libmmt's three `multicast.auth` negatives turn on
@@ -57,13 +59,42 @@ pub struct Root {
     ///
     /// So the guarantee here is the same one `role` carries: the field survives
     /// a round-trip *semantically* intact — every key and value is preserved,
-    /// but not the byte stream. `serde_json::Map` is `BTreeMap`-backed
-    /// (`preserve_order` is off across this workspace), so re-serializing sorts
-    /// the block's keys. That moves toward RFC 8785 JCS canonical order rather
-    /// than away, and nothing here verifies over catalog bytes — but anyone who
-    /// does eventually verify a signature must not assume byte-identity.
+    /// but not the byte stream, and not any particular key order. Order after
+    /// re-serializing depends on how `serde_json` was built, which is a property
+    /// of the build scope, not of this crate (check with
+    /// `cargo tree -e features -i serde_json -p <crate>`; no `Cargo.toml` here
+    /// names the feature). `qlog` enables `serde_json/preserve_order` and
+    /// reaches every binary that links this crate (`moq-pub`, `moq-pub-mmtp`,
+    /// `moq-sub`, via `quinn` → `moq-native-ietf`), so there `Map` is
+    /// `IndexMap`-backed and keeps the source document's arbitrary order. Only
+    /// this crate's isolated build (`cargo test -p moq-catalog`) has it off,
+    /// where `Map` is `BTreeMap`-backed and sorts keys by UTF-8 bytes — still
+    /// not RFC 8785 JCS order, which sorts by UTF-16 code unit (§3.2.3; the two
+    /// agree across the whole BMP and diverge only when a supplementary-plane
+    /// key is compared with one in U+E000–U+FFFF). So no canonical-form
+    /// property may be assumed in either direction. Nothing here verifies over
+    /// catalog bytes — but anyone who does eventually verify a signature must
+    /// not assume byte-identity.
     /// Validation of this block belongs to whoever actually verifies the
     /// signature, against libmmt's schema.
+    ///
+    /// **Carrying this block is only safe because nothing here rewrites a
+    /// catalog.** At the time of writing no path deserializes a `Root`, mutates
+    /// `tracks` or `multicast`, and re-serializes: `moq-pub` constructs `Root`
+    /// fresh (so this is `None`); `moq-pub-mmtp` *parses* the operator's
+    /// `--catalog-json` (so this can be `Some`) but uses the parsed value only
+    /// to validate, and `publish_catalog_track` ships the original file bytes
+    /// verbatim — which is load-bearing: it must not switch to re-serializing
+    /// the parsed `Root` (the shape its test
+    /// `publish_catalog_track_registers_only_canonical_name` uses for a
+    /// synthetic catalog), because that would ship bytes the signer never
+    /// produced; `moq-sub` parses and reads; and `moq-relay-ietf` never parses
+    /// a catalog into `Root` at all (it does not depend on this crate). The
+    /// first code that *does* rewrite one must recompute this block or drop it — it
+    /// must not forward it, because a signature carried past a content change no
+    /// longer covers the content, and a stale-but-well-formed signature is worse
+    /// than none. That, or `moq-rs` growing a real verifier, is what would make
+    /// a typed model mandatory here.
     #[serde(
         rename = "multicast.auth",
         default,
