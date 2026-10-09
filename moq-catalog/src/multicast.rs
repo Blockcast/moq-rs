@@ -24,11 +24,15 @@ pub enum NetworkSource {
     #[serde(rename = "amt")]
     Amt {
         /// AMT relay discovery method. OPTIONAL per
-        /// draft-ramadan-moq-multicast-00 §7.4 — an omitted value means the
+        /// draft-ramadan-moq-multicast-00 §4.2.1 — an omitted value means the
         /// same thing as `"driad"` in the subscriber's discovery order, but is
         /// kept absent here so a catalog round-trips without gaining a field
         /// its publisher never emitted.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ///
+        /// `Option` alone is what makes the field optional on the wire; serde
+        /// deserializes a missing `Option` as `None` with no `default` needed.
+        /// `skip_serializing_if` is the attribute doing the round-trip work.
+        #[serde(skip_serializing_if = "Option::is_none")]
         discovery: Option<AmtDiscovery>,
         #[serde(skip_serializing_if = "Option::is_none")]
         relay: Option<String>,
@@ -131,7 +135,7 @@ mod tests {
     }
 
     /// BLO-17758: `discovery` is OPTIONAL per draft-ramadan-moq-multicast-00
-    /// §7.4, and no producer in the tree emits it. Requiring it here made
+    /// §4.2.1, and no producer in the tree emits it. Requiring it here made
     /// `moq-sub --catalog` fail with `missing field 'discovery'` against the
     /// live `nasa/iss/a` broadcast, so no media was ever requested. This is
     /// the exact wire form the deployed publisher emits.
@@ -162,6 +166,15 @@ mod tests {
     fn live_multicast_config_deserializes() {
         let json = r#"{"endpoints":[{"protocol":"ssm","sourceAddress":"69.25.95.192","groupAddress":"232.1.1.60","port":8000,"tracks":[{"name":"video/720p","packetId":1}]}],"networkSource":[{"relay":"69.25.95.128","type":"amt"}]}"#;
         let cfg: MulticastConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.network_source.as_ref().unwrap().len(), 1);
+        let sources = cfg.network_source.as_ref().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0],
+            NetworkSource::Amt {
+                discovery: None,
+                relay: Some("69.25.95.128".to_string()),
+                port: None,
+            }
+        );
     }
 }
