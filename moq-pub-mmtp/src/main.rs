@@ -823,6 +823,7 @@ mod tests {
                 })
                 .collect(),
             bandwidth: None,
+            network_source: None,
         }
     }
 
@@ -868,6 +869,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1), ("a", 1)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -885,6 +887,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("does-not-exist", 1)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -902,6 +905,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -918,6 +922,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -939,6 +944,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -956,6 +962,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: None,
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tracks, _requests, mut readers) = Tracks::new(ns()).produce();
@@ -1007,6 +1014,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let catalog_bytes = serde_json::to_vec(&cat).unwrap();
@@ -1035,6 +1043,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17), ("a", 18)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -1061,6 +1070,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17), ("v/repair", 18)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -1094,6 +1104,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();
@@ -1137,6 +1148,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         cat.validate()
@@ -1162,6 +1174,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();
@@ -1180,6 +1193,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, _rd) = Tracks::new(ns()).produce();
@@ -1379,6 +1393,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 1)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tracks, _requests, mut readers) = Tracks::new(ns()).produce();
@@ -1506,6 +1521,7 @@ mod tests {
             Some(MulticastConfig {
                 endpoints: Some(vec![endpoint(vec![("v", 17)])]),
                 network_source: None,
+                auth: None,
             }),
         );
         let (mut tw, _r, mut tr) = Tracks::new(ns()).produce();

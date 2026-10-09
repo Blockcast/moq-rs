@@ -41,7 +41,7 @@ The packetization itself is fine. **What needs to change is just the transport l
 ### What's missing in moq-rs upstream
 
 - `moq-catalog::TrackPackaging::Mmtp` variant. Currently `{Cmaf, Loc}` — one-line add.
-- `moq-catalog::MulticastConfig` + friends. Doesn't exist — needs to be ported from hang-mmt-fec, aligned with draft-ramadan-moq-multicast §7.2.
+- `moq-catalog::MulticastConfig` + friends. Doesn't exist — needs to be ported from hang-mmt-fec, aligned with draft-ramadan-moq-multicast §4.1 (endpoint format; §7.2 is Content Authentication and was a miscitation).
 - Publisher binary that accepts MMTP packets (vs `moq-pub` which only accepts fMP4 frames via stdin into the mp4 parser at `moq-pub/src/media.rs`). New binary or new mode.
 
 ## Three approaches
@@ -113,7 +113,7 @@ Local-only first. If/when we PR upstream, drop this in.
 New file `moq-catalog/src/multicast.rs` ported from `hang-mmt-fec/rs/hang/src/catalog/root.rs`:
 
 ```rust
-// Per draft-ramadan-moq-multicast §7.2
+// Per draft-ramadan-moq-multicast §4.1
 pub struct MulticastEndpoint {
     pub protocol: String,                // "ssm" | "asm"
     pub source_address: Option<String>,  // SSM source IP
