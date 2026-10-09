@@ -45,15 +45,34 @@ fn subscribe_ok_params(
     Ok(params)
 }
 
+pub const DROPPED_DATAGRAMS_METRIC: &str = "moq_pub_mmtp_dropped_datagrams_total";
+pub const SENT_DATAGRAMS_METRIC: &str = "moq_pub_mmtp_sent_datagrams_total";
+/// Ring-superseded: a lagging subscriber let the publisher-side ring overwrite
+/// entries before they were read. Remedy is subscriber backpressure/capacity.
+pub const DROP_REASON_RING_SUPERSEDED: &str = "ring_superseded";
+/// Over-MTU: the encoded datagram exceeded the live QUIC datagram limit.
+/// Remedy is path MTU, not capacity. Distinct cause, distinct fix — hence a
+/// label rather than one summed counter (BLO-41602).
+pub const DROP_REASON_OVER_MTU: &str = "over_mtu";
+
 fn record_datagram_loss_metric(
     dropped_total: u64,
     reported_dropped: u64,
     skipped_too_large: u64,
     reported_too_large: u64,
 ) -> u64 {
-    let loss_delta = (dropped_total - reported_dropped) + (skipped_too_large - reported_too_large);
-    metrics::counter!("moq_pub_mmtp_dropped_datagrams_total").increment(loss_delta);
-    loss_delta
+    let ring_delta = dropped_total - reported_dropped;
+    let over_mtu_delta = skipped_too_large - reported_too_large;
+    // Both series are incremented unconditionally (including by 0) so that each
+    // reason stays present once either has ever been touched. An absent series
+    // and a zero one are indistinguishable in PromQL, and that ambiguity is the
+    // thing this issue is fixing — see describe_metrics() for the startup
+    // materialization that extends the same guarantee to a process with no loss.
+    metrics::counter!(DROPPED_DATAGRAMS_METRIC, "reason" => DROP_REASON_RING_SUPERSEDED)
+        .increment(ring_delta);
+    metrics::counter!(DROPPED_DATAGRAMS_METRIC, "reason" => DROP_REASON_OVER_MTU)
+        .increment(over_mtu_delta);
+    ring_delta + over_mtu_delta
 }
 
 #[derive(Debug)]
@@ -685,6 +704,12 @@ impl ObjectForwarder {
         tracing::debug!("[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
+        // Denominator for the loss counters above (BLO-41602). A drop rate is
+        // uninterpretable on its own: 281/s is healthy against 300k sent and an
+        // outage against 300. Handle is resolved once — the loop runs at
+        // thousands/sec on Solana shred ingest, so a per-iteration registry
+        // lookup is not free.
+        let sent_datagrams = metrics::counter!(SENT_DATAGRAMS_METRIC);
         // Loss warnings are rate-limited by TIME, not by a fixed drop count:
         // at bursty ingest rates (Solana shreds arrive per-FEC-set at
         // thousands/sec) any count threshold either spams the log or hides
@@ -828,6 +853,7 @@ impl ObjectForwarder {
                 )?;
 
             datagram_count += 1;
+            sent_datagrams.increment(1);
         }
 
         // The final input can be over the datagram limit. The loop normally
@@ -884,11 +910,10 @@ mod tests {
 
     use super::*;
 
-    const DROPPED_DATAGRAMS_METRIC: &str = "moq_pub_mmtp_dropped_datagrams_total";
-
     #[derive(Default)]
     struct CounterRecorder {
-        dropped_datagrams: Arc<AtomicU64>,
+        ring_superseded: Arc<AtomicU64>,
+        over_mtu: Arc<AtomicU64>,
     }
 
     struct AtomicCounter(Arc<AtomicU64>);
@@ -918,10 +943,24 @@ mod tests {
         }
 
         fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-            if key.name() == DROPPED_DATAGRAMS_METRIC {
-                Counter::from_arc(Arc::new(AtomicCounter(Arc::clone(&self.dropped_datagrams))))
-            } else {
-                Counter::noop()
+            if key.name() != DROPPED_DATAGRAMS_METRIC {
+                return Counter::noop();
+            }
+            // Resolve by the `reason` label, not by name alone: keyed on name
+            // only, both reasons land in one bucket and a test asserting the
+            // split would pass even with the two increments swapped.
+            let reason = key
+                .labels()
+                .find(|label| label.key() == "reason")
+                .map(|label| label.value().to_owned());
+            match reason.as_deref() {
+                Some(DROP_REASON_RING_SUPERSEDED) => {
+                    Counter::from_arc(Arc::new(AtomicCounter(Arc::clone(&self.ring_superseded))))
+                }
+                Some(DROP_REASON_OVER_MTU) => {
+                    Counter::from_arc(Arc::new(AtomicCounter(Arc::clone(&self.over_mtu))))
+                }
+                _ => Counter::noop(),
             }
         }
 
@@ -940,7 +979,10 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || record_datagram_loss_metric(7, 3, 0, 0));
 
-        assert_eq!(recorder.dropped_datagrams.load(Ordering::Relaxed), 4);
+        assert_eq!(recorder.ring_superseded.load(Ordering::Relaxed), 4);
+        // Asserting the other bucket is zero is what makes the label
+        // load-bearing: without it, swapping the two reasons still passes.
+        assert_eq!(recorder.over_mtu.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -949,7 +991,21 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || record_datagram_loss_metric(0, 0, 5, 2));
 
-        assert_eq!(recorder.dropped_datagrams.load(Ordering::Relaxed), 3);
+        assert_eq!(recorder.over_mtu.load(Ordering::Relaxed), 3);
+        assert_eq!(recorder.ring_superseded.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dropped_datagram_metric_separates_simultaneous_causes() {
+        let recorder = CounterRecorder::default();
+
+        // Both causes in one delta. Summed into a single counter (the pre-
+        // BLO-41602 shape) this is an indistinguishable 9, and the responder
+        // cannot tell a lagging subscriber from a low-MTU path.
+        metrics::with_local_recorder(&recorder, || record_datagram_loss_metric(7, 3, 7, 2));
+
+        assert_eq!(recorder.ring_superseded.load(Ordering::Relaxed), 4);
+        assert_eq!(recorder.over_mtu.load(Ordering::Relaxed), 5);
     }
 
     #[test]
@@ -960,7 +1016,7 @@ mod tests {
         // loop iteration to report its accumulated loss.
         metrics::with_local_recorder(&recorder, || record_datagram_loss_metric(0, 0, 1, 0));
 
-        assert_eq!(recorder.dropped_datagrams.load(Ordering::Relaxed), 1);
+        assert_eq!(recorder.over_mtu.load(Ordering::Relaxed), 1);
     }
 
     #[test]

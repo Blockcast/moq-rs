@@ -16,7 +16,11 @@
 //
 // | Name | Description |
 // |------|-------------|
-// | `moq_pub_mmtp_dropped_datagrams_total` | Datagrams dropped by the publisher-side ring buffer (ring-superseded by a lagging subscriber, or over-MTU payloads skipped) — see moq-transport/src/session/subscribed.rs |
+// | `moq_pub_mmtp_dropped_datagrams_total{reason}` | Datagrams dropped by the publisher-side ring buffer. `reason="ring_superseded"` (lagging subscriber) or `reason="over_mtu"` (above the live QUIC datagram limit) — distinct causes with distinct remedies, so they are not summed. See moq-transport/src/session/subscribed.rs |
+// | `moq_pub_mmtp_sent_datagrams_total` | Datagrams successfully sent. The denominator: loss fraction is `rate(dropped) / (rate(dropped) + rate(sent))` |
+//
+// All three series are materialized at zero on startup, so an absent series
+// means the exporter is down — never "no loss" (BLO-41602).
 
 /// Register metric descriptions (Prometheus `# HELP` text).
 ///
@@ -38,11 +42,34 @@
 /// `metrics-exporter-prometheus` is optional, so `describe_counter!` compiles
 /// either way and is a no-op against the facade when no recorder is installed.
 pub fn describe_metrics() {
+    use moq_transport::session::{
+        DROPPED_DATAGRAMS_METRIC, DROP_REASON_OVER_MTU, DROP_REASON_RING_SUPERSEDED,
+        SENT_DATAGRAMS_METRIC,
+    };
+
     metrics::describe_counter!(
-        "moq_pub_mmtp_dropped_datagrams_total",
-        "Datagrams dropped by the publisher-side ring buffer: ring-superseded \
-         (lagging subscriber) or over-MTU payloads skipped"
+        DROPPED_DATAGRAMS_METRIC,
+        "Datagrams dropped by the publisher-side ring buffer, by `reason`: \
+         ring_superseded (lagging subscriber) or over_mtu (payload above the \
+         live QUIC datagram limit)"
     );
+    metrics::describe_counter!(
+        SENT_DATAGRAMS_METRIC,
+        "Datagrams successfully sent to the subscriber. Denominator for the \
+         drop counters: a drop rate alone cannot distinguish a lossy path from \
+         a busy one"
+    );
+
+    // Materialize all three series at zero (BLO-41602). Without this a process
+    // that has never dropped a datagram exports no drop series at all, and
+    // PromQL cannot tell "loss-free" from "publishing nothing" — measured
+    // 2026-10-08, staging-blockcastd scraped up=1 with no drop series while
+    // production carried 132M, and neither reading was interpretable.
+    // `increment(0)` registers without perturbing the value.
+    metrics::counter!(DROPPED_DATAGRAMS_METRIC, "reason" => DROP_REASON_RING_SUPERSEDED)
+        .increment(0);
+    metrics::counter!(DROPPED_DATAGRAMS_METRIC, "reason" => DROP_REASON_OVER_MTU).increment(0);
+    metrics::counter!(SENT_DATAGRAMS_METRIC).increment(0);
 }
 
 /// Install the Prometheus exporter iff `MOQ_PUB_METRICS_ADDR` is set. No-op
@@ -208,5 +235,30 @@ mod tests {
     async fn none_flag_addr_is_a_no_op() {
         install_flag_exporter_if_needed(None, Some("127.0.0.1:0".parse().unwrap()));
         install_flag_exporter_if_needed(None, None);
+    }
+
+    /// BLO-41602: the whole point of materializing at zero is that a
+    /// loss-free publisher still EXPORTS the drop series, so PromQL can tell
+    /// "no loss" from "not running". That rests entirely on `increment(0)`
+    /// producing a rendered line — assert it against the real Prometheus
+    /// renderer rather than assuming it.
+    #[test]
+    fn describe_metrics_materializes_every_series_at_zero() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, describe_metrics);
+
+        let rendered = handle.render();
+        for expected in [
+            "moq_pub_mmtp_dropped_datagrams_total{reason=\"ring_superseded\"} 0",
+            "moq_pub_mmtp_dropped_datagrams_total{reason=\"over_mtu\"} 0",
+            "moq_pub_mmtp_sent_datagrams_total 0",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} in rendered exposition:\n{rendered}"
+            );
+        }
     }
 }
