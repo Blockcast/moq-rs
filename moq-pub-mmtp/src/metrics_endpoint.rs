@@ -16,8 +16,26 @@
 //
 // | Name | Description |
 // |------|-------------|
-// | `moq_pub_mmtp_dropped_datagrams_total{reason}` | Datagrams dropped by the publisher-side ring buffer. `reason="ring_superseded"` (lagging subscriber) or `reason="over_mtu"` (above the live QUIC datagram limit) — distinct causes with distinct remedies, so they are not summed. See moq-transport/src/session/subscribed.rs |
-// | `moq_pub_mmtp_sent_datagrams_total` | Datagrams successfully sent. The denominator: loss fraction is `rate(dropped) / (rate(dropped) + rate(sent))` |
+// | `moq_pub_mmtp_dropped_datagrams_total{reason}` | Datagrams dropped by the publisher-side ring buffer. `reason="ring_superseded"` (lagging subscriber) or `reason="over_mtu"` (above the live QUIC datagram limit) — distinct causes with distinct remedies, so they are not summed. A bare selector on this metric returns TWO series (one per reason), deliberately: single-value panels and scalar threshold comparisons must aggregate (`sum without(reason)`) or pick a reason. See moq-transport/src/session/subscribed.rs |
+// | `moq_pub_mmtp_sent_datagrams_total` | Datagrams successfully sent. The denominator for the loss fraction below |
+//
+// Loss fraction. `sent` carries no `reason` label, so the drop side must
+// aggregate it away first — PromQL matches binary operands on the full label
+// set, and a bare `rate(dropped) / (rate(dropped) + rate(sent))` matches no
+// pairs and returns an EMPTY vector:
+//
+//   sum without(reason) (rate(moq_pub_mmtp_dropped_datagrams_total[5m]))
+//     / (sum without(reason) (rate(moq_pub_mmtp_dropped_datagrams_total[5m]))
+//        + rate(moq_pub_mmtp_sent_datagrams_total[5m]))
+//
+// Per-reason fraction (same denominator, one series per reason). The empty
+// `()` after `group_left` is required: without it the parser takes the next
+// `(` as group_left's label list and rejects the query.
+//
+//   rate(moq_pub_mmtp_dropped_datagrams_total[5m])
+//     / ignoring(reason) group_left()
+//       (sum without(reason) (rate(moq_pub_mmtp_dropped_datagrams_total[5m]))
+//        + rate(moq_pub_mmtp_sent_datagrams_total[5m]))
 //
 // All three series are materialized at zero on startup, so an absent series
 // means the exporter is down — never "no loss" (BLO-41602).
@@ -327,7 +345,14 @@ mod tests {
             .await
             .unwrap();
         let mut response = String::new();
-        stream.read_to_string(&mut response).await.unwrap();
+        // A hung scrape must fail the test, not stall CI to the job limit.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("scrape timed out")
+        .unwrap();
 
         for expected in [
             "moq_pub_mmtp_dropped_datagrams_total{reason=\"ring_superseded\"} 0",
