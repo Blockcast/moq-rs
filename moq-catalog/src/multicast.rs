@@ -1,5 +1,25 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! Multicast catalog extension (draft-ramadan-moq-multicast-00 §4).
+//!
+//! Two documents define this wire format and they do not always agree: the
+//! draft, and libmmt's `packages/container/schemas/catalog.schema.json`, which
+//! `tests/fixtures/README.md` names as the other implementation. When they
+//! disagree:
+//!
+//! - Parsing follows the draft. This crate is a reader, so a form the draft
+//!   allows is accepted even where libmmt's schema rejects it: AMT without
+//!   `discovery`, ATSC 3.0 without `plpId`/`serviceId`/`slsUri`,
+//!   endpoint-level `networkSource`, and `auth` nested in `multicast`. Each is
+//!   a deliberate divergence from libmmt.
+//! - libmmt governs the shared corpus, and so what a producer should emit.
+//!   That README's contract is that every `positive/` file validates in both
+//!   and every `negative/` file is rejected by both. A draft-only form above
+//!   therefore cannot be a `positive/` fixture (unit tests here pin it
+//!   instead), and a form libmmt rejects with a shared `negative/` vector
+//!   stays rejected here whatever the draft says: the object form of
+//!   `MulticastConfig::network_source`.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,10 +59,25 @@ pub enum NetworkSource {
         #[serde(skip_serializing_if = "Option::is_none")]
         port: Option<u16>,
     },
+    /// ATSC 3.0 broadcast source (§4.2.2).
+    ///
+    /// libmmt's `$defs/networkSource` atsc3 branch requires `plpId`,
+    /// `serviceId` and `slsUri`; the draft makes all three OPTIONAL, and so
+    /// does this crate. A source omitting any of them parses here and fails
+    /// libmmt's schema: a deliberate divergence from libmmt, the same one
+    /// `discovery` above has carried since BLO-17758. See the module doc.
     #[serde(rename = "atsc3")]
     Atsc3 {
-        /// RF center frequency in kHz. The one REQUIRED ATSC 3.0 field per
+        /// RF center frequency. The one REQUIRED ATSC 3.0 field per
         /// draft-ramadan-moq-multicast-00 §4.2.2.
+        ///
+        /// No unit is claimed here because the authorities disagree: the
+        /// draft says kHz (its example is `533000`), libmmt types it as a bare
+        /// `positiveInteger`, and libmmt's corpus vector `fec-multicast.json`
+        /// carries `587000000`, a UHF channel only in Hz. Nothing in `moq-rs`
+        /// interprets the value and validation checks only that it is
+        /// non-zero, so the unit is a cross-repo question. This crate's tests
+        /// follow the corpus.
         frequency: u64,
         /// Physical Layer Pipe ID. OPTIONAL per §4.2.2, which gives it a
         /// default of 0 (base PLP).
@@ -97,6 +132,10 @@ pub struct MulticastEndpoint {
     ///
     /// Array-only, matching `MulticastConfig::network_source`; see the note
     /// there for why the draft's bare-object form is deliberately not accepted.
+    ///
+    /// libmmt's `$defs/endpoint` is `additionalProperties: false` without
+    /// `networkSource`, so it rejects an endpoint carrying one. Accepting it
+    /// here is a deliberate divergence from libmmt; see the module doc.
     #[serde(rename = "networkSource", skip_serializing_if = "Option::is_none")]
     pub network_source: Option<Vec<NetworkSource>>,
 }
@@ -124,9 +163,14 @@ pub struct MulticastConfig {
     ///
     /// Distinct from `Root::multicast_auth`, which is the *literal dotted root
     /// key* `"multicast.auth"` sitting beside `multicast` — libmmt's shape, and
-    /// what the fleet actually emits (BLO-39866, #103). Both are legal wire
-    /// forms and they are different JSON; carrying one did not carry the other,
-    /// so the draft-shaped nesting still hard-failed `deny_unknown_fields`.
+    /// what the fleet actually emits (BLO-39866, #103). They are different
+    /// JSON; carrying one did not carry the other, so the draft-shaped nesting
+    /// still hard-failed `deny_unknown_fields`.
+    ///
+    /// Only the dotted key is legal in libmmt: its `$defs/multicast` is
+    /// `additionalProperties: false` over `endpoints` and `networkSource`, so
+    /// it rejects this nested form. Accepting it here is a deliberate
+    /// divergence from libmmt; see the module doc for which authority wins.
     ///
     /// Untyped and unvalidated for the same reason `Root::multicast_auth` is:
     /// nothing in `moq-rs` verifies provenance, and a second partial definition
@@ -240,13 +284,13 @@ mod tests {
     /// hit from the AMT side.
     #[test]
     fn atsc3_parses_with_only_frequency_and_does_not_invent_fields() {
-        let json = r#"{"type":"atsc3","frequency":533000}"#;
+        let json = r#"{"type":"atsc3","frequency":533000000}"#;
         let source: NetworkSource = serde_json::from_str(json).unwrap();
         assert!(
             matches!(
                 source,
                 NetworkSource::Atsc3 {
-                    frequency: 533000,
+                    frequency: 533000000,
                     plp_id: None,
                     service_id: None,
                     sls_uri: None,
@@ -269,7 +313,7 @@ mod tests {
                 "absent {absent} must stay absent on re-serialize: {emitted}"
             );
         }
-        assert_eq!(obj["frequency"], 533000_u64);
+        assert_eq!(obj["frequency"], 533000000_u64);
     }
 
     /// BLO-41985 gap (b1): §4.1 types `networkSource` as OPTIONAL and says it

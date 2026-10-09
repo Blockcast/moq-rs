@@ -775,7 +775,7 @@ mod tests {
             r#"{
             "version":1,"streamingFormat":"mmtp","streamingFormatVersion":"x",
             "tracks":[{"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000}],
-            "multicast":{"endpoints":[{"sourceAddress":"192.0.2.1","groupAddress":"232.1.1.1","port":5000,"tracks":[{"name":"v","packetId":1}]}],"networkSource":[{"type":"atsc3","frequency":533000}]}
+            "multicast":{"endpoints":[{"sourceAddress":"192.0.2.1","groupAddress":"232.1.1.1","port":5000,"tracks":[{"name":"v","packetId":1}]}],"networkSource":[{"type":"atsc3","frequency":533000000}]}
         }"#,
         );
     }
