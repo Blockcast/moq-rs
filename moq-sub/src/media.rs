@@ -56,10 +56,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             None
         };
         let moov = {
-            let init_track_name: &str = match catalog {
-                Some(ref c) => &c.tracks[0].init_track.clone().unwrap(),
-                None => "0.mp4",
-            };
+            let init_track_name = init_track_name(catalog.as_ref())?;
             let buf = self.download_first_object(init_track_name, "init").await?;
             self.output.lock().await.write_all(&buf).await?;
             let mut reader = Cursor::new(&buf);
@@ -81,7 +78,18 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         for (idx, trak) in moov.traks.into_iter().enumerate() {
             let id = trak.tkhd.track_id;
             let name: String = match catalog {
-                Some(ref c) => c.tracks[idx].name.clone(),
+                Some(ref c) => c
+                    .tracks
+                    .get(idx)
+                    .with_context(|| {
+                        format!(
+                            "moov declares {} traks but the catalog declares {} tracks",
+                            idx + 1,
+                            c.tracks.len()
+                        )
+                    })?
+                    .name
+                    .clone(),
                 None => format!("{id}.m4s"),
             };
             info!("found track {name}");
@@ -209,12 +217,49 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
     }
 }
 
+/// Resolve the track carrying the fMP4 init segment (`ftyp` + `moov`).
+///
+/// `initTrack` is optional in the catalog schema, and the MSF publisher leaves
+/// it unset and inlines the init segment as base64 `initData` instead. moq-sub
+/// only knows how to *fetch* one, so say so rather than unwrapping a `None`.
+fn init_track_name(catalog: Option<&moq_catalog::Root>) -> anyhow::Result<&str> {
+    let Some(catalog) = catalog else {
+        return Ok("0.mp4");
+    };
+    let track = catalog
+        .tracks
+        .first()
+        .context("catalog declares no tracks")?;
+    track.init_track.as_deref().with_context(|| {
+        format!(
+            "track {:?} has no initTrack{}; moq-sub fetches the init segment from a \
+             separate track",
+            track.name,
+            if track.init_data.is_some() {
+                " (initData is present, but moq-sub does not read an inline one)"
+            } else {
+                ""
+            }
+        )
+    })
+}
+
 fn validate_catalog(catalog: &moq_catalog::Root) -> anyhow::Result<()> {
     anyhow::ensure!(catalog.version == 1, "unknown catalog version");
     if catalog.streaming_format == "mmtp" {
         catalog
             .validate()
             .map_err(|error| anyhow::anyhow!("invalid catalog: {error}"))?;
+        // Everything below this gate is an fMP4/CMAF consumer: it reads a ftyp +
+        // moov init segment and forwards whole objects. An MMTP broadcast carries
+        // an MMTP packet header in front of every object, so without the refusal
+        // we would read a packet header as a `ftyp` box and fail somewhere much
+        // less obvious. moq-sub-raw is the subscriber that depacketizes MMTP.
+        anyhow::bail!(
+            "moq-sub cannot consume a streamingFormat=\"mmtp\" catalog: it has no MMTP \
+             depacketization and would parse MMTP packet headers as fMP4 boxes. \
+             Use moq-sub-raw for this broadcast."
+        );
     }
     Ok(())
 }
@@ -308,5 +353,90 @@ mod tests {
         );
 
         validate_catalog(&catalog).expect("moq-sub must consume a legacy-container hang catalog");
+    }
+
+    /// The `nasa/iss/a` catalog as served by the production relay, captured
+    /// 2026-10-09 (BLO-17758 probe). Kept verbatim: it is the shape that made
+    /// `tracks[0].init_track.unwrap()` panic, and a hand-written stand-in would
+    /// not have caught it -- every MMTP catalog this tree already ships as a
+    /// fixture omits `initData` as well as `initTrack`, so none of them
+    /// distinguishes "publisher inlines the init segment" from "there is no
+    /// init segment at all".
+    fn live_mmtp_catalog() -> moq_catalog::Root {
+        let json = include_str!("../tests/fixtures/nasa-iss-a-mmtp-catalog.json");
+        serde_json::from_str(json).expect("live capture must still deserialize")
+    }
+
+    /// Pins the three properties the two tests below actually depend on. Without
+    /// this, a fixture that drifted to `cmaf`, or grew an `initTrack`, would let
+    /// both of them pass for the wrong reason.
+    #[test]
+    fn live_capture_still_has_the_shape_this_guard_is_for() {
+        let catalog = live_mmtp_catalog();
+        assert_eq!(catalog.streaming_format, "mmtp");
+        assert!(
+            catalog.validate().is_ok(),
+            "capture must be a *valid* MSF catalog: the point is that moq-sub \
+             refuses it for being MMTP, not for being malformed"
+        );
+        let track = &catalog.tracks[0];
+        assert!(track.init_track.is_none(), "fixture grew an initTrack");
+        assert!(
+            track.init_data.is_some(),
+            "fixture lost its inline initData"
+        );
+    }
+
+    /// AC 1: refuse, and say which tool to reach for instead. Everything past
+    /// this gate parses fMP4 boxes, so an MMTP catalog that gets through fails
+    /// later and far less legibly.
+    #[test]
+    fn refuses_an_mmtp_catalog_and_names_moq_sub_raw() {
+        let error = validate_catalog(&live_mmtp_catalog())
+            .expect_err("moq-sub has no MMTP depacketization; it must refuse")
+            .to_string();
+        assert!(error.contains("mmtp"), "must name the format: {error}");
+        assert!(
+            error.contains("moq-sub-raw"),
+            "must name the subscriber that can do this: {error}"
+        );
+    }
+
+    #[test]
+    fn init_track_defaults_when_no_catalog_was_requested() {
+        assert_eq!(init_track_name(None).unwrap(), "0.mp4");
+    }
+
+    #[test]
+    fn init_track_comes_from_the_catalog_when_declared() {
+        let mut catalog = cmaf_catalog(1);
+        catalog.tracks[0].init_track = Some("video/init.mp4".into());
+        assert_eq!(init_track_name(Some(&catalog)).unwrap(), "video/init.mp4");
+    }
+
+    /// AC 2: the same `initTrack: None` + `initData: Some(..)` shape on the CMAF
+    /// envelope, which `validate_catalog` lets through, so this is the only
+    /// guard standing between it and the old panic.
+    #[test]
+    fn init_track_errors_rather_than_panicking_on_an_inline_init_segment() {
+        let mut catalog = cmaf_catalog(1);
+        catalog.tracks[0].init_data = Some("AAAAGGZ0eXBpc281".into());
+        assert!(catalog.tracks[0].init_track.is_none());
+
+        let error = init_track_name(Some(&catalog))
+            .expect_err("moq-sub cannot fetch an init segment it was never given a track for")
+            .to_string();
+        assert!(error.contains("initTrack"), "{error}");
+        assert!(
+            error.contains("initData"),
+            "must say why the publisher thought it was fine: {error}"
+        );
+    }
+
+    #[test]
+    fn init_track_errors_on_a_catalog_with_no_tracks() {
+        let mut catalog = cmaf_catalog(1);
+        catalog.tracks.clear();
+        assert!(init_track_name(Some(&catalog)).is_err());
     }
 }
