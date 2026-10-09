@@ -143,7 +143,7 @@ fn select_wire_profile(offered: &[String], supported: &[WireProfile]) -> Option<
     supported.iter().copied().find(|profile| {
         offered
             .iter()
-            .any(|offered| offered.as_str() == profile.name())
+            .any(|offered| WireProfile::from_webtransport_protocol(offered) == Some(*profile))
     })
 }
 
@@ -152,21 +152,26 @@ fn validate_selected_profile(
     selected: Option<&str>,
 ) -> anyhow::Result<WireProfile> {
     anyhow::ensure!(
-        selected == Some(required.name()),
+        selected == Some(required.webtransport_protocol()),
         "WebTransport protocol mismatch: required={} selected={}",
-        required,
+        required.webtransport_protocol(),
         selected.unwrap_or("<none>")
     );
     Ok(required)
 }
 
 fn offered_profiles_label(offered: &[String]) -> &'static str {
-    let blockcast = offered.iter().any(|profile| profile == "moqt-blockcast-01");
-    let draft19 = offered.iter().any(|profile| profile == "moqt-19");
-    let draft16 = offered.iter().any(|profile| profile == "moqt-16");
+    let resolved = |profile: WireProfile| {
+        offered
+            .iter()
+            .any(|offered| WireProfile::from_webtransport_protocol(offered) == Some(profile))
+    };
+    let blockcast = resolved(WireProfile::Blockcast01);
+    let draft19 = resolved(WireProfile::Draft19);
+    let draft16 = resolved(WireProfile::Draft16);
     let unknown = offered
         .iter()
-        .any(|profile| WireProfile::from_name(profile).is_none());
+        .any(|profile| WireProfile::from_webtransport_protocol(profile).is_none());
     if unknown {
         return if blockcast || draft19 || draft16 {
             "known+unknown"
@@ -178,14 +183,19 @@ fn offered_profiles_label(offered: &[String]) -> &'static str {
         (false, false, false) => "none",
         (true, false, false) => "moqt-blockcast-01",
         (false, true, false) => "moqt-19",
-        (false, false, true) => "moqt-16",
+        (false, false, true) => "moqt-wt-16",
         (true, true, false) => "moqt-blockcast-01+moqt-19",
-        (true, false, true) => "moqt-blockcast-01+moqt-16",
-        (false, true, true) => "moqt-19+moqt-16",
-        (true, true, true) => "moqt-blockcast-01+moqt-19+moqt-16",
+        (true, false, true) => "moqt-blockcast-01+moqt-wt-16",
+        (false, true, true) => "moqt-19+moqt-wt-16",
+        (true, true, true) => "moqt-blockcast-01+moqt-19+moqt-wt-16",
     }
 }
 
+/// Names the locally-enabled profile set. Emitted on BOTH the WebTransport and
+/// the native-QUIC paths, so it deliberately keeps the ALPN spelling
+/// (`moqt-16`) rather than the ROOT-13 WebTransport token (`moqt-wt-16`) — one
+/// label cannot be truthful about two wires, and the transport is already a
+/// separate label on every `moq_negotiation_total` sample.
 fn supported_profiles_label(supported: &[WireProfile]) -> &'static str {
     let blockcast = supported.contains(&WireProfile::Blockcast01);
     let draft19 = supported.contains(&WireProfile::Draft19);
@@ -210,7 +220,19 @@ fn required_profile_label(offered: &[String]) -> &'static str {
             "multiple"
         };
     }
-    WireProfile::from_name(&offered[0]).map_or("unknown", WireProfile::name)
+    WireProfile::from_webtransport_protocol(&offered[0])
+        .map_or("unknown", WireProfile::webtransport_protocol)
+}
+
+/// The token this profile actually puts on the wire for `scheme`: the ROOT-13
+/// WebTransport subprotocol for `https`, the ALPN for native `moqt`. Metric
+/// labels must report what was offered, not the profile's ALPN spelling, or the
+/// ROOT-13 convergence receipt cannot see migrated traffic.
+fn wire_token_for_scheme(profile: WireProfile, scheme: &str) -> &'static str {
+    match scheme {
+        "https" => profile.webtransport_protocol(),
+        _ => profile.name(),
+    }
 }
 
 fn connect_error_outcome(error: &quinn::ConnectionError) -> &'static str {
@@ -689,7 +711,7 @@ impl Server {
                 let offered = request.protocols.join(",");
                 let supported = wire_profiles
                     .iter()
-                    .map(|profile| profile.name())
+                    .map(|profile| profile.webtransport_protocol())
                     .collect::<Vec<_>>()
                     .join(",");
                 metrics::counter!(
@@ -716,7 +738,7 @@ impl Server {
             let session = request
                 .respond(
                     web_transport_quinn::proto::ConnectResponse::OK
-                        .with_protocol(selected_version.name()),
+                        .with_protocol(selected_version.webtransport_protocol()),
                 )
                 .await
                 .context("failed to respond to WebTransport request")?;
@@ -872,9 +894,9 @@ impl Client {
                         _ => "unknown",
                     },
                     "outcome" => connect_error_outcome(&error),
-                    "offered" => required.name(),
+                    "offered" => wire_token_for_scheme(required, url.scheme()),
                     "supported" => supported_profiles_label(&self.wire_profiles),
-                    "required" => required.name(),
+                    "required" => wire_token_for_scheme(required, url.scheme()),
                 )
                 .increment(1);
                 return Err(error.into());
@@ -892,7 +914,7 @@ impl Client {
         let (session, transport, selected_version) = match url.scheme() {
             "https" => {
                 let request = web_transport_quinn::proto::ConnectRequest::new(url.clone())
-                    .with_protocol(required.name());
+                    .with_protocol(required.webtransport_protocol());
                 let session = web_transport_quinn::Session::connect(connection, request).await?;
                 let selected_version =
                     validate_selected_profile(required, session.response().protocol.as_deref())?;
@@ -933,9 +955,9 @@ impl Client {
                 Transport::RawQuic => "raw_quic",
             },
             "outcome" => "selected",
-            "offered" => required.name(),
+            "offered" => wire_token_for_scheme(required, url.scheme()),
             "supported" => supported_profiles_label(&self.wire_profiles),
-            "required" => required.name(),
+            "required" => wire_token_for_scheme(required, url.scheme()),
         )
         .increment(1);
 
@@ -1200,17 +1222,35 @@ mod tests {
         );
         assert!(validate_selected_profile(WireProfile::Draft19, Some("moqt-16")).is_err());
         assert!(validate_selected_profile(WireProfile::Draft19, None).is_err());
+        // ROOT-13: draft-16 offers and requires the WT token, never the ALPN.
+        assert_eq!(
+            validate_selected_profile(WireProfile::Draft16, Some("moqt-wt-16")).unwrap(),
+            WireProfile::Draft16
+        );
+        assert!(validate_selected_profile(WireProfile::Draft16, Some("moqt-16")).is_err());
+        assert!(validate_selected_profile(WireProfile::Draft16, Some("moqt-raw-mmtp-16")).is_err());
     }
 
     #[test]
     fn webtransport_selects_only_an_exact_common_protocol() {
-        let offered = vec!["moqt-19-preview".to_string(), "moqt-16".to_string()];
+        let offered = vec!["moqt-19-preview".to_string(), "moqt-wt-16".to_string()];
         assert_eq!(
             select_wire_profile(&offered, &[WireProfile::Draft19, WireProfile::Draft16]),
             Some(WireProfile::Draft16)
         );
         assert_eq!(
             select_wire_profile(&["moqt-19-preview".to_string()], &[WireProfile::Draft19]),
+            None
+        );
+        // Reader-lenient window: an un-migrated writer still negotiates.
+        // Delete with ROOT-13 cutover step 5.
+        assert_eq!(
+            select_wire_profile(&["moqt-16".to_string()], &[WireProfile::Draft16]),
+            Some(WireProfile::Draft16)
+        );
+        // The raw-MMTP media contract is not served by this crate.
+        assert_eq!(
+            select_wire_profile(&["moqt-raw-mmtp-16".to_string()], &[WireProfile::Draft16]),
             None
         );
     }
@@ -1226,7 +1266,10 @@ mod tests {
         for role in ["publisher", "subscriber", "relay"] {
             for offered in profiles {
                 for supported in profiles {
-                    let selected = select_wire_profile(&[offered.name().to_string()], &[supported]);
+                    let selected = select_wire_profile(
+                        &[offered.webtransport_protocol().to_string()],
+                        &[supported],
+                    );
                     let expected = (offered == supported).then_some(offered);
                     assert_eq!(
                         selected, expected,
@@ -1244,8 +1287,30 @@ mod tests {
             "moqt-blockcast-01"
         );
         assert_eq!(
+            offered_profiles_label(&["moqt-wt-16".to_string()]),
+            "moqt-wt-16"
+        );
+        assert_eq!(
+            required_profile_label(&["moqt-wt-16".to_string()]),
+            "moqt-wt-16"
+        );
+        assert_eq!(
+            required_profile_label(&["moqt-wt-16".to_string(), "moqt-19".to_string()]),
+            "multiple"
+        );
+        assert_eq!(
             supported_profiles_label(&[WireProfile::Blockcast01, WireProfile::Draft16]),
             "moqt-blockcast-01+moqt-16"
+        );
+        // The client counter must name the token that went on the wire, or the
+        // ROOT-13 convergence receipt cannot see migrated WebTransport traffic.
+        assert_eq!(
+            wire_token_for_scheme(WireProfile::Draft16, "https"),
+            "moqt-wt-16"
+        );
+        assert_eq!(
+            wire_token_for_scheme(WireProfile::Draft16, "moqt"),
+            "moqt-16"
         );
     }
 
@@ -1332,6 +1397,22 @@ mod tests {
         assert_eq!(session.protocol(), Some("moqt-19"));
         assert_eq!(info.transport, Transport::WebTransport);
         assert_eq!(info.selected_version, WireProfile::Draft19);
+    }
+
+    #[tokio::test]
+    async fn webtransport_selects_and_echoes_exact_moqt_wt_16() {
+        // ROOT-13 W4: draft-16 negotiates `moqt-wt-16` on the wire in both
+        // directions while the native QUIC ALPN stays `moqt-16`.
+        let (client, server) =
+            negotiate("https", &[WireProfile::Draft16], WireProfile::Draft16).await;
+        let (session, _, transport, selected) = client.unwrap();
+        assert_eq!(session.protocol(), Some("moqt-wt-16"));
+        assert_eq!(transport, Transport::WebTransport);
+        assert_eq!(selected, WireProfile::Draft16);
+        let (session, info) = server.await.unwrap().unwrap();
+        assert_eq!(session.protocol(), Some("moqt-wt-16"));
+        assert_eq!(info.transport, Transport::WebTransport);
+        assert_eq!(info.selected_version, WireProfile::Draft16);
     }
 
     #[tokio::test]
