@@ -87,11 +87,13 @@ pub fn spawn_if_enabled() -> Option<std::net::SocketAddr> {
         return None;
     };
 
-    // Registered whenever an exporter address is configured, independent of
-    // whether the metrics-prometheus feature was compiled in: describe_counter!
-    // is a no-op against the facade when no recorder is installed, and calling
-    // it here (rather than only from the feature-gated install-success arm
-    // below) keeps this function reachable under every feature combination.
+    // Called whenever an exporter address is configured, independent of
+    // whether the metrics-prometheus feature was compiled in, so this function
+    // stays reachable under every feature combination. It registers NOTHING
+    // here: `metrics` resolves `counter!`/`describe_counter!` against the
+    // global recorder at call time, which is still the NoopRecorder until
+    // `install()` below runs, and there is no replay. The registration that
+    // actually lands is the second call in the install-success arm.
     describe_metrics();
 
     #[cfg(feature = "metrics-prometheus")]
@@ -104,6 +106,13 @@ pub fn spawn_if_enabled() -> Option<std::net::SocketAddr> {
                     .install()
                 {
                     Ok(()) => {
+                        // Must follow install(): before it the series were
+                        // discarded by the NoopRecorder, which on this (the
+                        // production) path left an absent drop series meaning
+                        // "loss-free or not publishing" (BLO-41602). Idempotent
+                        // with the pre-install call above. Mirrors the flag
+                        // path in install_flag_exporter_if_needed.
+                        describe_metrics();
                         tracing::info!(
                             addr = %socket_addr,
                             "metrics exporter listening on http://{socket_addr}/metrics"
@@ -260,5 +269,76 @@ mod tests {
                 "missing {expected:?} in rendered exposition:\n{rendered}"
             );
         }
+    }
+
+    const ENV_CHILD_MARKER: &str = "MOQ_PUB_METRICS_ENV_ACTIVATION_CHILD";
+    const ENV_CHILD_PASSED: &str = "ENV_ACTIVATION_CHILD_PASSED";
+
+    /// BLO-41602: `describe_metrics_materializes_every_series_at_zero` installs
+    /// a recorder and THEN describes, the inverse of the production sequence,
+    /// so it cannot see a registration that runs before `install()`. This
+    /// drives the real `MOQ_PUB_METRICS_ADDR` path (`spawn_if_enabled`) and
+    /// scrapes the live exporter. The global recorder is install-once per
+    /// process and other tests in this binary claim it, so the scenario runs
+    /// in a fresh child process (`env_activation_child`).
+    #[test]
+    fn env_activation_materializes_every_series_at_zero() {
+        // ponytail: free port picked then released before the child binds it;
+        // a collision fails loudly (install Err -> expect in the child).
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "metrics_endpoint::tests::env_activation_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MOQ_PUB_METRICS_ADDR", format!("127.0.0.1:{port}"))
+            .env(ENV_CHILD_MARKER, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The sentinel guards against a filter that matched no test, which
+        // the harness reports as a successful run.
+        assert!(
+            out.status.success() && stdout.contains(ENV_CHILD_PASSED),
+            "env-activation child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "child process of env_activation_materializes_every_series_at_zero"]
+    async fn env_activation_child() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if std::env::var_os(ENV_CHILD_MARKER).is_none() {
+            return;
+        }
+        let addr = spawn_if_enabled().expect("exporter must install in a fresh process");
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+
+        for expected in [
+            "moq_pub_mmtp_dropped_datagrams_total{reason=\"ring_superseded\"} 0",
+            "moq_pub_mmtp_dropped_datagrams_total{reason=\"over_mtu\"} 0",
+            "moq_pub_mmtp_sent_datagrams_total 0",
+        ] {
+            assert!(
+                response.contains(expected),
+                "missing {expected:?} in scraped exposition:\n{response}"
+            );
+        }
+        println!("{ENV_CHILD_PASSED}");
     }
 }

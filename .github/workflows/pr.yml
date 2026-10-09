@@ -38,6 +38,10 @@ jobs:
 
       # Make sure u guys don't write bad code
       - run: cargo test --verbose
+      # The metrics_endpoint tests are cfg(feature = "metrics-prometheus"),
+      # which the default-feature run above never compiles; the shipped image
+      # builds with it (Dockerfile), so test what ships (BLO-41602).
+      - run: cargo test -p moq-pub-mmtp --features metrics-prometheus metrics_endpoint
       - name: Verify production shred datagram delivery
         run: |
           cargo build -p moq-relay-ietf -p moq-pub-mmtp -p moq-sub-raw
