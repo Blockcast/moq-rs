@@ -17,8 +17,9 @@
 //!   and every `negative/` file is rejected by both. A draft-only form above
 //!   therefore cannot be a `positive/` fixture (unit tests here pin it
 //!   instead), and a form libmmt rejects with a shared `negative/` vector
-//!   stays rejected here whatever the draft says: the object form of
-//!   `MulticastConfig::network_source`.
+//!   stays rejected here whatever the draft says. No live instance of that
+//!   second case: the object form of `MulticastConfig::network_source` was
+//!   one until the draft itself went array-only on 2026-10-05.
 
 use serde::{Deserialize, Serialize};
 
@@ -120,18 +121,19 @@ pub struct MulticastEndpoint {
     pub tracks: Vec<MulticastTrackRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bandwidth: Option<u64>,
-    /// Per-endpoint network delivery configuration. OPTIONAL per
-    /// draft-ramadan-moq-multicast-00 §4.1, which places it either here or on
-    /// the enclosing `multicast` object ("May appear on individual endpoints
-    /// or at the top-level `multicast` object to apply to all endpoints").
+    /// Per-endpoint network delivery configuration. `(array of objects,
+    /// OPTIONAL)` per draft-ramadan-moq-multicast-00 §4.1, which places it
+    /// either here or on the enclosing `multicast` object: §4.2 says it "MAY
+    /// appear at the `multicast` level (applying to all endpoints) or on
+    /// individual endpoints; a single source is expressed as a one-element
+    /// array."
     ///
     /// Without this field `deny_unknown_fields` above turned the per-endpoint
     /// placement into a hard `unknown field` parse failure — the same class of
     /// break as the `missing field 'discovery'` one that cost BLO-17758 a run,
     /// with the sign flipped.
     ///
-    /// Array-only, matching `MulticastConfig::network_source`; see the note
-    /// there for why the draft's bare-object form is deliberately not accepted.
+    /// Array-only, matching both the draft and `MulticastConfig::network_source`.
     ///
     /// libmmt's `$defs/endpoint` is `additionalProperties: false` without
     /// `networkSource`, so it rejects an endpoint carrying one. Accepting it
@@ -145,21 +147,23 @@ pub struct MulticastEndpoint {
 pub struct MulticastConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Vec<MulticastEndpoint>>,
-    /// Network delivery configuration applying to all endpoints (§4.1, §4.2).
+    /// Network delivery configuration applying to all endpoints. `(array of
+    /// objects, OPTIONAL)` per draft-ramadan-moq-multicast-00 §4.1; §4.2 adds
+    /// that "a single source is expressed as a one-element array."
     ///
-    /// The draft types this "object or array" and every example in §4.1,
-    /// §4.2.1 and §4.2.2 uses the bare object. This is array-only on purpose:
-    /// libmmt — the actual producer — pins it to an array of objects, and the
-    /// object form is held as a byte-identical libmmt mirror in the golden
-    /// negative fixture `network-source-object` (`Reject::Parse`). This is the
-    /// one place `multicast.rs` is knowingly stricter than the draft section
-    /// it implements; widening it is a cross-repo schema decision, not a
-    /// local one. Tracked on BLO-41985.
+    /// Array-only here agrees with both authorities: libmmt pins an array, and
+    /// the draft has typed this an array since the 2026-10-05 sync
+    /// (moqcast-draft `9088406f`). The bare-object form earlier drafts allowed
+    /// is held as a byte-identical libmmt mirror in the golden negative fixture
+    /// `network-source-object` (`Reject::Parse`). Tracked on BLO-41985.
     #[serde(rename = "networkSource", skip_serializing_if = "Option::is_none")]
     pub network_source: Option<Vec<NetworkSource>>,
     /// Multicast content-authentication block, OPTIONAL per
-    /// draft-ramadan-moq-multicast-00 §7.2, which nests it inside `multicast`:
-    /// `{"multicast": {"auth": {"scheme": "signed_mmt_message"}, ...}}`.
+    /// draft-ramadan-moq-multicast-00, which lists it among the `multicast`
+    /// object's members in §4.1 — "**auth** (object, OPTIONAL): Content
+    /// authentication configuration for the bc-provenance profile; see
+    /// Section 7.2" — i.e. nested inside `multicast`:
+    /// `{"multicast": {"auth": {"scheme": "bc-provenance"}, ...}}`.
     ///
     /// Distinct from `Root::multicast_auth`, which is the *literal dotted root
     /// key* `"multicast.auth"` sitting beside `multicast` — libmmt's shape, and
@@ -365,12 +369,12 @@ mod tests {
     /// rejected it.
     #[test]
     fn nested_multicast_auth_parses_and_round_trips() {
-        let json = r#"{"endpoints":[{"groupAddress":"232.1.1.60","port":8000,"tracks":[{"name":"video","packetId":1}]}],"auth":{"scheme":"signed_mmt_message"}}"#;
+        let json = r#"{"endpoints":[{"groupAddress":"232.1.1.60","port":8000,"tracks":[{"name":"video","packetId":1}]}],"auth":{"scheme":"bc-provenance"}}"#;
         let cfg: MulticastConfig =
             serde_json::from_str(json).expect("nested multicast.auth must parse");
         assert_eq!(
             cfg.auth,
-            Some(serde_json::json!({"scheme": "signed_mmt_message"})),
+            Some(serde_json::json!({"scheme": "bc-provenance"})),
             "auth block must survive parse intact"
         );
         assert_eq!(
@@ -393,18 +397,19 @@ mod tests {
         );
     }
 
-    /// The draft types `networkSource` as "object or array" (§4.1) and every
-    /// example in §4.1/§4.2.1/§4.2.2 uses the bare object, but libmmt pins it
-    /// to an array and the golden negative fixture `network-source-object`
-    /// mirrors that byte-for-byte. This pins the *known, deliberate*
-    /// divergence so widening it later is an explicit cross-repo decision
-    /// rather than an accident. See BLO-41985.
+    /// The bare-object `networkSource` form that drafts before the 2026-10-05
+    /// sync allowed. Both authorities now reject it: libmmt pins an array and
+    /// the current draft types it "array of objects" (§4.1, §4.2). The golden
+    /// negative fixture `network-source-object` mirrors libmmt's rejection
+    /// byte-for-byte; this pins the parse side so a future widening has to be
+    /// an explicit cross-repo decision rather than an accident. See BLO-41985.
     #[test]
     fn object_form_network_source_is_deliberately_rejected() {
         let json = r#"{"endpoints":[],"networkSource":{"type":"amt","relay":"69.25.95.128"}}"#;
         assert!(
             serde_json::from_str::<MulticastConfig>(json).is_err(),
-            "object-form networkSource stays rejected while libmmt pins an array"
+            "object-form networkSource stays rejected: both libmmt and the \
+             current draft type it as an array"
         );
     }
 }
