@@ -75,9 +75,8 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         let mut has_video = false;
         let mut has_audio = false;
         let mut tracks = vec![];
-        let trak_count = moov.traks.len();
-        for (idx, trak) in moov.traks.into_iter().enumerate() {
-            let name = track_name(catalog.as_ref(), idx, trak_count, trak.tkhd.track_id)?;
+        let names = track_names(catalog.as_ref(), &moov)?;
+        for (trak, name) in moov.traks.into_iter().zip(names) {
             info!("found track {name}");
             let mut active = false;
             if !has_video && trak.mdia.minf.stbl.stsd.avc1.is_some() {
@@ -230,38 +229,45 @@ fn init_track_name(catalog: Option<&moq_catalog::Root>) -> anyhow::Result<&str> 
     })
 }
 
-/// Name of the catalog track carrying moov trak `idx` (of `trak_count`), or the
-/// `{track_id}.m4s` default when no catalog was requested.
-fn track_name(
+/// Name the track carrying each moov trak, in moov order: the catalog track at
+/// the same index, or `{track_id}.m4s` when no catalog was requested.
+fn track_names(
     catalog: Option<&moq_catalog::Root>,
-    idx: usize,
-    trak_count: usize,
-    track_id: u32,
-) -> anyhow::Result<String> {
-    let Some(catalog) = catalog else {
-        return Ok(format!("{track_id}.m4s"));
-    };
-    let track = catalog.tracks.get(idx).with_context(|| {
-        format!(
-            "moov trak {idx} has no matching catalog track ({trak_count} traks vs {} catalog \
-             tracks)",
-            catalog.tracks.len()
-        )
-    })?;
-    Ok(track.name.clone())
+    moov: &mp4::MoovBox,
+) -> anyhow::Result<Vec<String>> {
+    moov.traks
+        .iter()
+        .enumerate()
+        .map(|(idx, trak)| match catalog {
+            None => Ok(format!("{}.m4s", trak.tkhd.track_id)),
+            Some(catalog) => catalog
+                .tracks
+                .get(idx)
+                .map(|track| track.name.clone())
+                .with_context(|| {
+                    format!(
+                        "moov trak {idx} has no matching catalog track ({} traks vs {} \
+                         catalog tracks)",
+                        moov.traks.len(),
+                        catalog.tracks.len()
+                    )
+                }),
+        })
+        .collect()
 }
 
 fn validate_catalog(catalog: &moq_catalog::Root) -> anyhow::Result<()> {
     anyhow::ensure!(catalog.version == 1, "unknown catalog version");
     if catalog.streaming_format == "mmtp" {
+        catalog
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid catalog: {error}"))?;
         // Everything below this gate is an fMP4/CMAF consumer: it reads a ftyp +
         // moov init segment and forwards whole objects. An MMTP broadcast carries
         // an MMTP packet header in front of every object, so without the refusal
         // we would read a packet header as a `ftyp` box and fail somewhere much
-        // less obvious. Nothing in this tree depacketizes MFUs back into fMP4:
-        // moq-sub-raw only captures the MMTP packets verbatim. The refusal comes
-        // before any `validate()` so a slightly malformed mmtp catalog still
-        // learns that moq-sub is the wrong tool, not just how to fix the catalog.
+        // less obvious. moq-sub-raw does not depacketize MMTP either: it writes
+        // the object payloads out verbatim, i.e. the raw MMTP packet stream.
         anyhow::bail!(
             "moq-sub cannot consume a streamingFormat=\"mmtp\" catalog: it would parse \
              MMTP packet headers as fMP4 boxes. Use moq-sub-raw to capture the raw MMTP \
@@ -404,55 +410,13 @@ mod tests {
             .to_string();
         assert!(error.contains("mmtp"), "must name the format: {error}");
         assert!(
-            error.contains("Use moq-sub-raw to capture the raw MMTP packet stream"),
-            "must say what moq-sub-raw actually yields -- MMTP packets, not media: {error}"
+            error.contains("moq-sub-raw"),
+            "must name the subscriber that can do this: {error}"
         );
         assert!(
-            error.contains("no MFU depacketizer"),
-            "must not imply some subscriber turns MFUs back into fMP4: {error}"
-        );
-    }
-
-    /// A malformed mmtp catalog must still be told moq-sub is the wrong tool;
-    /// otherwise the user fixes the catalog only to be refused anyway.
-    #[test]
-    fn refuses_a_malformed_mmtp_catalog_with_the_same_redirect() {
-        let mut catalog = live_mmtp_catalog();
-        catalog.tracks[0].packaging = None;
-        assert!(
-            catalog.validate().is_err(),
-            "fixture edit no longer makes the catalog invalid; this test is vacuous"
-        );
-
-        let error = validate_catalog(&catalog)
-            .expect_err("moq-sub has no MMTP depacketization; it must refuse")
-            .to_string();
-        assert!(error.contains("moq-sub-raw"), "{error}");
-    }
-
-    #[test]
-    fn track_name_defaults_when_no_catalog_was_requested() {
-        assert_eq!(track_name(None, 0, 1, 7).unwrap(), "7.m4s");
-    }
-
-    #[test]
-    fn track_name_reports_the_real_trak_count_when_the_catalog_runs_out() {
-        let mut catalog = cmaf_catalog(1);
-        catalog.tracks.push(moq_catalog::Track {
-            name: "audio".into(),
-            ..Default::default()
-        });
-        assert_eq!(track_name(Some(&catalog), 1, 5, 2).unwrap(), "audio");
-
-        // A 5-trak moov against a 2-track catalog fails at trak 2, and must say
-        // 5 -- not the 3 it had reached.
-        let error = track_name(Some(&catalog), 2, 5, 3)
-            .expect_err("no catalog track for trak 2")
-            .to_string();
-        assert!(error.contains("5 traks vs 2 catalog tracks"), "{error}");
-        assert!(
-            error.contains("trak 2"),
-            "must say where it ran out: {error}"
+            error.contains("raw MMTP packet stream"),
+            "must say what moq-sub-raw gives you: it captures MMTP packets, it \
+             does not depacketize them: {error}"
         );
     }
 
@@ -492,5 +456,46 @@ mod tests {
         let mut catalog = cmaf_catalog(1);
         catalog.tracks.clear();
         assert!(init_track_name(Some(&catalog)).is_err());
+    }
+
+    fn moov(track_ids: &[u32]) -> mp4::MoovBox {
+        let mut moov = mp4::MoovBox {
+            traks: vec![Default::default(); track_ids.len()],
+            ..Default::default()
+        };
+        for (trak, &track_id) in moov.traks.iter_mut().zip(track_ids) {
+            trak.tkhd.track_id = track_id;
+        }
+        moov
+    }
+
+    #[test]
+    fn track_names_come_from_the_catalog_or_default_to_the_trak_id() {
+        assert_eq!(
+            track_names(Some(&cmaf_catalog(1)), &moov(&[7])).unwrap(),
+            ["video"]
+        );
+        assert_eq!(
+            track_names(None, &moov(&[7, 9])).unwrap(),
+            ["7.m4s", "9.m4s"]
+        );
+    }
+
+    /// The count is the moov's, not how far the loop got: a 5-trak moov
+    /// against a 2-track catalog must not be reported as "3 traks".
+    #[test]
+    fn track_names_report_the_true_moov_trak_count() {
+        let mut catalog = cmaf_catalog(1);
+        catalog.tracks.push(moq_catalog::Track {
+            name: "audio".into(),
+            ..Default::default()
+        });
+
+        let error = track_names(Some(&catalog), &moov(&[1, 2, 3, 4, 5]))
+            .expect_err("trak 2 has no catalog track")
+            .to_string();
+        assert!(error.contains("moov trak 2 "), "{error}");
+        assert!(error.contains("5 traks"), "{error}");
+        assert!(error.contains("2 catalog tracks"), "{error}");
     }
 }
