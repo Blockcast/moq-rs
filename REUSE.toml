@@ -61,6 +61,7 @@ path = [
   "moq-sub-raw/**",
   "moq-catalog/src/multicast.rs",
   "moq-catalog/tests/**",
+  "moq-sub/tests/fixtures/nasa-iss-a-mmtp-catalog.json",
   "moq-transport/tests/fixtures/moqt-16-v1.json",
 ]
 precedence = "closest"
