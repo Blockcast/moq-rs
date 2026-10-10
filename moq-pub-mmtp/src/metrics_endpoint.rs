@@ -16,7 +16,29 @@
 //
 // | Name | Description |
 // |------|-------------|
-// | `moq_pub_mmtp_dropped_datagrams_total` | Datagrams dropped by the publisher-side ring buffer (ring-superseded by a lagging subscriber, or over-MTU payloads skipped) — see moq-transport/src/session/subscribed.rs |
+// | `moq_pub_mmtp_dropped_datagrams_total{reason}` | Datagrams dropped by the publisher-side ring buffer. `reason="ring_superseded"` (lagging subscriber) or `reason="over_mtu"` (above the live QUIC datagram limit) — distinct causes with distinct remedies, so they are not summed. A bare selector on this metric returns TWO series (one per reason), deliberately: single-value panels and scalar threshold comparisons must aggregate (`sum without(reason)`) or pick a reason. See moq-transport/src/session/subscribed.rs |
+// | `moq_pub_mmtp_sent_datagrams_total` | Datagrams successfully sent. The denominator for the loss fraction below |
+//
+// Loss fraction. `sent` carries no `reason` label, so the drop side must
+// aggregate it away first — PromQL matches binary operands on the full label
+// set, and a bare `rate(dropped) / (rate(dropped) + rate(sent))` matches no
+// pairs and returns an EMPTY vector:
+//
+//   sum without(reason) (rate(moq_pub_mmtp_dropped_datagrams_total[5m]))
+//     / (sum without(reason) (rate(moq_pub_mmtp_dropped_datagrams_total[5m]))
+//        + rate(moq_pub_mmtp_sent_datagrams_total[5m]))
+//
+// Per-reason fraction (same denominator, one series per reason). The empty
+// `()` after `group_left` is required: without it the parser takes the next
+// `(` as group_left's label list and rejects the query.
+//
+//   rate(moq_pub_mmtp_dropped_datagrams_total[5m])
+//     / ignoring(reason) group_left()
+//       (sum without(reason) (rate(moq_pub_mmtp_dropped_datagrams_total[5m]))
+//        + rate(moq_pub_mmtp_sent_datagrams_total[5m]))
+//
+// All three series are materialized at zero on startup, so an absent series
+// means the exporter is down — never "no loss" (BLO-41602).
 
 /// Register metric descriptions (Prometheus `# HELP` text).
 ///
@@ -38,11 +60,34 @@
 /// `metrics-exporter-prometheus` is optional, so `describe_counter!` compiles
 /// either way and is a no-op against the facade when no recorder is installed.
 pub fn describe_metrics() {
+    use moq_transport::session::{
+        DROPPED_DATAGRAMS_METRIC, DROP_REASON_OVER_MTU, DROP_REASON_RING_SUPERSEDED,
+        SENT_DATAGRAMS_METRIC,
+    };
+
     metrics::describe_counter!(
-        "moq_pub_mmtp_dropped_datagrams_total",
-        "Datagrams dropped by the publisher-side ring buffer: ring-superseded \
-         (lagging subscriber) or over-MTU payloads skipped"
+        DROPPED_DATAGRAMS_METRIC,
+        "Datagrams dropped by the publisher-side ring buffer, by `reason`: \
+         ring_superseded (lagging subscriber) or over_mtu (payload above the \
+         live QUIC datagram limit)"
     );
+    metrics::describe_counter!(
+        SENT_DATAGRAMS_METRIC,
+        "Datagrams successfully sent to the subscriber. Denominator for the \
+         drop counters: a drop rate alone cannot distinguish a lossy path from \
+         a busy one"
+    );
+
+    // Materialize all three series at zero (BLO-41602). Without this a process
+    // that has never dropped a datagram exports no drop series at all, and
+    // PromQL cannot tell "loss-free" from "publishing nothing" — measured
+    // 2026-10-08, staging-blockcastd scraped up=1 with no drop series while
+    // production carried 132M, and neither reading was interpretable.
+    // `increment(0)` registers without perturbing the value.
+    metrics::counter!(DROPPED_DATAGRAMS_METRIC, "reason" => DROP_REASON_RING_SUPERSEDED)
+        .increment(0);
+    metrics::counter!(DROPPED_DATAGRAMS_METRIC, "reason" => DROP_REASON_OVER_MTU).increment(0);
+    metrics::counter!(SENT_DATAGRAMS_METRIC).increment(0);
 }
 
 /// Install the Prometheus exporter iff `MOQ_PUB_METRICS_ADDR` is set. No-op
@@ -60,11 +105,13 @@ pub fn spawn_if_enabled() -> Option<std::net::SocketAddr> {
         return None;
     };
 
-    // Registered whenever an exporter address is configured, independent of
-    // whether the metrics-prometheus feature was compiled in: describe_counter!
-    // is a no-op against the facade when no recorder is installed, and calling
-    // it here (rather than only from the feature-gated install-success arm
-    // below) keeps this function reachable under every feature combination.
+    // Called whenever an exporter address is configured, independent of
+    // whether the metrics-prometheus feature was compiled in, so this function
+    // stays reachable under every feature combination. It registers NOTHING
+    // here: `metrics` resolves `counter!`/`describe_counter!` against the
+    // global recorder at call time, which is still the NoopRecorder until
+    // `install()` below runs, and there is no replay. The registration that
+    // actually lands is the second call in the install-success arm.
     describe_metrics();
 
     #[cfg(feature = "metrics-prometheus")]
@@ -77,6 +124,13 @@ pub fn spawn_if_enabled() -> Option<std::net::SocketAddr> {
                     .install()
                 {
                     Ok(()) => {
+                        // Must follow install(): before it the series were
+                        // discarded by the NoopRecorder, which on this (the
+                        // production) path left an absent drop series meaning
+                        // "loss-free or not publishing" (BLO-41602). Idempotent
+                        // with the pre-install call above. Mirrors the flag
+                        // path in install_flag_exporter_if_needed.
+                        describe_metrics();
                         tracing::info!(
                             addr = %socket_addr,
                             "metrics exporter listening on http://{socket_addr}/metrics"
@@ -208,5 +262,108 @@ mod tests {
     async fn none_flag_addr_is_a_no_op() {
         install_flag_exporter_if_needed(None, Some("127.0.0.1:0".parse().unwrap()));
         install_flag_exporter_if_needed(None, None);
+    }
+
+    /// BLO-41602: the whole point of materializing at zero is that a
+    /// loss-free publisher still EXPORTS the drop series, so PromQL can tell
+    /// "no loss" from "not running". That rests entirely on `increment(0)`
+    /// producing a rendered line — assert it against the real Prometheus
+    /// renderer rather than assuming it.
+    #[test]
+    fn describe_metrics_materializes_every_series_at_zero() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, describe_metrics);
+
+        let rendered = handle.render();
+        for expected in [
+            "moq_pub_mmtp_dropped_datagrams_total{reason=\"ring_superseded\"} 0",
+            "moq_pub_mmtp_dropped_datagrams_total{reason=\"over_mtu\"} 0",
+            "moq_pub_mmtp_sent_datagrams_total 0",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} in rendered exposition:\n{rendered}"
+            );
+        }
+    }
+
+    const ENV_CHILD_MARKER: &str = "MOQ_PUB_METRICS_ENV_ACTIVATION_CHILD";
+    const ENV_CHILD_PASSED: &str = "ENV_ACTIVATION_CHILD_PASSED";
+
+    /// BLO-41602: `describe_metrics_materializes_every_series_at_zero` installs
+    /// a recorder and THEN describes, the inverse of the production sequence,
+    /// so it cannot see a registration that runs before `install()`. This
+    /// drives the real `MOQ_PUB_METRICS_ADDR` path (`spawn_if_enabled`) and
+    /// scrapes the live exporter. The global recorder is install-once per
+    /// process and other tests in this binary claim it, so the scenario runs
+    /// in a fresh child process (`env_activation_child`).
+    #[test]
+    fn env_activation_materializes_every_series_at_zero() {
+        // ponytail: free port picked then released before the child binds it;
+        // a collision fails loudly (install Err -> expect in the child).
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "metrics_endpoint::tests::env_activation_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MOQ_PUB_METRICS_ADDR", format!("127.0.0.1:{port}"))
+            .env(ENV_CHILD_MARKER, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The sentinel guards against a filter that matched no test, which
+        // the harness reports as a successful run.
+        assert!(
+            out.status.success() && stdout.contains(ENV_CHILD_PASSED),
+            "env-activation child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "child process of env_activation_materializes_every_series_at_zero"]
+    async fn env_activation_child() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if std::env::var_os(ENV_CHILD_MARKER).is_none() {
+            return;
+        }
+        let addr = spawn_if_enabled().expect("exporter must install in a fresh process");
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        // A hung scrape must fail the test, not stall CI to the job limit.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("scrape timed out")
+        .unwrap();
+
+        for expected in [
+            "moq_pub_mmtp_dropped_datagrams_total{reason=\"ring_superseded\"} 0",
+            "moq_pub_mmtp_dropped_datagrams_total{reason=\"over_mtu\"} 0",
+            "moq_pub_mmtp_sent_datagrams_total 0",
+        ] {
+            assert!(
+                response.contains(expected),
+                "missing {expected:?} in scraped exposition:\n{response}"
+            );
+        }
+        println!("{ENV_CHILD_PASSED}");
     }
 }

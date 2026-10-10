@@ -38,6 +38,19 @@ jobs:
 
       # Make sure u guys don't write bad code
       - run: cargo test --verbose
+      # The metrics_endpoint tests are cfg(feature = "metrics-prometheus"),
+      # which the default-feature run above never compiles; the shipped image
+      # builds with it (Dockerfile), so test what ships (BLO-41602).
+      # A name filter that matches nothing exits 0 ("0 passed; N filtered
+      # out"), so renaming the module would silently turn this step into a
+      # no-op. Require at least one test to have run. (cargo 1.96, pinned in
+      # rust-toolchain.toml, has no `cargo test --no-tests=fail`.)
+      - name: Test metrics_endpoint (fail on empty selection)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p moq-pub-mmtp --features metrics-prometheus metrics_endpoint | tee "$RUNNER_TEMP/metrics-endpoint-tests.log"
+          grep -qE 'test result: ok\. [1-9]' "$RUNNER_TEMP/metrics-endpoint-tests.log"
       - name: Verify production shred datagram delivery
         run: |
           cargo build -p moq-relay-ietf -p moq-pub-mmtp -p moq-sub-raw
