@@ -8,6 +8,7 @@
 //! unified SETUP message. Version negotiation is handled entirely by ALPN.
 
 mod param_types;
+#[allow(clippy::module_inception)]
 mod setup;
 mod version;
 
@@ -38,7 +39,7 @@ pub const SUPPORTED_ALPNS: &[&str] = &[
 /// Prefer [`DraftVersion::Draft18`]`.alpn_bytes()` in new code; this constant will be
 /// removed in a future cleanup once all call sites are updated.
 #[deprecated(
-    since = "0.0.0",
+    since = "0.16.0",
     note = "Use `DraftVersion::Draft18.alpn_bytes()` instead."
 )]
 pub const ALPN: &[u8] = DraftVersion::Draft18.alpn_bytes();
@@ -51,8 +52,9 @@ pub const ALPN: &[u8] = DraftVersion::Draft18.alpn_bytes();
 pub fn negotiate_version(offered: &[impl AsRef<str>]) -> Option<DraftVersion> {
     SUPPORTED_ALPNS
         .iter()
-        .find(|ours| offered.iter().any(|theirs| theirs.as_ref() == **ours))
-        .and_then(|alpn| DraftVersion::from_alpn(alpn))
+        .copied()
+        .find(|ours| offered.iter().any(|theirs| theirs.as_ref() == *ours))
+        .and_then(DraftVersion::from_alpn)
 }
 
 #[cfg(test)]
@@ -66,8 +68,8 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_picks_our_preference() {
-        // Server prefers draft-18 (first in SUPPORTED_ALPNS); d16 is not supported.
+    fn negotiate_skips_unsupported() {
+        // moqt-16 is not in SUPPORTED_ALPNS; moqt-18 is selected as the only match.
         let offered = vec!["moqt-16".to_string(), "moqt-18".to_string()];
         assert_eq!(negotiate_version(&offered), Some(DraftVersion::Draft18));
     }

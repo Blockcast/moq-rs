@@ -176,8 +176,10 @@ impl DraftVersion {
 
     /// Convert an ALPN string to the matching `DraftVersion`.
     ///
-    /// Returns `None` for unknown strings. Callers should reject connections
-    /// with unknown ALPNs rather than falling back to any default version.
+    /// Returns `None` for unrecognized strings. Known-but-gated variants
+    /// (e.g. `Draft20`, `Draft22`) return `Some` even if not yet in
+    /// [`SUPPORTED_ALPNS`][crate::setup::SUPPORTED_ALPNS]. For
+    /// connection-time version gating use [`negotiate_version`][crate::setup::negotiate_version].
     pub fn from_alpn(s: &str) -> Option<Self> {
         match s {
             "moqt-18" => Some(Self::Draft18),
