@@ -4,8 +4,10 @@
 //! Explicit MOQT wire profiles.
 //!
 //! A profile may only be selected through exact transport negotiation. Native
-//! QUIC uses the profile name as its ALPN while WebTransport carries the same
-//! value in WT-Available-Protocols / WT-Protocol.
+//! QUIC carries [`WireProfile::name`] as its ALPN; WebTransport carries
+//! [`WireProfile::webtransport_protocol`] in WT-Available-Protocols /
+//! WT-Protocol. The two coincide for `Draft19` and `Blockcast01` and diverge
+//! for `Draft16` (ALPN `moqt-16`, WebTransport `moqt-wt-16`) under ROOT-13.
 
 pub mod draft19;
 
@@ -59,7 +61,8 @@ impl WireProfile {
     ///
     /// Readers accept it; writers never offer it. Delete at ROOT-13 cutover
     /// step 5, once the strict reader is proven (see
-    /// `docs/g0/root-13-subprotocol-token-matrix.md`).
+    /// `docs/g0/root-13-subprotocol-token-matrix.md` in the
+    /// `Blockcast/pim-multicast-gateway` repo).
     const fn legacy_webtransport_protocol(self) -> Option<&'static str> {
         match self {
             Self::Draft16 => Some("moqt-16"),
