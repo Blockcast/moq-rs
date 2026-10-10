@@ -576,6 +576,49 @@ impl Root {
         Ok(())
     }
 
+    fn validate_network_sources(
+        network_sources: &[NetworkSource],
+    ) -> Result<(), CatalogValidationError> {
+        if network_sources.is_empty() {
+            return Err(CatalogValidationError::InvalidMulticast(
+                "networkSource must not be empty when present",
+            ));
+        }
+        for source in network_sources {
+            match source {
+                NetworkSource::Amt { relay, port, .. } => {
+                    if relay.as_deref() == Some("") || matches!(port, Some(0)) {
+                        return Err(CatalogValidationError::InvalidMulticast(
+                            "AMT relay must be nonempty and port must be positive",
+                        ));
+                    }
+                }
+                NetworkSource::Atsc3 {
+                    frequency,
+                    plp_id,
+                    sls_uri,
+                    ..
+                } => {
+                    // plpId and slsUri are OPTIONAL per §4.2.2. An absent plpId
+                    // means the base PLP (0), which is in range; an absent
+                    // slsUri has no URI to reject. Only a *present* value is
+                    // checked, so omission cannot fail validation.
+                    if *frequency == 0
+                        || plp_id.unwrap_or(0) > 63
+                        || sls_uri
+                            .as_deref()
+                            .is_some_and(|uri| url::Url::parse(uri).is_err())
+                    {
+                        return Err(CatalogValidationError::InvalidMulticast(
+                            "invalid ATSC3 frequency, plpId, or slsUri",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_multicast(
         &self,
         multicast: &MulticastConfig,
@@ -588,36 +631,15 @@ impl Root {
                 "endpoints must not be empty",
             ))?;
         if let Some(network_sources) = &multicast.network_source {
-            if network_sources.is_empty() {
-                return Err(CatalogValidationError::InvalidMulticast(
-                    "networkSource must not be empty when present",
-                ));
-            }
-            for source in network_sources {
-                match source {
-                    NetworkSource::Amt { relay, port, .. } => {
-                        if relay.as_deref() == Some("") || matches!(port, Some(0)) {
-                            return Err(CatalogValidationError::InvalidMulticast(
-                                "AMT relay must be nonempty and port must be positive",
-                            ));
-                        }
-                    }
-                    NetworkSource::Atsc3 {
-                        frequency,
-                        plp_id,
-                        sls_uri,
-                        ..
-                    } => {
-                        if *frequency == 0 || *plp_id > 63 || url::Url::parse(sls_uri).is_err() {
-                            return Err(CatalogValidationError::InvalidMulticast(
-                                "invalid ATSC3 frequency, plpId, or slsUri",
-                            ));
-                        }
-                    }
-                }
-            }
+            Self::validate_network_sources(network_sources)?;
         }
         for endpoint in endpoints {
+            // §4.1 allows networkSource per endpoint as well as at the
+            // `multicast` level; an invalid source must not slip through
+            // merely because of where the publisher put it.
+            if let Some(network_sources) = &endpoint.network_source {
+                Self::validate_network_sources(network_sources)?;
+            }
             if endpoint.group_address.is_empty() || endpoint.port == 0 || endpoint.tracks.is_empty()
             {
                 return Err(CatalogValidationError::InvalidMulticast(
@@ -741,6 +763,41 @@ mod tests {
             "tracks":[{"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000}],
             "multicast":{"endpoints":[{"sourceAddress":"192.0.2.1","groupAddress":"232.1.1.1","port":5000,"tracks":[{"name":"v","packetId":1}]}]}
         }"#,
+        );
+    }
+
+    /// BLO-41985: a minimal ATSC 3.0 source carrying only the one REQUIRED
+    /// field (§4.2.2) must both parse and validate — an absent `plpId` reads
+    /// as the base PLP 0 and an absent `slsUri` has no URI to reject.
+    #[test]
+    fn multicast_atsc3_validates_with_only_frequency() {
+        parse_and_validate(
+            r#"{
+            "version":1,"streamingFormat":"mmtp","streamingFormatVersion":"x",
+            "tracks":[{"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000}],
+            "multicast":{"endpoints":[{"sourceAddress":"192.0.2.1","groupAddress":"232.1.1.1","port":5000,"tracks":[{"name":"v","packetId":1}]}],"networkSource":[{"type":"atsc3","frequency":533000000}]}
+        }"#,
+        );
+    }
+
+    /// BLO-41985: §4.1 lets `networkSource` sit on an endpoint instead of on
+    /// `multicast`. Validation must reach it there too — otherwise the same
+    /// malformed source passes or fails purely on where the publisher put it.
+    #[test]
+    fn multicast_endpoint_level_network_source_is_validated() {
+        let json = r#"{
+            "version":1,"streamingFormat":"mmtp","streamingFormatVersion":"x",
+            "tracks":[{"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000}],
+            "multicast":{"endpoints":[{"sourceAddress":"192.0.2.1","groupAddress":"232.1.1.1","port":5000,"tracks":[{"name":"v","packetId":1}],"networkSource":[{"type":"amt","relay":""}]}]}
+        }"#;
+        // Parses fine: the empty relay is a validation concern, not a schema one.
+        let root: Root = serde_json::from_str(json).expect("endpoint networkSource must parse");
+        let err = root
+            .validate()
+            .expect_err("empty AMT relay on an endpoint-level source must be rejected");
+        assert!(
+            err.to_string().contains("AMT relay must be nonempty"),
+            "unexpected error: {err}"
         );
     }
 }
