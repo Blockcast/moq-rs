@@ -15,3 +15,9 @@ The specification allows a `both` role but you'll get an error.
 
 You can have one publisher and any number of subscribers connected to the same path.
 If the publisher disconnects, then all subscribers receive an error and will not get updates, even if a new publisher reuses the path.
+
+## Authorization
+
+Per-scope bearer-token authorization is configured via `ScopeConfig.auth`. When a scope has an auth policy, every accepted client session must present a valid token in the SETUP AUTHORIZATION TOKEN option (draft-ietf-moq-transport-18 §10.3.1.4), and the session is closed with UNAUTHORIZED otherwise. Scopes without a policy are unaffected. Known gap: relay-to-relay `--announce` forward links are relay-initiated and currently do not present a token; they emit a warning when connecting to an auth-enabled scope.
+
+The enforcement model and fail-closed contract are documented in `src/auth/mod.rs`.

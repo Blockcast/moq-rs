@@ -22,7 +22,7 @@
 //! |------|--------|-------------|
 //! | `moq_relay_connections_total` | - | Total incoming connections accepted |
 //! | `moq_relay_connections_closed_total` | - | Total connections that have closed (graceful or error) |
-//! | `moq_relay_connection_errors_total` | `stage` | Connection failures (stage: session_accept, session_run) |
+//! | `moq_relay_connection_errors_total` | `stage` | Connection failures (stage: session_accept, scope_resolve, auth_setup, session_run) |
 //! | `moq_relay_publishers_total` | - | Total publishers (PUBLISH_NAMESPACE requests) received |
 //! | `moq_relay_announce_ok_total` | `kind` | Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE (kind: client, proxied) |
 //! | `moq_relay_announce_errors_total` | `phase` | PUBLISH_NAMESPACE failures (phase: local_register, remote_register, coordinator_register, coordinator_lookup, send_ok, forward, peer_fanout) |
@@ -37,6 +37,8 @@
 //! | `moq_relay_cache_idle_evictions_total` | `source` | Unwatched cache entries evicted, releasing an upstream subscription (source: local, remote) |
 //! | `moq_relay_change_channel_lagged_total` | `channel` | Change notifications skipped by a lagging receiver, forcing a resync (channel: namespace, track) |
 //! | `moq_relay_lease_registry_lock_poisoned_total` | `operation` | Upstream namespace lease registry lock found poisoned (operation: acquire, release) |
+//! | `moq_relay_auth_denied_total` | `phase`, `operation`, `reason` | Operations refused by authorization. `phase`: setup, request. `operation`: client_setup, publish_namespace, publish, subscribe, subscribe_namespace, track_status, fetch. `reason`: token_missing, token_invalid, token_expired, token_replayed, token_malformed, scope_mismatch, issuer_unknown, policy_denied, hook_fault, alias_in_setup, too_many_tokens |
+//! | `moq_relay_auth_errors_total` | `stage` | Authorization could not reach a verdict (stage: scope_config, setup, request). Distinct from `auth_denied_total`: these indicate a relay or configuration fault, not a rejected peer, and are the ones worth alerting on |
 //!
 //! ## Gauges
 //!
@@ -78,7 +80,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_connection_errors_total",
-        "Connection failures by stage (session_accept, session_run)"
+        "Connection failures by stage (session_accept, scope_resolve, auth_setup, session_run)"
     );
     describe_counter!(
         "moq_relay_publishers_total",
@@ -146,6 +148,15 @@ pub fn describe_metrics() {
     describe_counter!(
         "moq_relay_lease_registry_lock_poisoned_total",
         "Upstream namespace lease registry lock found poisoned by operation (acquire, release)"
+    );
+    describe_counter!(
+        "moq_relay_auth_denied_total",
+        "Operations denied by authorization, by phase (setup, request), operation, and reason"
+    );
+    describe_counter!(
+        "moq_relay_auth_errors_total",
+        "Authorization failures that prevented a verdict being reached, by stage (scope_config, setup, request). \
+         Distinct from moq_relay_auth_denied_total: these indicate a relay or configuration fault, not a rejected peer"
     );
 
     // Gauges

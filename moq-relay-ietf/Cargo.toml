@@ -28,6 +28,11 @@ moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
 moq-api = { path = "../moq-api", version = "0.2" }
 web-transport = { workspace = true }
 
+# Bearer tokens are held in a type that zeroizes on drop and redacts under
+# Debug. Not optional: the enforcement points compile without `auth-cat`, so
+# the type that carries the credential has to as well.
+secrecy = "0.10"
+
 # QUIC
 url = "2"
 

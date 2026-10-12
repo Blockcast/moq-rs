@@ -17,13 +17,14 @@ use moq_transport::{
 };
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 
+use crate::auth::SessionAuth;
 use crate::{
     local::MAX_CONCURRENT_RENDEZVOUS_HOLDS,
     metrics::{GaugeGuard, TimingGuard},
     remote::RemoteSubscribeError,
     upstream_namespaces::UpstreamNamespaces,
-    Coordinator, Locals, NamespaceChange, PublishedTrackChange, RemoteManager, SessionContext,
-    TrackChange, TrackSnapshot, UpstreamReady,
+    Locals, NamespaceChange, PublishedTrackChange, RemoteManager, SessionContext, TrackChange,
+    TrackSnapshot, UpstreamReady,
 };
 
 /// Ceiling on how long a SUBSCRIBE is held waiting for a publisher to appear.
@@ -199,6 +200,10 @@ pub struct Producer {
     rendezvous_hold_permits: Arc<Semaphore>,
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+    /// Authorization state for this session. `None` when the scope has no
+    /// authorization policy, in which case every request is permitted.
+    #[allow(dead_code)] // Read by the request gates.
+    auth: Option<SessionAuth>,
     /// Shared only by SUBSCRIBE_TRACKS requests on this transport session. Its
     /// bound must match the child-task channel capacity in [`Self::run`].
     subscribe_tracks_session_child_permits: Arc<Semaphore>,
@@ -226,25 +231,25 @@ enum UpstreamWait {
 }
 
 impl Producer {
-    pub fn new(
-        publisher: Publisher,
-        locals: Locals,
-        remotes: RemoteManager,
-        coordinator: Arc<dyn Coordinator>,
-        context: SessionContext,
-    ) -> Self {
-        let (upstream_namespaces, runner) =
-            UpstreamNamespaces::new(locals.clone(), remotes.clone(), coordinator);
-        tokio::spawn(runner.run());
-        Self::new_with_upstream_namespaces(publisher, locals, remotes, upstream_namespaces, context)
-    }
-
+    /// Create a producer for a session.
+    ///
+    /// `auth` is the session's authorization state, and is deliberately a
+    /// required argument rather than something attached afterwards: a producer
+    /// with no authorization serves every request, so forgetting to supply it
+    /// must be a compile error rather than a silent grant. `None` states that
+    /// the session needs no authorization — its scope has no policy, or the
+    /// relay dialled the peer itself.
+    ///
+    /// **Breaking change:** the old `Producer::new` public convenience
+    /// constructor has been removed because it could only produce an
+    /// unauthenticated producer, matching the draft-16 relay.
     pub(crate) fn new_with_upstream_namespaces(
         publisher: Publisher,
         locals: Locals,
         remotes: RemoteManager,
         upstream_namespaces: UpstreamNamespaces,
         context: SessionContext,
+        auth: Option<SessionAuth>,
     ) -> Self {
         Self {
             publisher,
@@ -255,6 +260,7 @@ impl Producer {
                 MAX_CONCURRENT_RENDEZVOUS_HOLDS_PER_SESSION,
             )),
             context,
+            auth,
             subscribe_tracks_session_child_permits: Arc::new(Semaphore::new(
                 MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
             )),
@@ -1754,12 +1760,19 @@ mod tests {
         .expect("MoQT setup timed out");
         let (server, publisher, _server_subscriber) = server.expect("accept MoQT session");
         let (client, _client_publisher, subscriber) = client.expect("connect MoQT session");
-        let mut producer = Producer::new(
+        let (upstream_namespaces, runner) = crate::upstream_namespaces::UpstreamNamespaces::new(
+            locals.clone(),
+            remotes.clone(),
+            coordinator,
+        );
+        tokio::spawn(runner.run());
+        let mut producer = Producer::new_with_upstream_namespaces(
             publisher.expect("server publisher"),
             locals,
             remotes,
-            coordinator,
+            upstream_namespaces,
             SessionContext::public(None),
+            None,
         );
         producer.subscribe_tracks_session_child_permits = Arc::new(Semaphore::new(child_limit));
         producer.subscribe_tracks_session_slot_permits = Arc::new(Semaphore::new(slot_limit));
@@ -2519,7 +2532,7 @@ mod tests {
             spawn_relay_session(locals.clone(), remotes, coordinator.clone()).await;
 
         // Open a SUBSCRIBE_NAMESPACE request for the prefix.
-        let mut handle = subscriber
+        let handle = subscriber
             .subscribe_namespace(prefix, KeyValuePairs::default())
             .await
             .expect("SUBSCRIBE_NAMESPACE should succeed");

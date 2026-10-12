@@ -1,400 +1,507 @@
 // SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Authorization operation and decision types.
-//!
-//! Every relay enforcement point names its operation via [`AuthzOperation`],
-//! which [`AuthHook::on_request`] uses to decide whether to allow or deny.
-//! The hook receives a fully decoded [`Principal`] (established at setup) so
-//! it never repeats cryptographic work on the request path.
-//!
-//! # CAT action mapping (draft-ietf-moq-c4m)
-//!
-//! Each [`AuthzOperation`] variant maps to a specific `MoqtAction` integer
-//! that must appear in the token's `moqt` claim scope. The mapping is:
-//!
-//! | Operation | CAT `MoqtAction` | Value |
-//! |---|---|---|
-//! | [`AuthzOperation::PublishNamespace`] | `PublishNamespace` | 2 |
-//! | [`AuthzOperation::SubscribeNamespace`] | `SubscribeNamespace` | 3 |
-//! | [`AuthzOperation::Subscribe`] | `Subscribe` | 4 |
-//! | [`AuthzOperation::Publish`] | `Publish` | 6 |
-//! | [`AuthzOperation::Fetch`] | **`Fetch`** | **7** |
-//! | [`AuthzOperation::TrackStatus`] | `TrackStatus` | 8 |
-//!
-//! `ClientSetup` (action 0) is checked inside [`AuthHook::on_setup`] and has
-//! no corresponding `AuthzOperation` variant.
-//!
-//! ## Draft-18 note: Fetch uses action 7
-//!
-//! Unlike the draft-16 relay (which mapped FETCH to the `Subscribe` (4) action
-//! as a deliberate simplification), this draft-18 implementation assigns
-//! [`AuthzOperation::Fetch`] its own variant that maps to `MoqtAction::Fetch`
-//! (value 7). Token issuers must include action 7 alongside action 4 (or use
-//! the `.subscriber()` builder which adds both) for subscribers that will
-//! issue FETCH requests.
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
 
 use moq_transport::coding::{TrackName, TrackNamespace, TrackNamespacePrefix};
+use moq_transport::message::RequestErrorCode;
+use secrecy::{ExposeSecret, SecretSlice};
 
-/// The authorization operation being requested.
+use crate::SessionContext;
+
+/// A resolved AUTHORIZATION TOKEN (draft-18 §10.2.2, §10.3.1.4).
 ///
-/// Passed to [`AuthHook::on_request`] so the hook can evaluate the operation
-/// against the caller's [`Principal`] without reconstructing protocol context.
+/// Alias bookkeeping is resolved before a hook sees this, so implementations
+/// always get a Token Type and Token Value pair, never a raw alias directive.
 ///
-/// See the module documentation for the CAT `MoqtAction` mapping.
+/// The value is a bearer credential: anyone holding the bytes can act as the
+/// peer until the token expires. It is therefore held in a [`SecretSlice`],
+/// which zeroizes on drop and redacts under `Debug`, and reading it requires
+/// an explicit [`expose_secret`](ExposeSecret::expose_secret) — so a copy is
+/// something a caller has to ask for rather than something that happens by
+/// accident.
+///
+/// # What this does and does not protect
+///
+/// It bounds the lifetime of this one copy, and this is the only copy the
+/// relay's own decoding creates — the transport parser borrows the option
+/// value, and [`decode_setup_tokens`] copies it straight into this buffer. It does **not** make the process
+/// secret-free. Others exist and none are zeroized:
+///
+/// * the QUIC receive path, and the transport's `Reader` buffer, which
+///   retains the raw SETUP for the life of the session;
+/// * [`Session::setup_params`], likewise for the life of the session;
+/// * with the `auth-cat` feature, the allocations `cat-token` makes per
+///   verification attempt while base64-decoding the token and re-encoding the
+///   signing input — together these reconstruct the token exactly, and there
+///   are up to `MAX_SETUP_VERIFICATIONS` attempts.
+///
+/// So this narrows one window rather than closing the file. Its real value is
+/// the type: reading a bearer credential requires saying
+/// [`expose_secret`](ExposeSecret::expose_secret), and `Debug` cannot print
+/// one by accident.
+///
+/// Deliberately not [`Clone`] — `secrecy` would permit it, but duplicating a
+/// credential should be a visible act, and no caller needs it.
+///
+/// [`decode_setup_tokens`]: super::decode_setup_tokens
+/// [`Session::setup_params`]: moq_transport::session::Session::setup_params
+#[derive(Debug)]
+pub struct AuthToken {
+    /// Token type from the IANA "MOQT Auth Token Type" registry. Type 0 is
+    /// reserved for types negotiated out of band.
+    pub token_type: u64,
+
+    /// The token payload. Its serialization is defined by `token_type`.
+    ///
+    /// Not public: callers must go through [`expose_value`] so every read of
+    /// a bearer credential is visible at the call site. The `secrecy` type is
+    /// not re-exported; making this field `pub` would put an unreexported type
+    /// in the public API (violates RFC-047 §6).
+    ///
+    /// [`expose_value`]: Self::expose_value
+    value: SecretSlice<u8>,
+}
+
+impl AuthToken {
+    /// Wrap a decoded token value.
+    ///
+    /// Takes an owned `Vec` so the caller hands over its copy rather than
+    /// leaving one behind for the allocator to recycle unzeroized. That holds
+    /// when the vector's capacity equals its length, as it does for the
+    /// `to_vec` in [`decode_setup_tokens`]: conversion to a boxed slice then
+    /// reuses the allocation instead of reallocating and freeing the original.
+    ///
+    /// [`decode_setup_tokens`]: super::decode_setup_tokens
+    pub fn new(token_type: u64, value: Vec<u8>) -> Self {
+        Self {
+            token_type,
+            value: SecretSlice::from(value),
+        }
+    }
+
+    /// The token payload.
+    ///
+    /// Named for what it does: every read of a bearer credential should be
+    /// visible at the call site.
+    pub fn expose_value(&self) -> &[u8] {
+        self.value.expose_secret()
+    }
+}
+
+/// An authenticated identity, established once at session setup.
+///
+/// Carries hook-private validated state — for the CAT hook, the decoded token —
+/// so that per-request authorization is a pure claims check with no
+/// cryptography. Cheap to clone: the claims are behind an [`Arc`].
+#[derive(Clone)]
+pub struct Principal {
+    /// Token subject (`sub`), for logging and metrics only. Never an
+    /// authorization input: authorization decisions come from the claims.
+    subject: Option<String>,
+
+    /// Validated state owned by the hook that produced this principal.
+    claims: Arc<dyn Any + Send + Sync>,
+}
+
+impl Principal {
+    /// Create a principal carrying hook-private validated state.
+    pub fn new<T: Any + Send + Sync>(subject: Option<String>, claims: T) -> Self {
+        Self {
+            subject,
+            claims: Arc::new(claims),
+        }
+    }
+
+    /// Create a principal with no claims, for hooks that carry no per-session
+    /// state.
+    pub fn anonymous() -> Self {
+        Self::new(None, ())
+    }
+
+    /// The token subject, for logging and metrics.
+    pub fn subject(&self) -> Option<&str> {
+        self.subject.as_deref()
+    }
+
+    /// Recover the claims this principal was created with.
+    ///
+    /// Returns `None` if the principal came from a different hook. A hook that
+    /// only ever sees principals it created should treat `None` as an internal
+    /// error and deny.
+    pub fn claims<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.claims.downcast_ref::<T>()
+    }
+}
+
+impl fmt::Debug for Principal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Principal")
+            .field("subject", &self.subject)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The operation being authorized.
+///
+/// Each variant corresponds to an authorization point in the relay. FETCH
+/// requires `Fetch(7)` from the CAT `moqt` claim; `Subscribe(4)` is not
+/// accepted in its place.
+///
+/// SUBSCRIBE_TRACKS (draft-18 §10.19) has no variant of its own because the
+/// CAT `moqt` action registry has no code point for it yet; the relay gates it
+/// as [`SubscribeNamespace`](Self::SubscribeNamespace) in the interim.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AuthzOperation<'a> {
-    /// Inbound PUBLISH_NAMESPACE (draft-18 §10.15) — publisher announces
-    /// availability of tracks under a namespace.
-    ///
-    /// Maps to CAT `MoqtAction::PublishNamespace` (value 2).
+    /// Inbound PUBLISH_NAMESPACE (draft-18 §10.15).
     PublishNamespace { namespace: &'a TrackNamespace },
 
-    /// Inbound SUBSCRIBE_NAMESPACE (draft-18 §10.18) — subscriber requests
-    /// namespace discovery for a prefix.
-    ///
-    /// Maps to CAT `MoqtAction::SubscribeNamespace` (value 3).
-    SubscribeNamespace { prefix: &'a TrackNamespacePrefix },
-
-    /// Inbound SUBSCRIBE (draft-18 §10.7) — subscriber requests a specific
-    /// track.
-    ///
-    /// Maps to CAT `MoqtAction::Subscribe` (value 4).
-    Subscribe {
-        namespace: &'a TrackNamespace,
-        track: &'a TrackName,
-    },
-
-    /// Inbound PUBLISH (draft-18 §10.11) — publisher sends a track.
-    ///
-    /// Maps to CAT `MoqtAction::Publish` (value 6).
+    /// Inbound PUBLISH for a single track (§10.10).
     Publish {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
     },
 
-    /// Inbound FETCH (draft-18 §10.13) — subscriber requests a historical
-    /// object range from a named track.
-    ///
-    /// Maps to CAT `MoqtAction::Fetch` (value **7**).
-    ///
-    /// In this draft-18 implementation, FETCH uses its own action value (7)
-    /// rather than reusing `Subscribe` (4). Token issuers must include
-    /// action 7 for clients that issue FETCH requests.
-    Fetch {
+    /// Inbound SUBSCRIBE (§10.7).
+    Subscribe {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
     },
 
-    /// Inbound TRACK_STATUS (draft-18 §10.15) — subscriber queries delivery
-    /// status for a specific track.
-    ///
-    /// Maps to CAT `MoqtAction::TrackStatus` (value 8).
+    /// Inbound SUBSCRIBE_NAMESPACE (§10.18).
+    SubscribeNamespace { prefix: &'a TrackNamespacePrefix },
+
+    /// Inbound TRACK_STATUS (§10.14).
     TrackStatus {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
     },
+
+    /// Inbound FETCH — standalone or joining (draft-18 §10.12).
+    ///
+    /// FETCH retrieves a bounded range of archived track content and requires
+    /// `Fetch = 7` in the CAT `moqt` claim (`Subscribe = 4` is not accepted).
+    /// Both forms are authorized through this variant once a joining FETCH has
+    /// been resolved to its track.
+    Fetch {
+        namespace: &'a TrackNamespace,
+        track: &'a TrackName,
+    },
 }
 
-impl<'a> AuthzOperation<'a> {
-    /// Short human-readable label, used in log messages.
+impl AuthzOperation<'_> {
+    /// A stable label for logs and metrics.
     pub fn label(&self) -> &'static str {
         match self {
             Self::PublishNamespace { .. } => "publish_namespace",
-            Self::SubscribeNamespace { .. } => "subscribe_namespace",
-            Self::Subscribe { .. } => "subscribe",
             Self::Publish { .. } => "publish",
-            Self::Fetch { .. } => "fetch",
+            Self::Subscribe { .. } => "subscribe",
+            Self::SubscribeNamespace { .. } => "subscribe_namespace",
             Self::TrackStatus { .. } => "track_status",
-        }
-    }
-
-    /// The resource shape this operation targets.
-    ///
-    /// Namespace-level operations carry only a namespace; track-level
-    /// operations carry both a namespace and a track name.
-    pub fn resource_shape(&self) -> ResourceShape {
-        match self {
-            Self::PublishNamespace { .. } | Self::SubscribeNamespace { .. } => {
-                ResourceShape::Namespace
-            }
-            Self::Subscribe { .. }
-            | Self::Publish { .. }
-            | Self::Fetch { .. }
-            | Self::TrackStatus { .. } => ResourceShape::Track,
+            Self::Fetch { .. } => "fetch",
         }
     }
 }
 
-/// The resource shape targeted by an authorization operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceShape {
-    /// Operation targets a namespace or namespace prefix (no track name).
-    Namespace,
-    /// Operation targets a specific track within a namespace.
-    Track,
-}
-
-/// The outcome of an authorization check.
-#[derive(Debug, Clone)]
-pub enum AuthDecision {
-    /// The operation is permitted. Carries the [`Principal`] established at
-    /// setup (for `on_setup`), or the original principal (for `on_request`).
-    Allow(Principal),
-    /// The operation is denied for the given reason.
-    Deny(DenyReason),
-}
-
-impl AuthDecision {
-    /// Construct an allow decision carrying `principal`.
-    pub fn allow(principal: Principal) -> Self {
-        Self::Allow(principal)
-    }
-
-    /// Construct a deny decision with `reason`.
-    pub fn deny(reason: DenyReason) -> Self {
-        Self::Deny(reason)
-    }
-
-    /// Returns `true` if this is an allow.
-    pub fn is_allowed(&self) -> bool {
-        matches!(self, Self::Allow(_))
-    }
-
-    /// Return the principal from an allow decision, or `None` for deny.
-    ///
-    /// For use in tests only.
-    #[cfg(test)]
-    pub fn into_principal(self) -> Option<Principal> {
-        match self {
-            Self::Allow(p) => Some(p),
-            Self::Deny(_) => None,
-        }
-    }
-
-    /// Extract the deny reason if this is a deny.
-    pub fn deny_reason(&self) -> Option<&DenyReason> {
-        match self {
-            Self::Allow(_) => None,
-            Self::Deny(r) => Some(r),
-        }
-    }
-}
-
-/// Why an authorization check was denied.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DenyReason {
-    /// The token is missing from CLIENT_SETUP.
-    TokenMissing,
-    /// The token bytes could not be decoded as a valid credential.
-    TokenMalformed,
-    /// The token's signature did not verify.
-    TokenInvalid,
-    /// The token has passed its `exp` claim.
-    TokenExpired,
-    /// The token's issuer is not in the configured allow-list.
-    IssuerUnknown,
-    /// The token's audience does not match the relay's identity.
-    AudienceMismatch,
-    /// The token's scope does not cover the requested operation or resource.
-    ScopeMismatch,
-    /// The token was replayed.
-    TokenReplayed,
-    /// A policy constraint in the token (e.g. `catreplay`, `catu`) could not
-    /// be enforced by this relay.
-    PolicyDenied { message: String },
-    /// The hook itself faulted (configuration error, coordinator down, etc.).
-    /// Treated as a denial but counted separately in metrics.
-    HookFault { message: String },
-}
-
-/// The verified identity established at session setup.
-///
-/// Carried through the session so per-request checks only do claim
-/// evaluation — no repeated cryptographic work.
-///
-/// # Clone cost
-///
-/// All fields are `Arc`-backed so `Clone` is O(1) — two refcount increments.
-/// `AllowAllAuthHook::on_request` clones the principal and re-wraps it in a
-/// new `AuthDecision::Allow`; this costs two `Arc::clone` calls with no heap
-/// allocation.
-///
-/// # Stability
-///
-/// `#[non_exhaustive]` allows fields to be added without breaking callers.
-/// Construct via [`Principal::new`]; the `data` field is for hook-internal use.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Principal {
-    /// The `sub` claim from the token (opaque subject identifier).
-    ///
-    /// `Arc<str>` rather than `String` so `Clone` is a single refcount
-    /// increment. C2 sets this from the decoded CAT `sub` claim.
-    pub subject: Option<std::sync::Arc<str>>,
-
-    /// Opaque per-implementation data carried through the session.
-    ///
-    /// `CatAuthHook` stores the decoded, verified token here so `on_request`
-    /// can evaluate claims without re-parsing. Other hooks leave this `None`.
-    /// `Arc<dyn Any>` makes `Clone` cheap (refcount only, no deep copy).
-    pub data: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
-}
-
-impl Principal {
-    /// Construct a principal with an optional subject string.
-    pub fn new(subject: Option<impl Into<std::sync::Arc<str>>>) -> Self {
-        Self {
-            subject: subject.map(Into::into),
-            data: None,
-        }
-    }
-
-    /// Construct a principal with no subject or data (anonymous session).
-    pub fn anonymous() -> Self {
-        Self {
-            subject: None,
-            data: None,
-        }
-    }
-
-    /// Attach opaque session data (consumed once, shared cheaply thereafter).
-    pub fn with_data(mut self, data: impl std::any::Any + Send + Sync + 'static) -> Self {
-        self.data = Some(std::sync::Arc::new(data));
-        self
-    }
-}
-
-/// Context passed to [`AuthHook::on_request`].
+/// A single authorization request.
 pub struct AuthRequest<'a> {
-    /// The principal established at session setup.
+    /// The session the request arrived on.
+    pub session: &'a SessionContext,
+
+    /// The identity established at setup.
     pub principal: &'a Principal,
-    /// The operation being authorized.
-    pub operation: &'a AuthzOperation<'a>,
-    /// The request ID from the wire message (used in metrics and logs).
+
+    /// What the peer is asking to do.
+    pub operation: AuthzOperation<'a>,
+
+    /// Request ID of the message being authorized, when known.
     pub request_id: Option<u64>,
 }
 
-/// Errors from the authorization layer.
+/// A hook's verdict.
+#[derive(Debug, Clone)]
+pub struct AuthDecision {
+    pub verdict: Verdict,
+}
+
+impl AuthDecision {
+    /// Allow the operation, establishing the given identity.
+    pub fn allow(principal: Principal) -> Self {
+        Self {
+            verdict: Verdict::Allow(principal),
+        }
+    }
+
+    /// Deny the operation.
+    pub fn deny(reason: DenyReason) -> Self {
+        Self {
+            verdict: Verdict::Deny(reason),
+        }
+    }
+
+    /// Whether the operation was allowed.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self.verdict, Verdict::Allow(_))
+    }
+
+    /// The established identity, if allowed.
+    pub fn principal(&self) -> Option<&Principal> {
+        match &self.verdict {
+            Verdict::Allow(principal) => Some(principal),
+            Verdict::Deny(_) => None,
+        }
+    }
+
+    /// The denial reason, if denied.
+    pub fn deny_reason(&self) -> Option<&DenyReason> {
+        match &self.verdict {
+            Verdict::Allow(_) => None,
+            Verdict::Deny(reason) => Some(reason),
+        }
+    }
+
+    /// Consume the decision, yielding the identity if allowed.
+    pub fn into_principal(self) -> Result<Principal, DenyReason> {
+        match self.verdict {
+            Verdict::Allow(principal) => Ok(principal),
+            Verdict::Deny(reason) => Err(reason),
+        }
+    }
+}
+
+/// Allow, carrying the established identity, or deny with a reason.
+#[derive(Debug, Clone)]
+pub enum Verdict {
+    Allow(Principal),
+    Deny(DenyReason),
+}
+
+/// Why an operation was denied.
 ///
-/// Returned by:
-/// - [`ScopeAuthConfig::validate`] — invalid configuration
-/// - [`AuthHook::on_setup`] — hook fault during session establishment
-/// - [`AuthHook::on_request`] — hook fault during per-request authorization
+/// Abstract on purpose: the relay maps these onto wire codes, and the mapping
+/// differs between session termination (draft-18 §15.10.1) and per-request
+/// rejection (§15.10.2).
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum DenyReason {
+    /// No AUTHORIZATION TOKEN of a usable type was presented.
+    #[error("token missing")]
+    TokenMissing,
+
+    /// The token was structurally valid but did not verify, or carried
+    /// unacceptable standard claims such as `iss` or `aud`.
+    #[error("token invalid")]
+    TokenInvalid,
+
+    /// The token is outside its `exp` / `nbf` validity window.
+    #[error("token expired")]
+    TokenExpired,
+
+    /// The token was replayed.
+    #[error("token replayed")]
+    TokenReplayed,
+
+    /// The token could not be decoded.
+    #[error("token malformed")]
+    TokenMalformed,
+
+    /// The token is valid but its claims do not cover this operation.
+    #[error("operation outside token scope")]
+    ScopeMismatch,
+
+    /// The token was issued by an issuer this scope does not accept.
+    #[error("issuer unknown")]
+    IssuerUnknown,
+
+    /// Denied for a hook-specific reason that is a property of the token or
+    /// the scope's configuration, and so holds for as long as the session
+    /// does — an unenforceable claim, an unusable key set.
+    ///
+    /// Callers may cache this the same way they cache the named variants.
+    #[error("{message}")]
+    PolicyDenied { message: String },
+
+    /// The hook could not reach a verdict: an unreachable backend, an
+    /// unusable clock.
+    ///
+    /// Denies like any other reason, but says nothing about the request, so
+    /// it must be retried rather than remembered — and it indicates a relay
+    /// or infrastructure problem rather than a misbehaving peer.
+    #[error("{message}")]
+    HookFault { message: String },
+}
+
+impl DenyReason {
+    /// Whether this is a decision about the peer's authority, rather than a
+    /// failure to reach one.
+    ///
+    /// A policy denial is a property of the token or the scope configuration
+    /// and holds for as long as the session does, so a caller may cache it.
+    /// [`HookFault`](Self::HookFault) is the only variant that may not be
+    /// cached: it describes the relay's own state, which can recover between
+    /// one request and the next.
+    pub fn is_policy_denial(&self) -> bool {
+        !matches!(self, Self::HookFault { .. })
+    }
+
+    /// A stable label for metrics. Deliberately low-cardinality, and never
+    /// derived from peer-controlled text.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::TokenMissing => "token_missing",
+            Self::TokenInvalid => "token_invalid",
+            Self::TokenExpired => "token_expired",
+            Self::TokenReplayed => "token_replayed",
+            Self::TokenMalformed => "token_malformed",
+            Self::ScopeMismatch => "scope_mismatch",
+            Self::IssuerUnknown => "issuer_unknown",
+            Self::PolicyDenied { .. } => "policy_denied",
+            Self::HookFault { .. } => "hook_fault",
+        }
+    }
+
+    /// The REQUEST_ERROR code for rejecting a single request (draft-18 §10.6,
+    /// §15.10.2; unchanged from draft-16).
+    ///
+    /// Malformed and expired tokens have dedicated codes; everything else is
+    /// UNAUTHORIZED. The reason phrase sent alongside is fixed text, so no
+    /// detail about why validation failed reaches the peer.
+    pub fn request_error_code(&self) -> u64 {
+        match self {
+            Self::TokenMalformed => RequestErrorCode::MalformedAuthToken as u64,
+            Self::TokenExpired => RequestErrorCode::ExpiredAuthToken as u64,
+            _ => RequestErrorCode::Unauthorized as u64,
+        }
+    }
+}
+
+/// A failure to reach a verdict.
 ///
-/// A hook that returns `Err` is treated as a denial and counted separately
-/// in metrics (fault vs. intentional denial).
-///
-/// [`AuthHook::on_setup`]: crate::auth::hook::AuthHook::on_setup
-/// [`AuthHook::on_request`]: crate::auth::hook::AuthHook::on_request
+/// Distinct from [`DenyReason`]: a deny is an authorization outcome, whereas
+/// this means the hook could not evaluate the request at all. Both fail closed,
+/// but only this one indicates a relay or configuration fault worth alerting
+/// on, so the two are counted separately.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AuthError {
-    /// The scope configuration is invalid or incompatible with this hook.
-    #[error("configuration error: {0}")]
+    /// The scope's authorization configuration is unusable — no keys, too many
+    /// keys, unparseable key material, or a scheme this binary was not built
+    /// with. Every session in the scope is refused until it is corrected.
+    #[error("scope authorization is misconfigured: {0}")]
     Configuration(String),
-    /// The coordinator returned an error while fetching scope config.
-    #[error("coordinator error: {0}")]
+
+    /// A dependency needed to reach a verdict failed, such as the coordinator
+    /// being unreachable.
+    #[error("authorization backend failure: {0}")]
     Backend(String),
+
+    /// The AUTHORIZATION TOKEN parameter could not be decoded. The peer
+    /// violated the wire format, so the session is terminated rather than the
+    /// individual request rejected.
+    #[error("malformed authorization token parameter: {0}")]
+    Malformed(#[from] super::TokenError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moq_transport::coding::{TrackName, TrackNamespace, TrackNamespacePrefix};
 
-    fn ns() -> TrackNamespace {
-        TrackNamespace::from_utf8_path("sports/football")
+    #[test]
+    fn auth_token_debug_does_not_leak_the_value() {
+        let token = AuthToken::new(1, b"super-secret-bearer-token".to_vec());
+
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        // The type is still identifiable for diagnostics.
+        assert!(rendered.contains("token_type: 1"), "{rendered}");
     }
 
-    fn track() -> TrackName {
-        TrackName::from("video")
-    }
-
-    fn prefix() -> TrackNamespacePrefix {
-        TrackNamespacePrefix::from_utf8_path("sports")
+    /// The value is reachable only through an explicit exposure, so a copy is
+    /// something a caller asks for rather than something that happens by
+    /// accident.
+    #[test]
+    fn auth_token_value_requires_explicit_exposure() {
+        let token = AuthToken::new(1, b"payload".to_vec());
+        assert_eq!(token.expose_value(), b"payload");
+        assert_eq!(token.value.expose_secret(), b"payload");
     }
 
     #[test]
-    fn fetch_operation_has_track_resource_shape() {
-        let ns = ns();
-        let track = track();
-        let op = AuthzOperation::Fetch {
-            namespace: &ns,
-            track: &track,
-        };
-        // Draft-18 FETCH uses MoqtAction::Fetch (7), a Track-level operation.
-        // Resource shape must be Track so scope matching checks both namespace
-        // and track name — consistent with Subscribe and TrackStatus.
-        assert_eq!(
-            op.resource_shape(),
-            ResourceShape::Track,
-            "Fetch must be Track-shaped so CAT Fetch(7) scope matching includes track"
-        );
-        assert_eq!(op.label(), "fetch");
+    fn principal_debug_does_not_leak_claims() {
+        let principal = Principal::new(Some("alice".to_string()), "sensitive-claims");
+        let rendered = format!("{principal:?}");
+        assert!(rendered.contains("alice"), "{rendered}");
+        assert!(!rendered.contains("sensitive-claims"), "{rendered}");
     }
 
     #[test]
-    fn subscribe_namespace_has_namespace_resource_shape() {
-        let pfx = prefix();
-        let op = AuthzOperation::SubscribeNamespace { prefix: &pfx };
-        assert_eq!(op.resource_shape(), ResourceShape::Namespace);
+    fn principal_round_trips_typed_claims() {
+        #[derive(Debug, PartialEq)]
+        struct Claims(u32);
+
+        let principal = Principal::new(Some("bob".to_string()), Claims(7));
+        assert_eq!(principal.subject(), Some("bob"));
+        assert_eq!(principal.claims::<Claims>(), Some(&Claims(7)));
+        // A hook asking for a type it did not store gets None, not a panic.
+        assert_eq!(principal.claims::<String>(), None);
     }
 
     #[test]
-    fn subscribe_has_track_resource_shape() {
-        let ns = ns();
-        let track = track();
-        let op = AuthzOperation::Subscribe {
-            namespace: &ns,
-            track: &track,
-        };
-        assert_eq!(op.resource_shape(), ResourceShape::Track);
+    fn decision_accessors_agree() {
+        let allow = AuthDecision::allow(Principal::anonymous());
+        assert!(allow.is_allowed());
+        assert!(allow.principal().is_some());
+        assert!(allow.deny_reason().is_none());
+
+        let deny = AuthDecision::deny(DenyReason::TokenMissing);
+        assert!(!deny.is_allowed());
+        assert!(deny.principal().is_none());
+        assert!(deny.deny_reason().is_some());
+        assert!(deny.into_principal().is_err());
+    }
+
+    /// Only a hook fault may be retried; everything else is a stable property
+    /// of the token or the scope and may be cached for the session.
+    #[test]
+    fn only_hook_faults_are_retryable() {
+        for stable in [
+            DenyReason::TokenMissing,
+            DenyReason::TokenInvalid,
+            DenyReason::TokenExpired,
+            DenyReason::TokenReplayed,
+            DenyReason::TokenMalformed,
+            DenyReason::ScopeMismatch,
+            DenyReason::IssuerUnknown,
+            DenyReason::PolicyDenied {
+                message: "unenforceable claim: cnf".to_string(),
+            },
+        ] {
+            assert!(
+                stable.is_policy_denial(),
+                "{stable} should be cacheable as a policy decision"
+            );
+        }
+
+        assert!(!DenyReason::HookFault {
+            message: "authorization unavailable".to_string(),
+        }
+        .is_policy_denial());
     }
 
     #[test]
-    fn track_status_has_track_resource_shape() {
-        let ns = ns();
-        let track = track();
-        let op = AuthzOperation::TrackStatus {
-            namespace: &ns,
-            track: &track,
-        };
-        assert_eq!(op.resource_shape(), ResourceShape::Track);
-    }
-
-    #[test]
-    fn auth_decision_allow_is_allowed() {
-        let d = AuthDecision::allow(Principal::new(Some(std::sync::Arc::<str>::from("alice"))));
-        assert!(d.is_allowed());
-        assert!(d.deny_reason().is_none());
-    }
-
-    #[test]
-    fn auth_decision_deny_is_not_allowed() {
-        let d = AuthDecision::deny(DenyReason::ScopeMismatch);
-        assert!(!d.is_allowed());
-        assert_eq!(d.deny_reason(), Some(&DenyReason::ScopeMismatch));
-    }
-
-    #[test]
-    fn fetch_and_subscribe_are_distinct_operations() {
-        let ns = ns();
-        let track = track();
-        let fetch = AuthzOperation::Fetch {
-            namespace: &ns,
-            track: &track,
-        };
-        let subscribe = AuthzOperation::Subscribe {
-            namespace: &ns,
-            track: &track,
-        };
-        // Both are Track-shaped, but their labels are distinct — they map to
-        // different CAT MoqtAction values (Fetch=7, Subscribe=4).
-        assert_eq!(fetch.label(), "fetch");
-        assert_eq!(subscribe.label(), "subscribe");
-        assert_ne!(fetch.label(), subscribe.label());
+    fn deny_reasons_map_to_draft18_request_error_codes() {
+        // draft-18 §15.10.2: MALFORMED_AUTH_TOKEN 0x4, EXPIRED_AUTH_TOKEN 0x5,
+        // UNAUTHORIZED 0x1.
+        assert_eq!(DenyReason::TokenMalformed.request_error_code(), 0x4);
+        assert_eq!(DenyReason::TokenExpired.request_error_code(), 0x5);
+        assert_eq!(DenyReason::TokenMissing.request_error_code(), 0x1);
+        assert_eq!(DenyReason::TokenInvalid.request_error_code(), 0x1);
+        assert_eq!(DenyReason::ScopeMismatch.request_error_code(), 0x1);
+        assert_eq!(DenyReason::IssuerUnknown.request_error_code(), 0x1);
+        assert_eq!(DenyReason::TokenReplayed.request_error_code(), 0x1);
     }
 }

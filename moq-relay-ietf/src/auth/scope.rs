@@ -1,300 +1,489 @@
 // SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Per-scope authorization configuration and hook resolution.
-//!
-//! [`ScopeAuthConfig`] holds the policy parameters that will be used by
-//! `CatAuthHook` (implemented in C2). [`ScopeAuthorizer`] builds and caches
-//! the per-scope hook instance.
-//!
-//! # C1 behavior — auth=None permits, auth=Some fails closed
-//!
-//! `ScopeAuthorizer::resolve` is the **only** correct path to obtain a hook:
-//!
-//! | `ScopeConfig::auth` | Hook returned | Sessions admitted? |
-//! |---|---|---|
-//! | `None` | [`AllowAllAuthHook`] | Yes |
-//! | `Some(cfg)` with invalid cfg | [`DenyAllAuthHook`] (`HookFault`) | **No** |
-//! | `Some(cfg)` with valid cfg | [`DenyAllAuthHook`] (`HookFault`) | **No** |
-//!
-//! Setting `auth=Some(...)` causes `resolve` to return `DenyAllAuthHook`,
-//! which **never** admits sessions when called. Note: the relay session code
-//! does not yet call `resolve` (wiring is deferred to C2), so the deny hook
-//! is not yet reached at runtime — but the contract is correct for C2.
-//!
-//! # C2 behavior (planned)
-//!
-//! C2 replaces the `Some(_) => DenyAll` arm with actual `CatAuthHook`
-//! construction. The [`ScopeAuthConfig`] fields are sized to hold exactly
-//! the inputs `CatAuthHook::new()` requires so no migration is needed.
+//! Resolves a scope's authorization policy into a hook, and caches it.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
-use super::hook::{AllowAllAuthHook, AuthHook, DenyAllAuthHook};
-use super::types::{AuthError, DenyReason};
+use super::{AuthError, AuthHook, DenyAllAuthHook, UNSCOPED};
+use crate::{Coordinator, ScopeAuthConfig};
 
-/// Configuration for per-scope CAT bearer-token authorization.
+/// How long an unusable configuration is cached before it is retried.
 ///
-/// Set as `Some(cfg)` on [`ScopeConfig::auth`] to declare that this scope
-/// requires token enforcement.
-///
-/// In C1, [`ScopeAuthorizer::resolve`] returns [`DenyAllAuthHook`] for any
-/// `Some(cfg)`. The relay session path does not yet call `resolve` (that
-/// wiring is C2), so there is no runtime enforcement yet. The contract is
-/// established now so C2 can wire it in without changing the type.
-///
-/// # Empty-field semantics
-///
-/// Field emptiness is validated by [`ScopeAuthConfig::validate`] before any
-/// hook is constructed:
-///
-/// - **`keys`**: must be non-empty (at least one public key required).
-/// - **`audience`**: must be non-empty (the relay UID, server-derived).
-/// - **`issuers`**: may be empty to accept any issuer (unsafe; prefer an
-///   explicit list in production). An empty list is NOT an error in C1 because
-///   the list is only enforced by `CatAuthHook` (C2).
-///
-/// [`ScopeConfig::auth`]: crate::coordinator::ScopeConfig::auth
-#[derive(Debug, Clone, Default)]
-pub struct ScopeAuthConfig {
-    /// ES256 public keys in rotation order. Each entry is a PEM-encoded
-    /// SubjectPublicKeyInfo (-----BEGIN PUBLIC KEY-----).
-    ///
-    /// Must be non-empty. An empty list is a configuration error that maps
-    /// to [`DenyAllAuthHook`] when validate() is called.
-    pub keys: Vec<String>,
+/// Short enough that fixing a misconfiguration takes effect promptly, long
+/// enough that a broken scope under load does not turn into a retry storm
+/// against the coordinator.
+const BROKEN_CONFIG_TTL: Duration = Duration::from_secs(30);
 
-    /// Expected token issuers (`iss` claim). An empty list means any issuer
-    /// is accepted — unsafe for production; prefer an explicit allowlist.
-    ///
-    /// In C1 this field is not enforced; it is validated and stored for C2.
-    pub issuers: Vec<String>,
-
-    /// Expected token audience (`aud` claim). Should be set to the relay UID.
-    ///
-    /// Must be non-empty. An empty string is a configuration error.
-    pub audience: String,
+/// Builds and caches the authorization hook for each scope.
+///
+/// [`Coordinator::get_scope_config`] is the source of truth for a scope's
+/// keys, but calling it per connection would put a coordinator round-trip and
+/// a set of PEM parses on the accept path. Results are therefore cached for
+/// [`ScopeAuthConfig::ttl`], which also bounds how long a key rotation takes
+/// to reach new sessions.
+pub(crate) struct ScopeAuthorizer {
+    coordinator: Arc<dyn Coordinator>,
+    cache: RwLock<HashMap<Option<String>, CacheEntry>>,
 }
 
-impl ScopeAuthConfig {
-    /// Validate the configuration before building a hook.
-    ///
-    /// Returns `Err` if any required field is missing or invalid. C1 callers
-    /// use this to produce a `DenyAllAuthHook` with an informative message
-    /// rather than silently admitting sessions.
-    pub fn validate(&self) -> Result<(), AuthError> {
-        if self.keys.is_empty() {
-            return Err(AuthError::Configuration(
-                "ScopeAuthConfig.keys is empty — at least one public key is required".into(),
-            ));
-        }
-        if self.audience.is_empty() {
-            return Err(AuthError::Configuration(
-                "ScopeAuthConfig.audience is empty — set it to the relay UID (server-derived)"
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Whether the issuer list is unrestricted (empty = accept any issuer).
-    ///
-    /// An unrestricted issuer list is legal but unsafe in production.
-    pub fn any_issuer(&self) -> bool {
-        self.issuers.is_empty()
-    }
+#[derive(Clone)]
+struct CacheEntry {
+    state: CacheState,
+    expires_at: Instant,
 }
 
-/// Builds the per-scope [`AuthHook`] from an optional [`ScopeAuthConfig`].
-///
-/// # C1 fail-closed contract
-///
-/// The guarantee that every caller MUST preserve:
-///
-/// * `auth = None` → [`AllowAllAuthHook`] — scope has no policy, sessions
-///   admitted freely. This is the only path that admits sessions in C1.
-/// * `auth = Some(_)` → [`DenyAllAuthHook`] — **always fail closed** in C1,
-///   regardless of whether the config is valid or not. No session is ever
-///   admitted when a policy is configured but the `CatAuthHook` implementation
-///   (C2) is absent.
-///
-/// This contract is tested by [`tests::auth_none_allows_auth_some_denies`].
-///
-/// # C2 change
-///
-/// C2 replaces the `Some(_) → DenyAll` arm with `CatAuthHook::new(cfg)`.
-/// The `None → AllowAll` arm is unchanged.
-pub struct ScopeAuthorizer;
+#[derive(Clone)]
+enum CacheState {
+    /// The scope requires token authorization.
+    Enforced(Arc<dyn AuthHook>),
+    /// The scope did not opt in; sessions skip authorization entirely.
+    Disabled,
+}
 
 impl ScopeAuthorizer {
-    /// Return the hook for a scope given its optional auth config.
-    ///
-    /// Pass `ScopeConfig::auth.as_ref()` here.
-    ///
-    /// See [`ScopeAuthorizer`] for the exact fail-closed contract.
-    pub fn resolve(auth: Option<&ScopeAuthConfig>) -> Arc<dyn AuthHook> {
-        match auth {
-            // No policy configured — admit sessions without enforcement.
-            None => Arc::new(AllowAllAuthHook),
-
-            // Policy configured but CatAuthHook (C2) not yet available.
-            // Fail closed: deny every session with an explicit HookFault so
-            // the reason is visible in logs and metrics. This prevents any
-            // auth=Some(...) configuration from silently admitting sessions.
-            Some(cfg) => {
-                let message = match cfg.validate() {
-                    Ok(()) => "CAT policy is configured but CatAuthHook is not implemented in C1; \
-                         upgrade to a C2 release to enable enforcement"
-                        .into(),
-                    Err(e) => format!("invalid ScopeAuthConfig ({e}); upgrade to C2"),
-                };
-                DenyAllAuthHook::new(DenyReason::HookFault { message })
-            }
+    pub(crate) fn new(coordinator: Arc<dyn Coordinator>) -> Self {
+        Self {
+            coordinator,
+            cache: RwLock::new(HashMap::new()),
         }
     }
+
+    /// The hook for a scope, or `None` if the scope does not require
+    /// authorization.
+    ///
+    /// Returns `Err` only when the scope's policy could not be determined at
+    /// all — the caller must fail closed, since it cannot know whether the
+    /// scope requires a token.
+    pub(crate) async fn resolve(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Option<Arc<dyn AuthHook>>, AuthError> {
+        if let Some(entry) = self.cached(scope) {
+            return Ok(entry.into_hook());
+        }
+
+        let config = self
+            .coordinator
+            .get_scope_config(scope)
+            .await
+            .map_err(|err| AuthError::Backend(format!("get_scope_config failed: {err}")))?;
+
+        let (state, ttl) = match config.auth {
+            None => {
+                // Logged once per TTL rather than per connection. "No policy"
+                // is a legitimate configuration, but it is indistinguishable
+                // from a coordinator that forgot to implement
+                // `get_scope_config`, so it should be visible in logs rather
+                // than inferred from the absence of anything.
+                tracing::info!(
+                    scope = scope.unwrap_or(UNSCOPED),
+                    "scope has no token authorization policy; admitting sessions on \
+                     scope permissions alone"
+                );
+                (CacheState::Disabled, super::DEFAULT_SCOPE_AUTH_TTL)
+            }
+            Some(auth) => {
+                let ttl = auth.effective_ttl();
+                match build_hook(&auth, scope) {
+                    Ok(hook) => (CacheState::Enforced(hook), ttl),
+                    // A scope that asked for authorization but cannot have it
+                    // must refuse every session, not run unauthenticated.
+                    Err(err) => {
+                        tracing::error!(
+                            scope = scope.unwrap_or(UNSCOPED),
+                            error = %err,
+                            "scope requires token authorization but its configuration is unusable; \
+                             refusing all sessions in this scope"
+                        );
+                        metrics::counter!(
+                            "moq_relay_auth_errors_total",
+                            "stage" => "scope_config"
+                        )
+                        .increment(1);
+                        (
+                            CacheState::Enforced(Arc::new(DenyAllAuthHook::new(err.to_string()))),
+                            BROKEN_CONFIG_TTL,
+                        )
+                    }
+                }
+            }
+        };
+
+        self.store(scope, state.clone(), ttl);
+
+        Ok(CacheEntry {
+            state,
+            expires_at: Instant::now() + ttl,
+        }
+        .into_hook())
+    }
+
+    fn cached(&self, scope: Option<&str>) -> Option<CacheEntry> {
+        let cache = self.cache.read().unwrap_or_else(|err| err.into_inner());
+        // `Option<&str>` cannot look up an `Option<String>` key directly, and
+        // the map is small (one entry per active scope), so an equality scan
+        // avoids allocating a key on every cache hit.
+        cache
+            .iter()
+            .find(|(key, _)| key.as_deref() == scope)
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.expires_at > Instant::now())
+            .cloned()
+    }
+
+    fn store(&self, scope: Option<&str>, state: CacheState, ttl: Duration) {
+        let mut cache = self.cache.write().unwrap_or_else(|err| err.into_inner());
+        cache.insert(
+            scope.map(str::to_string),
+            CacheEntry {
+                state,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
+
+    /// Drop a scope's cached policy, forcing the next session to re-fetch it.
+    #[cfg(test)]
+    pub(crate) fn invalidate(&self, scope: Option<&str>) {
+        let mut cache = self.cache.write().unwrap_or_else(|err| err.into_inner());
+        cache.retain(|key, _| key.as_deref() != scope);
+    }
+}
+
+impl CacheEntry {
+    fn into_hook(self) -> Option<Arc<dyn AuthHook>> {
+        match self.state {
+            CacheState::Enforced(hook) => Some(hook),
+            CacheState::Disabled => None,
+        }
+    }
+}
+
+/// Build the hook a scope's configuration calls for.
+///
+/// Separated from [`ScopeAuthorizer::resolve`] so that the feature boundary is
+/// a single function rather than a `cfg` scattered through the cache logic.
+fn build_hook(
+    config: &ScopeAuthConfig,
+    scope: Option<&str>,
+) -> Result<Arc<dyn AuthHook>, AuthError> {
+    // No token scheme is compiled into this build yet, so every policy is
+    // unbuildable and the scope fails closed with a DenyAll hook.
+    let _ = (config, scope);
+    Err(AuthError::Configuration(
+        "relay was built without the `auth-cat` feature, so it cannot verify \
+         the tokens this scope requires"
+            .to_string(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::types::DenyReason;
-    use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace};
-    use moq_transport::setup::Setup;
 
-    use crate::auth::hook::AuthHook;
-    use crate::auth::types::{AuthRequest, AuthzOperation, Principal};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn dummy_setup() -> Setup {
-        Setup {
-            params: KeyValuePairs::default(),
+    use async_trait::async_trait;
+    use moq_native_ietf::quic;
+    use moq_transport::coding::TrackNamespace;
+
+    use crate::{
+        AuthPublicKey, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
+        NamespaceRegistration, ScopeConfig,
+    };
+
+    /// A coordinator that returns a scripted config and counts calls, so the
+    /// tests can assert on caching rather than on wall-clock behaviour.
+    struct ScriptedCoordinator {
+        config: std::sync::Mutex<ScopeConfig>,
+        calls: AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl ScriptedCoordinator {
+        fn new(config: ScopeConfig) -> Self {
+            Self {
+                config: std::sync::Mutex::new(config),
+                calls: AtomicUsize::new(0),
+                fail: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.fail.store(failing, Ordering::SeqCst);
         }
     }
 
-    fn dummy_principal() -> Principal {
-        Principal::new(None::<std::sync::Arc<str>>)
+    #[async_trait]
+    impl Coordinator for ScriptedCoordinator {
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+            _context: &CoordinatorContext,
+        ) -> CoordinatorResult<NamespaceRegistration> {
+            Ok(NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+            Err(CoordinatorError::NamespaceNotFound)
+        }
+
+        async fn get_scope_config(&self, _scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(CoordinatorError::Other(anyhow::anyhow!("backend down")));
+            }
+            Ok(self.config.lock().unwrap().clone())
+        }
     }
 
-    // =========================================================================
-    // The core C1 security invariant.
-    // =========================================================================
+    /// Placeholder key material. No hook can be built in this configuration,
+    /// so its content is never parsed.
+    fn valid_pem() -> String {
+        "-----BEGIN PUBLIC KEY-----\nplaceholder\n-----END PUBLIC KEY-----\n".to_string()
+    }
 
-    /// **Security contract**: `auth=None` → AllowAll; `auth=Some(...)` → DenyAll.
-    ///
-    /// This test must never be removed or weakened. It is the machine-readable
-    /// proof that auth=Some cannot accidentally admit sessions in C1.
+    fn enforced_config() -> ScopeConfig {
+        ScopeConfig {
+            auth: Some(ScopeAuthConfig::new(vec![
+                AuthPublicKey::es256(valid_pem()),
+            ])),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
-    async fn auth_none_allows_auth_some_denies() {
-        let setup = dummy_setup();
+    async fn a_scope_without_auth_config_needs_no_hook() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
 
-        // auth=None: all sessions admitted.
-        let allow_hook = ScopeAuthorizer::resolve(None);
-        let result = allow_hook.on_setup(&setup).await.unwrap();
-        assert!(
-            result.is_allowed(),
-            "auth=None must admit sessions (AllowAllAuthHook)"
-        );
+        assert!(authorizer.resolve(Some("open")).await.unwrap().is_none());
+        assert_eq!(coordinator.calls(), 1);
+    }
 
-        // auth=Some(valid): all sessions denied — fail closed.
-        let valid_cfg = ScopeAuthConfig {
-            keys: vec!["-----BEGIN PUBLIC KEY-----\nfake\n-----END PUBLIC KEY-----".into()],
-            issuers: vec!["https://issuer.example".into()],
-            audience: "relay-uid-hex".into(),
-        };
-        let deny_hook = ScopeAuthorizer::resolve(Some(&valid_cfg));
-        let result = deny_hook.on_setup(&setup).await.unwrap();
-        assert!(
-            !result.is_allowed(),
-            "auth=Some(valid_cfg) must deny sessions in C1 (fail closed)"
-        );
-        assert!(
-            matches!(result.deny_reason(), Some(DenyReason::HookFault { .. })),
-            "auth=Some(valid_cfg) must produce HookFault deny reason in C1"
-        );
+    #[tokio::test]
+    async fn results_are_cached_per_scope() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
 
-        // auth=Some(invalid): also denied, not panicked.
-        let invalid_cfg = ScopeAuthConfig::default(); // empty keys + empty audience
-        let deny_hook2 = ScopeAuthorizer::resolve(Some(&invalid_cfg));
-        let result2 = deny_hook2.on_setup(&setup).await.unwrap();
-        assert!(
-            !result2.is_allowed(),
-            "auth=Some(invalid_cfg) must also deny — invalid config cannot fail open"
-        );
+        for _ in 0..5 {
+            authorizer.resolve(Some("tenant")).await.unwrap();
+        }
+        assert_eq!(coordinator.calls(), 1, "repeat resolves must hit the cache");
 
-        // on_request with auth=Some also denies.
-        let ns = TrackNamespace::from_utf8_path("sports");
-        let track = TrackName::from("video");
-        let principal = dummy_principal();
-        let op = AuthzOperation::Fetch {
-            namespace: &ns,
-            track: &track,
-        };
-        let req = AuthRequest {
-            principal: &principal,
-            operation: &op,
-            request_id: Some(1),
-        };
-        let req_result = deny_hook.on_request(&req).await.unwrap();
-        assert!(
-            !req_result.is_allowed(),
-            "on_request with auth=Some must also deny"
+        // A different scope is a separate cache entry.
+        authorizer.resolve(Some("other")).await.unwrap();
+        assert_eq!(coordinator.calls(), 2);
+
+        // The unscoped session is its own entry, distinct from any named scope.
+        authorizer.resolve(None).await.unwrap();
+        assert_eq!(coordinator.calls(), 3);
+        authorizer.resolve(None).await.unwrap();
+        assert_eq!(coordinator.calls(), 3);
+    }
+
+    /// An unusable policy is cached too, on its own shorter TTL, so a broken
+    /// scope under load does not turn into a retry storm against the
+    /// coordinator. It must still deny throughout.
+    #[tokio::test]
+    async fn a_broken_config_is_cached_and_keeps_denying() {
+        // Unbuildable: the key list is empty (and no token scheme is compiled
+        // in yet either).
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
+            auth: Some(
+                ScopeAuthConfig::new(vec![])
+                    // Ignored in favour of BROKEN_CONFIG_TTL.
+                    .with_ttl(Duration::from_nanos(1)),
+            ),
+            ..Default::default()
+        }));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+
+        for _ in 0..3 {
+            let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+            assert!(
+                !hook.on_setup(&session, &[]).await.unwrap().is_allowed(),
+                "a broken scope must deny on every resolve"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        assert_eq!(
+            coordinator.calls(),
+            1,
+            "a broken config must be cached, not refetched per connection"
         );
     }
 
-    // =========================================================================
-    // ScopeAuthConfig validation.
-    // =========================================================================
+    #[tokio::test]
+    async fn a_coordinator_failure_fails_closed() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        coordinator.set_failing(true);
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
 
-    #[test]
-    fn validate_rejects_empty_keys() {
-        let cfg = ScopeAuthConfig {
-            keys: vec![],
-            issuers: vec![],
-            audience: "relay-uid".into(),
-        };
-        assert!(cfg.validate().is_err(), "empty keys must be invalid");
+        // Not `Ok(None)`: the relay must not admit a session merely because it
+        // could not find out whether the scope requires a token.
+        let err = authorizer
+            .resolve(Some("tenant"))
+            .await
+            .err()
+            .expect("a backend failure must surface");
+        assert!(matches!(err, AuthError::Backend(_)), "{err:?}");
     }
 
-    #[test]
-    fn validate_rejects_empty_audience() {
-        let cfg = ScopeAuthConfig {
-            keys: vec!["key".into()],
-            issuers: vec![],
-            audience: String::new(),
-        };
-        assert!(cfg.validate().is_err(), "empty audience must be invalid");
+    #[tokio::test]
+    async fn a_failure_is_not_cached_as_permissive() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        coordinator.set_failing(true);
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        assert!(authorizer.resolve(Some("tenant")).await.is_err());
+
+        // Once the backend recovers the scope resolves normally: the failure
+        // left no poisoned entry behind.
+        coordinator.set_failing(false);
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_none());
     }
 
-    #[test]
-    fn validate_accepts_empty_issuers() {
-        // Empty issuers = any issuer accepted. Not ideal but not invalid.
-        let cfg = ScopeAuthConfig {
-            keys: vec!["key".into()],
-            issuers: vec![],
-            audience: "relay-uid".into(),
-        };
-        assert!(cfg.validate().is_ok());
-        assert!(cfg.any_issuer());
+    #[tokio::test]
+    async fn an_unusable_config_denies_rather_than_disables() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
+            // Enabled but with no keys: unusable.
+            auth: Some(ScopeAuthConfig::new(vec![])),
+            ..Default::default()
+        }));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        let hook = authorizer
+            .resolve(Some("tenant"))
+            .await
+            .unwrap()
+            .expect("a broken scope must still get a hook, not be waved through");
+
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+        assert!(!hook.on_setup(&session, &[]).await.unwrap().is_allowed());
     }
 
-    #[test]
-    fn validate_accepts_full_config() {
-        let cfg = ScopeAuthConfig {
-            keys: vec!["key".into()],
-            issuers: vec!["https://issuer.example".into()],
-            audience: "relay-uid".into(),
-        };
-        assert!(cfg.validate().is_ok());
-        assert!(!cfg.any_issuer());
+    #[tokio::test]
+    async fn too_many_keys_denies_rather_than_disables() {
+        let keys = (0..crate::MAX_SCOPE_AUTH_KEYS + 1)
+            .map(|_| AuthPublicKey::es256(valid_pem()))
+            .collect();
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
+            auth: Some(ScopeAuthConfig::new(keys)),
+            ..Default::default()
+        }));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+        assert!(!hook.on_setup(&session, &[]).await.unwrap().is_allowed());
     }
 
-    #[test]
-    fn default_config_is_invalid() {
-        // ScopeAuthConfig::default() must fail validation — it must never
-        // accidentally pass as a working config.
-        let cfg = ScopeAuthConfig::default();
+    /// Without a token scheme compiled in, a scope that requires tokens cannot
+    /// be served, so it must refuse sessions rather than run unauthenticated.
+    #[tokio::test]
+    async fn a_scope_requiring_tokens_is_refused_without_the_feature() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(enforced_config()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+        let decision = hook.on_setup(&session, &[]).await.unwrap();
+
+        assert!(!decision.is_allowed());
         assert!(
-            cfg.validate().is_err(),
-            "default (all-empty) config must be invalid; C1 cannot silently accept it"
+            decision
+                .deny_reason()
+                .unwrap()
+                .to_string()
+                .contains("auth-cat"),
+            "the denial should name the missing feature"
         );
+
+        // The request path must deny too. A hook that refused setup but waved
+        // requests through would be no protection at all for any session that
+        // reached the request stage by another route.
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = moq_transport::coding::TrackName::from("video");
+        let auth = crate::auth::SessionAuth::new(hook, crate::auth::Principal::anonymous());
+
+        for operation in [
+            crate::auth::AuthzOperation::PublishNamespace {
+                namespace: &namespace,
+            },
+            crate::auth::AuthzOperation::Publish {
+                namespace: &namespace,
+                track: &track,
+            },
+            crate::auth::AuthzOperation::Subscribe {
+                namespace: &namespace,
+                track: &track,
+            },
+        ] {
+            let label = operation.label();
+            assert!(
+                crate::auth::authorize(Some(&auth), &session, operation, None)
+                    .await
+                    .is_err(),
+                "{label} must be denied without the feature"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolves_are_consistent() {
+        // The cache is shared across connection tasks; this exercises the lock
+        // discipline under contention rather than asserting a call count, since
+        // concurrent misses may legitimately each fetch.
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = Arc::new(ScopeAuthorizer::new(coordinator.clone()));
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let authorizer = authorizer.clone();
+            tasks.push(tokio::spawn(async move {
+                authorizer.resolve(Some("tenant")).await.unwrap().is_none()
+            }));
+        }
+
+        for task in tasks {
+            assert!(task.await.unwrap(), "every resolve must agree");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_forces_a_refetch() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        authorizer.resolve(Some("tenant")).await.unwrap();
+        authorizer.resolve(Some("tenant")).await.unwrap();
+        assert_eq!(coordinator.calls(), 1);
+
+        authorizer.invalidate(Some("tenant"));
+        authorizer.resolve(Some("tenant")).await.unwrap();
+        assert_eq!(coordinator.calls(), 2);
     }
 }

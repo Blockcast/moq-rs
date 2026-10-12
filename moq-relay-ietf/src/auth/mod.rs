@@ -1,57 +1,110 @@
 // SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Session and request authorization foundations for the draft-18 relay.
+//! Session and request authorization for the relay.
 //!
-//! # C1 behavior — two paths, one invariant
+//! # Model
 //!
-//! **`auth=None`:** The scope has no policy. [`ScopeAuthorizer::resolve`]
-//! returns [`AllowAllAuthHook`]; every session is admitted freely.
+//! Authorization is a per-scope policy, not a relay-wide switch. After
+//! [`Coordinator::resolve_scope`] identifies which scope a connection belongs
+//! to, [`Coordinator::get_scope_config`] supplies that scope's
+//! [`ScopeAuthConfig`], including the public keys used to verify tokens. A
+//! scope that returns no policy carries no token enforcement; AUTHORIZATION
+//! TOKEN options are still validated for wire-format conformance
+//! (draft-18 §10.2.2) but do not gate admission.
 //!
-//! **`auth=Some(cfg)`:** The scope has a CAT policy. [`ScopeAuthorizer::resolve`]
-//! returns [`DenyAllAuthHook`] in C1 because `CatAuthHook` (C2) is not yet
-//! implemented. The relay session path does not yet call `resolve` (that
-//! wiring arrives in C2), but the hook contract is correct: **`DenyAllAuthHook`
-//! never admits a session** — so once C2 wires in `resolve`, no configured
-//! policy can accidentally admit sessions.
+//! Where a policy is present, enforcement happens at two points:
 //!
-//! This contract is machine-tested in
-//! [`scope::tests::auth_none_allows_auth_some_denies`].
+//! * **Setup.** The AUTHORIZATION TOKEN options from the client's SETUP
+//!   (draft-18 §10.3.1.4) are decoded (see [`decode_setup_tokens`]) and handed
+//!   to [`AuthHook::on_setup`]. A denial terminates the session with
+//!   UNAUTHORIZED (§3.5) before either half of it is constructed.
+//! * **Request.** Authorization-relevant requests are checked against the
+//!   [`Principal`] established at setup, through [`AuthHook::on_request`],
+//!   before the relay acts on them. A denial rejects that request and leaves
+//!   the session running.
 //!
-//! # C2 behavior (planned — do not implement here)
-//!
-//! C2 replaces the `Some(_) → DenyAll` arm in `ScopeAuthorizer::resolve` with
-//! `CatAuthHook::new(cfg)`, adds session-token decoding, relay gate wiring,
-//! and metrics. No C1 type needs to change for that migration.
+//! Cryptography is confined to setup. The identity established there is
+//! carried in a [`Principal`], so per-request checks are pure claim
+//! evaluation. Expiry is re-checked on every request, so no *new* request is
+//! authorized more than [`ScopeAuthConfig::clock_skew`] past the token's
+//! `exp`. That tolerance exists to absorb clock differences between issuer
+//! and relay, and it applies to the per-request check exactly as it does at
+//! setup — so "expired" in practice means `exp + clock_skew`, not `exp`.
 //!
 //! # CAT action mapping (draft-ietf-moq-c4m)
 //!
-//! | Wire Message | [`AuthzOperation`] | CAT `MoqtAction` | Value |
-//! |---|---|---|---|
-//! | SETUP | *(inline in `on_setup`)* | `ClientSetup` | 0 |
-//! | SUBSCRIBE | `Subscribe` | `Subscribe` | 4 |
-//! | SUBSCRIBE_NAMESPACE | `SubscribeNamespace` | `SubscribeNamespace` | 3 |
-//! | PUBLISH | `Publish` | `Publish` | 6 |
-//! | PUBLISH_NAMESPACE | `PublishNamespace` | `PublishNamespace` | 2 |
-//! | FETCH | **`Fetch`** | **`Fetch`** | **7** |
-//! | TRACK_STATUS | `TrackStatus` | `TrackStatus` | 8 |
+//! | Wire message (draft-18) | [`AuthzOperation`] | CAT `moqt` action |
+//! |---|---|---|
+//! | SETUP (§10.3) | *(inside `on_setup`)* | `ClientSetup` (0) |
+//! | PUBLISH_NAMESPACE (§10.15) | `PublishNamespace` | 2 |
+//! | SUBSCRIBE_NAMESPACE (§10.18) | `SubscribeNamespace` | 3 |
+//! | SUBSCRIBE (§10.7) | `Subscribe` | 4 |
+//! | PUBLISH (§10.10) | `Publish` | 6 |
+//! | FETCH (§10.12) | `Fetch` | 7 |
+//! | TRACK_STATUS (§10.14) | `TrackStatus` | 8 |
+//! | SUBSCRIBE_TRACKS (§10.19) | `SubscribeNamespace` *(interim)* | 3 |
 //!
-//! ## Draft-18 note: Fetch uses action 7
+//! FETCH requires `Fetch(7)`; a token that grants only `Subscribe(4)` cannot
+//! fetch. SUBSCRIBE_TRACKS is new in draft-18 and has no CAT action yet.
 //!
-//! Unlike the draft-16 relay (which mapped FETCH to `Subscribe` action 4),
-//! this draft-18 implementation correctly assigns FETCH its own variant.
-//! Token issuers must include action 7 for clients that issue FETCH requests.
+//! # Revocation, and what it does not cover
+//!
+//! Rotating a scope's keys stops new sessions being established with the old
+//! key within one [`ScopeAuthConfig::ttl`], but does **not** terminate
+//! sessions already running: a session holds the hook it was admitted with.
+//! Token expiry is therefore what bounds a compromised credential, which is
+//! why the CAT hook requires `exp` and caps how far ahead it may be.
+//!
+//! Expiry bounds *admission*, not *delivery*. A SUBSCRIBE authorized before
+//! the token expired keeps streaming afterwards, because nothing revisits an
+//! established subscription — so a leaked token buys media for as long as the
+//! session survives, not merely until `exp`. Tearing down in-flight
+//! subscriptions at expiry, and re-resolving the hook when a scope's
+//! configuration changes, are the two pieces that would close this; neither is
+//! implemented.
+//!
+//! # Failing closed
+//!
+//! Once a scope has opted in, anything short of an explicit allow denies:
+//!
+//! * a coordinator that cannot be reached,
+//! * a configuration with no keys, too many keys, or unparseable key material,
+//! * a relay built without the scheme's feature,
+//! * a hook that returns an error,
+//! * a missing, malformed, expired or out-of-scope token.
+//!
+//! The one deliberate exception is a scope that never opted in, which is not
+//! an authorization failure but the absence of a policy.
+//!
+//! [`Coordinator::resolve_scope`]: crate::Coordinator::resolve_scope
+//! [`Coordinator::get_scope_config`]: crate::Coordinator::get_scope_config
+//! [`ScopeAuthConfig`]: crate::ScopeAuthConfig
+//! [`ScopeAuthConfig::clock_skew`]: crate::ScopeAuthConfig::clock_skew
+//! [`ScopeAuthConfig::ttl`]: crate::ScopeAuthConfig::ttl
 
-pub mod hook;
-pub mod scope;
-pub mod token;
-pub mod types;
+mod hook;
+mod scope;
+mod session;
+mod token;
+mod types;
 
-pub use hook::{AllowAllAuthHook, AuthHook, DenyAllAuthHook};
-pub use scope::{ScopeAuthConfig, ScopeAuthorizer};
-pub use token::{
-    decode_setup_tokens, AliasType, SetupToken, TokenError, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
-};
+pub use hook::{AllowAllAuthHook, AuthHook};
+pub use token::{decode_setup_tokens, TokenError, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS};
 pub use types::{
-    AuthDecision, AuthError, AuthRequest, AuthzOperation, DenyReason, Principal, ResourceShape,
+    AuthDecision, AuthError, AuthRequest, AuthToken, AuthzOperation, DenyReason, Principal, Verdict,
 };
+
+pub(crate) use hook::DenyAllAuthHook;
+pub(crate) use scope::ScopeAuthorizer;
+// `authorize` is consumed by the per-request gates, which land separately.
+#[allow(unused_imports)]
+pub(crate) use session::{authorize, SessionAuth};
+
+use crate::DEFAULT_SCOPE_AUTH_TTL;
+
+const UNSCOPED: &str = "<unscoped>";
+
+/// Session termination code for UNAUTHORIZED (draft-18 §3.5, §15.10.1;
+/// unchanged from draft-16).
+pub(crate) const SESSION_ERROR_UNAUTHORIZED: u32 = 0x2;
