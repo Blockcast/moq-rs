@@ -269,6 +269,14 @@ pub struct Session {
 
     /// Maps bidi-request IDs to their response stream writers (draft-18).
     bidi_response_map: BidiResponseMap,
+
+    /// Setup options the peer sent in its SETUP.
+    ///
+    /// Retained in decoded form so the application layer can read options the
+    /// transport does not interpret itself — notably AUTHORIZATION TOKEN
+    /// (draft-18 §10.3.1.4), which the relay's authorization hook decodes.
+    /// Empty for sessions created via `connect()`.
+    setup_params: KeyValuePairs,
 }
 
 impl Session {
@@ -369,6 +377,25 @@ impl Session {
     /// Returns `None` if no path was present or if the path was just "/".
     pub fn connection_path(&self) -> Option<&str> {
         self.connection_path.as_deref()
+    }
+
+    /// Returns the SETUP options sent by the peer.
+    ///
+    /// Only populated for server-side sessions created via [`accept`]; sessions
+    /// created via [`connect`] return an empty set. Options the transport
+    /// interprets itself (PATH) are present here too, but the primary consumer
+    /// is the application layer reading options the transport deliberately
+    /// does not act on, such as AUTHORIZATION TOKEN (draft-18 §10.3.1.4).
+    ///
+    /// The list is returned as decoded, so repeated keys — which
+    /// AUTHORIZATION TOKEN explicitly permits — are all present. Use direct
+    /// iteration rather than [`KeyValuePairs::get`], which returns only the
+    /// first match.
+    ///
+    /// [`accept`]: Self::accept
+    /// [`connect`]: Self::connect
+    pub fn setup_params(&self) -> &KeyValuePairs {
+        &self.setup_params
     }
 
     /// Log a control message with structured fields for observability.
@@ -597,6 +624,9 @@ impl Session {
         }
     }
 
+    // Every argument is independent session state with no natural grouping;
+    // bundling them into a struct would only move the same list one level out.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         webtransport: web_transport::Session,
         sender: Writer,
@@ -604,6 +634,7 @@ impl Session {
         mlog: Option<mlog::MlogWriter>,
         transport: Transport,
         connection_path: Option<String>,
+        setup_params: KeyValuePairs,
         request_id: RequestId,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
@@ -648,6 +679,7 @@ impl Session {
             connection_path,
             bidi_task_rx,
             bidi_response_map,
+            setup_params,
         };
 
         (session, publisher, subscriber)
@@ -748,8 +780,18 @@ impl Session {
 
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, 1);
-        let (session, publisher, subscriber) =
-            Session::new(session, sender, recver, mlog, transport, path, request_id);
+        let (session, publisher, subscriber) = Session::new(
+            session,
+            sender,
+            recver,
+            mlog,
+            transport,
+            path,
+            // Outbound sessions send SETUP options rather than acting on the
+            // peer's, so there is nothing to retain.
+            KeyValuePairs::default(),
+            request_id,
+        );
         // Both roles are always constructed for a client session; propagate
         // rather than panic if that ever stops holding (RFC-022).
         let publisher = publisher.ok_or(SessionError::Internal)?;
@@ -853,6 +895,7 @@ impl Session {
             mlog,
             transport,
             connection_path,
+            client.params,
             request_id,
         ))
     }
