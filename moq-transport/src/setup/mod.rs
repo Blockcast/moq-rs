@@ -13,7 +13,7 @@ mod setup;
 mod version;
 
 pub use auth_token::{
-    decode_setup_tokens, AliasType, AuthToken, SetupTokens, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
+    decode_setup_tokens, AliasType, SetupToken, TokenError, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
 };
 pub use param_types::*;
 pub use setup::*;

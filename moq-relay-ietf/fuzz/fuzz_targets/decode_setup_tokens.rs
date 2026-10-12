@@ -3,17 +3,20 @@
 
 //! Fuzz target for `moq_transport::setup::decode_setup_tokens`.
 //!
-//! Exercises the AUTHORIZATION TOKEN SETUP parameter parser against arbitrary
+//! Exercises the AUTHORIZATION TOKEN setup-option parser against arbitrary
 //! peer-supplied bytes. The production function lives in `moq-transport` (no
 //! C build deps) so the fuzz harness can depend on it directly without
 //! pulling in the relay's TLS/QUIC dependency tree.
 //!
 //! # Invariants asserted
 //!
-//! * `tokens.len() <= MAX_SETUP_TOKENS`
-//! * Accepted token values are non-empty
-//! * `counted <= n_params` (scan limit is correctly bounded)
-//! * `any_present()` iff `tokens.is_empty() == false || skipped > 0`
+//! * Never panics.
+//! * `Ok(tokens)` implies `tokens.len() <= MAX_SETUP_TOKENS` and
+//!   `n_params <= MAX_SETUP_TOKENS`.
+//! * More than `MAX_SETUP_TOKENS` options always errors.
+//! * A decoded token's value is a suffix of the input payload (the value is
+//!   not length-prefixed and the parser must not copy or truncate it).
+//! * Every error maps to a draft-18 §15.10.1 session close code.
 //!
 //! # Run
 //!
@@ -26,29 +29,25 @@
 
 use libfuzzer_sys::fuzz_target;
 use moq_transport::coding::{KeyValuePair, KeyValuePairs};
-use moq_transport::setup::{decode_setup_tokens, AliasType, ParameterType, Setup, MAX_SETUP_TOKENS};
+use moq_transport::setup::{decode_setup_tokens, AliasType, ParameterType, MAX_SETUP_TOKENS};
 
 fuzz_target!(|data: &[u8]| {
     // Interpret input as:
     //   byte[0]  = number of AUTHORIZATION TOKEN copies to include (0-7)
-    //   byte[1..] = the raw parameter payload (shared by all copies)
+    //   byte[1..] = the raw option payload (shared by all copies)
     //
     // This structure lets the engine explore:
-    //   - 0 params (empty Setup)
-    //   - 1-4 params (at/below MAX_SETUP_TOKENS)
-    //   - 5-7 params (above limit, exercises scan-stop path)
+    //   - 0 options (empty SETUP)
+    //   - 1-4 options (at/below MAX_SETUP_TOKENS)
+    //   - 5-7 options (above the limit)
     //   - arbitrary payload bytes
-
     let (count_byte, payload) = match data.split_first() {
         Some((b, rest)) => (*b, rest),
         None => {
-            // Empty input → empty Setup — verify absent case.
-            let result = decode_setup_tokens(&Setup {
-                params: KeyValuePairs::default(),
-            });
-            assert_eq!(result.tokens.len(), 0);
-            assert_eq!(result.skipped, 0);
-            assert!(!result.any_present());
+            // Empty input → empty SETUP — verify the absent case.
+            let empty = KeyValuePairs::default();
+            let tokens = decode_setup_tokens(&empty).expect("absent is ok");
+            assert!(tokens.is_empty());
             return;
         }
     };
@@ -60,32 +59,31 @@ fuzz_target!(|data: &[u8]| {
     for _ in 0..n_params {
         kvps.0.push(KeyValuePair::new_bytes(auth_key, payload.to_vec()));
     }
-    let setup = Setup { params: kvps };
 
     // Call the production function — not a copy.
-    let result = decode_setup_tokens(&setup);
-
-    // Invariants that must hold for any input.
-    assert!(
-        result.tokens.len() <= MAX_SETUP_TOKENS,
-        "accepted tokens must not exceed MAX_SETUP_TOKENS"
-    );
-    assert_eq!(
-        result.any_present(),
-        !result.tokens.is_empty() || result.skipped > 0,
-        "any_present() must match tokens+skipped state"
-    );
-    for token in &result.tokens {
-        assert!(!token.value.is_empty(), "accepted token value must be non-empty");
-    }
-    if n_params > 0 {
-        let counted = result.tokens.len() + result.skipped;
-        assert!(
-            counted <= n_params,
-            "counted ({counted}) cannot exceed n_params ({n_params})"
-        );
+    match decode_setup_tokens(&kvps) {
+        Ok(tokens) => {
+            assert!(tokens.len() <= MAX_SETUP_TOKENS);
+            assert!(n_params <= MAX_SETUP_TOKENS, "over-limit input must error");
+            assert_eq!(tokens.len(), n_params);
+            for token in &tokens {
+                assert!(
+                    payload.ends_with(token.value),
+                    "token value must be the unmodified tail of the option"
+                );
+            }
+        }
+        Err(err) => {
+            assert!(
+                matches!(err.session_error_code(), 0x2 | 0x3 | 0x6),
+                "unexpected session close code {:#x}",
+                err.session_error_code()
+            );
+        }
     }
 
-    // Verify UseValue alias type constant is stable (regression: do not redefine).
-    assert_eq!(AliasType::UseValue as u64, 0x01);
+    // Draft-18 §15.5 Table 11 code points (regression: an earlier port swapped
+    // REGISTER and USE_VALUE).
+    assert_eq!(AliasType::Register as u64, 0x01);
+    assert_eq!(AliasType::UseValue as u64, 0x03);
 });

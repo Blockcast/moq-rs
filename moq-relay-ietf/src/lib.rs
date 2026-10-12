@@ -51,9 +51,9 @@ mod web;
 pub use api::*;
 pub use auth::decode_setup_tokens;
 pub use auth::{
-    AliasType, AllowAllAuthHook, AuthDecision, AuthError, AuthHook, AuthRequest, AuthToken,
-    AuthzOperation, DenyAllAuthHook, DenyReason, Principal, ResourceShape, ScopeAuthConfig,
-    ScopeAuthorizer, SetupTokens, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
+    AliasType, AllowAllAuthHook, AuthDecision, AuthError, AuthHook, AuthRequest, AuthzOperation,
+    DenyAllAuthHook, DenyReason, Principal, ResourceShape, ScopeAuthConfig, ScopeAuthorizer,
+    SetupToken, TokenError, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
 };
 pub use consumer::*;
 pub use coordinator::*;

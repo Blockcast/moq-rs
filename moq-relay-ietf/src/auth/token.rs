@@ -13,12 +13,12 @@
 //!
 //! ```text
 //! AUTHORIZATION TOKEN Option {
-//!   Alias Type (vi),     ; USE_VALUE = 1 (draft-18; was 0x3 in draft-16)
+//!   Alias Type (vi),     ; USE_VALUE = 0x3 (draft-18 §15.5, as in draft-16)
 //!   Token Type (vi),     ; e.g. 0x01 for CAT
 //!   Token Value (..),    ; remainder of the parameter value
 //! }
 //! ```
 
 pub use moq_transport::setup::{
-    decode_setup_tokens, AliasType, AuthToken, SetupTokens, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
+    decode_setup_tokens, AliasType, SetupToken, TokenError, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
 };

@@ -50,7 +50,7 @@ pub mod types;
 pub use hook::{AllowAllAuthHook, AuthHook, DenyAllAuthHook};
 pub use scope::{ScopeAuthConfig, ScopeAuthorizer};
 pub use token::{
-    decode_setup_tokens, AliasType, AuthToken, SetupTokens, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
+    decode_setup_tokens, AliasType, SetupToken, TokenError, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
 };
 pub use types::{
     AuthDecision, AuthError, AuthRequest, AuthzOperation, DenyReason, Principal, ResourceShape,
