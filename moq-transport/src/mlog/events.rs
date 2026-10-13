@@ -170,11 +170,33 @@ pub struct LogLevelEvent {
     pub message: String,
 }
 
+/// Option/parameter type carrying an AUTHORIZATION TOKEN.
+///
+/// The same code point in both registries — draft-18 §10.3.1.4 for setup
+/// options and §10.2.2 for message parameters — so one rule covers both.
+const AUTHORIZATION_TOKEN_PARAM: u64 = 0x3;
+
 // Helper functions to create vector of string pairs from KVPs
 fn key_value_pairs_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)> {
     kvps.iter()
-        .map(|kvp| (kvp.key.to_string(), format!("{:?}", kvp.value)))
+        .map(|kvp| (kvp.key.to_string(), render_parameter(kvp)))
         .collect()
+}
+
+/// Render a parameter for the log, redacting bearer credentials.
+///
+/// `Value`'s `Debug` hex-dumps the first bytes, which for an AUTHORIZATION
+/// TOKEN is a prefix of the credential itself. mlog files are written to disk
+/// with no expiry and can be served over HTTP by the relay, so that prefix
+/// would outlive the session and cross a trust boundary. The length is kept
+/// because it is useful for debugging and discloses nothing.
+fn render_parameter(kvp: &coding::KeyValuePair) -> String {
+    match (&kvp.value, kvp.key) {
+        (coding::Value::BytesValue(bytes), AUTHORIZATION_TOKEN_PARAM) => {
+            format!("[REDACTED {} bytes]", bytes.len())
+        }
+        (value, _) => format!("{value:?}"),
+    }
 }
 
 fn create_control_message_event(
@@ -864,5 +886,29 @@ mod tests {
         assert_eq!(modified["end_of_group"], true);
         assert_eq!(modified["default_priority"], true);
         assert_eq!(modified["first_object"], true);
+    }
+
+    /// An AUTHORIZATION TOKEN must not reach the log. mlog files persist on
+    /// disk and can be served over HTTP, so a credential prefix written here
+    /// outlives the session and crosses a trust boundary.
+    #[test]
+    fn authorization_tokens_are_redacted_in_logs() {
+        let secret = b"super-secret-bearer-token-value".to_vec();
+        let kvps = vec![
+            coding::KeyValuePair::new_bytes(0x3, secret.clone()),
+            coding::KeyValuePair::new_bytes(0x1, b"/tenant/live".to_vec()),
+            coding::KeyValuePair::new_int(0x2, 100),
+        ];
+
+        let rendered = key_value_pairs_to_vec(&kvps);
+
+        let token = &rendered[0].1;
+        assert_eq!(token, &format!("[REDACTED {} bytes]", secret.len()));
+        assert!(!token.contains("73"), "{token} looks like a hex dump");
+        assert!(!token.contains("super"), "{token}");
+
+        // Other parameters are untouched: PATH is not a credential.
+        assert_ne!(rendered[1].1, "[REDACTED 12 bytes]");
+        assert_eq!(rendered[2].1, "100");
     }
 }

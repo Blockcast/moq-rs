@@ -12,6 +12,7 @@ use moq_transport::{
 };
 use tokio::sync::Semaphore;
 
+use crate::auth::{authorize, AuthzOperation, SessionAuth};
 use crate::{
     metrics::GaugeGuard, CacheLease, Coordinator, Locals, Producer, RemoteManager, SessionContext,
     SessionInterface, TrackRequest,
@@ -98,17 +99,30 @@ pub struct Consumer {
     forward: Option<Producer>, // Forward all announcements to this subscriber
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+    /// Authorization state for this session. `None` when the scope has no
+    /// authorization policy, in which case every request is permitted.
+    auth: Option<SessionAuth>,
     publish_track_permits: Arc<Semaphore>,
 }
 
 impl Consumer {
-    pub fn new(
+    /// Create a consumer for a session.
+    ///
+    /// `auth` is the session's authorization state, and is deliberately a
+    /// required argument rather than something attached afterwards: a consumer
+    /// with no authorization accepts every publish, so forgetting to supply it
+    /// must be a compile error rather than a silent grant. `None` states that
+    /// the session needs no authorization — its scope has no policy, or the
+    /// relay dialled the peer itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         subscriber: Subscriber,
         locals: Locals,
         coordinator: Arc<dyn Coordinator>,
         remotes: RemoteManager,
         forward: Option<Producer>,
         context: SessionContext,
+        auth: Option<SessionAuth>,
     ) -> Self {
         Self {
             subscriber,
@@ -117,6 +131,7 @@ impl Consumer {
             remotes,
             forward,
             context,
+            auth,
             publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
         }
     }
@@ -242,6 +257,25 @@ impl Consumer {
             futures::future::BoxFuture<'static, Result<(), anyhow::Error>>,
         > = FuturesUnordered::new();
         let ns = published_ns.namespace.to_utf8_path();
+
+        // Authorize before registering anything: an unauthorized namespace
+        // must leave no trace in the local registry, the discovery state, or
+        // the coordinator. This runs ahead of the proxied branch below, which
+        // mutates discovery state too.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::PublishNamespace {
+                namespace: &published_ns.namespace,
+            },
+            Some(published_ns.info.request_id),
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_announce_errors_total", "phase" => "auth").increment(1);
+            published_ns.reject(reason.request_error_code(), "unauthorized")?;
+            return Err(anyhow::anyhow!("unauthorized publish_namespace"));
+        }
 
         // A namespace forwarded by a peer relay is proxied, not ours, so it is
         // advertised for discovery and nothing more.
@@ -534,6 +568,23 @@ impl Consumer {
         let namespace = publish.namespace().clone();
         let track_name = publish.name().clone();
 
+        // Authorize before taking the reader or registering the track.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::Publish {
+                namespace: &namespace,
+                track: &track_name,
+            },
+            None,
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_publish_errors_total", "phase" => "auth").increment(1);
+            publish.close(ServeError::Closed(reason.request_error_code()));
+            return Err(anyhow::anyhow!("unauthorized publish"));
+        }
+
         // Take the reader first, then follow the same order as PUBLISH_NAMESPACE:
         // local registration → coordinator registration → PUBLISH_OK.
         let reader = match publish.take_reader() {
@@ -644,5 +695,268 @@ mod tests {
         assert!(locals.retrieve_track(None, &full_name).is_none());
         drop(writer);
         drop(upstream);
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization gates, end to end over a loopback session.
+    // -----------------------------------------------------------------------
+
+    mod auth_gates {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use moq_transport::{
+            coding::{TrackNamespace, TrackNamespacePrefix},
+            message::RequestErrorCode,
+            serve::{FullTrackName, ServeError, Track, Tracks},
+            session::{Publisher, Session as TransportSession, SessionError, Transport},
+        };
+
+        use crate::auth::{
+            AuthDecision, AuthError, AuthHook, AuthRequest, AuthToken, DenyReason, Principal,
+            SessionAuth,
+        };
+        use crate::{
+            Consumer, Coordinator, CoordinatorContext, CoordinatorResult, Locals, NamespaceOrigin,
+            NamespaceRegistration, RemoteManager, SessionContext,
+        };
+
+        /// Denies every request, recording the operation labels it saw.
+        #[derive(Default)]
+        struct DenyingHook {
+            seen: Mutex<Vec<&'static str>>,
+        }
+
+        #[async_trait]
+        impl AuthHook for DenyingHook {
+            async fn on_setup(
+                &self,
+                _session: &SessionContext,
+                _tokens: &[AuthToken],
+            ) -> Result<AuthDecision, AuthError> {
+                Ok(AuthDecision::allow(Principal::anonymous()))
+            }
+
+            async fn on_request(
+                &self,
+                request: &AuthRequest<'_>,
+            ) -> Result<AuthDecision, AuthError> {
+                self.seen.lock().unwrap().push(request.operation.label());
+                Ok(AuthDecision::deny(DenyReason::ScopeMismatch))
+            }
+        }
+
+        /// Counts namespace registrations, so a test can show none happened.
+        #[derive(Default)]
+        struct CountingCoordinator {
+            registrations: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Coordinator for CountingCoordinator {
+            async fn register_namespace(
+                &self,
+                _scope: Option<&str>,
+                _namespace: &TrackNamespace,
+                _context: &CoordinatorContext,
+            ) -> CoordinatorResult<NamespaceRegistration> {
+                self.registrations.fetch_add(1, Ordering::SeqCst);
+                Ok(NamespaceRegistration::new(()))
+            }
+
+            async fn unregister_namespace(
+                &self,
+                _scope: Option<&str>,
+                _namespace: &TrackNamespace,
+            ) -> CoordinatorResult<()> {
+                Ok(())
+            }
+
+            async fn lookup(
+                &self,
+                _scope: Option<&str>,
+                _namespace: &TrackNamespace,
+            ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::quic::Client>)>
+            {
+                Err(crate::CoordinatorError::NamespaceNotFound)
+            }
+        }
+
+        async fn loopback_pair() -> (web_transport::Session, web_transport::Session) {
+            use web_transport::quinn::{ClientBuilder, ServerBuilder};
+
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("certificate");
+            let cert_der = cert.cert.der().clone();
+            let key = cert
+                .key_pair
+                .serialize_der()
+                .try_into()
+                .expect("private key");
+            let mut server = ServerBuilder::new()
+                .with_addr("127.0.0.1:0".parse().expect("addr"))
+                .with_certificate(vec![cert_der], key)
+                .expect("server");
+            let addr = server.local_addr().expect("local addr");
+            let accepted = tokio::spawn(async move {
+                server
+                    .accept()
+                    .await
+                    .expect("request")
+                    .ok()
+                    .await
+                    .expect("session")
+            });
+            let client = ClientBuilder::new()
+                .dangerous()
+                .with_no_certificate_verification()
+                .expect("client");
+            let url = url::Url::parse(&format!("https://127.0.0.1:{}/", addr.port())).expect("url");
+            let connected = tokio::time::timeout(Duration::from_secs(10), client.connect(url))
+                .await
+                .expect("connect timed out")
+                .expect("connect");
+            (
+                tokio::time::timeout(Duration::from_secs(10), accepted)
+                    .await
+                    .expect("accept timed out")
+                    .expect("join")
+                    .into(),
+                connected.into(),
+            )
+        }
+
+        /// A relay-side `Consumer` with `context` and a denying hook, and the
+        /// peer's `Publisher`.
+        async fn spawn(
+            locals: Locals,
+            coordinator: Arc<CountingCoordinator>,
+            context: SessionContext,
+            hook: Arc<DenyingHook>,
+        ) -> Publisher {
+            let (server_transport, client_transport) = loopback_pair().await;
+            let (server, client) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    TransportSession::accept(server_transport, None, Transport::WebTransport),
+                    TransportSession::connect(client_transport, None, Transport::WebTransport),
+                )
+            })
+            .await
+            .expect("setup timed out");
+            let (server, _server_publisher, server_subscriber) = server.expect("accept");
+            let (client, client_publisher, _client_subscriber) = client.expect("connect");
+
+            let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+            let consumer = Consumer::new(
+                server_subscriber.expect("server subscriber"),
+                locals,
+                coordinator,
+                remotes,
+                None,
+                context,
+                Some(SessionAuth::new(hook, Principal::anonymous())),
+            );
+            tokio::spawn(async move { server.run().await });
+            tokio::spawn(async move { client.run().await });
+            tokio::spawn(async move { consumer.run().await });
+            client_publisher
+        }
+
+        fn unauthorized() -> ServeError {
+            ServeError::Closed(RequestErrorCode::Unauthorized as u64)
+        }
+
+        async fn assert_publish_namespace_refused(context: SessionContext) {
+            let locals = Locals::new();
+            let coordinator = Arc::new(CountingCoordinator::default());
+            let hook = Arc::new(DenyingHook::default());
+            let mut publisher =
+                spawn(locals.clone(), coordinator.clone(), context, hook.clone()).await;
+
+            let namespace = TrackNamespace::from_utf8_path("secret/ns");
+            let (_writer, _request, reader) = Tracks::new(namespace).produce();
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), publisher.publish_namespace(reader))
+                    .await
+                    .expect("PUBLISH_NAMESPACE response timed out");
+
+            match result {
+                Err(SessionError::Serve(err)) => assert_eq!(err, unauthorized()),
+                other => panic!("expected UNAUTHORIZED, got {other:?}"),
+            }
+            assert_eq!(*hook.seen.lock().unwrap(), vec!["publish_namespace"]);
+            assert_eq!(
+                coordinator.registrations.load(Ordering::SeqCst),
+                0,
+                "a refused namespace must not reach the coordinator"
+            );
+            assert!(
+                locals
+                    .list_namespaces_matching(None, &TrackNamespacePrefix::from_utf8_path("secret"))
+                    .is_empty(),
+                "a refused namespace must leave no local or discovery state"
+            );
+        }
+
+        /// A denied PUBLISH_NAMESPACE is answered with UNAUTHORIZED (draft-18
+        /// §10.6) and leaves no trace in the registry or the coordinator.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn denied_publish_namespace_is_unauthorized_and_unregistered() {
+            assert_publish_namespace_refused(SessionContext::public(None)).await;
+        }
+
+        /// The same holds on a peer-relay session. The proxied branch mutates
+        /// discovery state, so authorization must run before it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn denied_proxied_publish_namespace_is_unauthorized_and_unregistered() {
+            assert_publish_namespace_refused(SessionContext::internal(None, None)).await;
+        }
+
+        /// A denied PUBLISH is answered with UNAUTHORIZED and the track is not
+        /// registered.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn denied_publish_is_unauthorized_and_unregistered() {
+            let locals = Locals::new();
+            let coordinator = Arc::new(CountingCoordinator::default());
+            let hook = Arc::new(DenyingHook::default());
+            let mut publisher = spawn(
+                locals.clone(),
+                coordinator.clone(),
+                SessionContext::public(None),
+                hook.clone(),
+            )
+            .await;
+
+            let namespace = TrackNamespace::from_utf8_path("secret/ns");
+            let (_writer, reader) = Track::new(namespace.clone(), "video").produce();
+            let mut published = tokio::time::timeout(
+                Duration::from_secs(2),
+                publisher.publish(reader, Default::default()),
+            )
+            .await
+            .expect("PUBLISH timed out")
+            .expect("PUBLISH sent");
+            let result = tokio::time::timeout(Duration::from_secs(2), published.ok())
+                .await
+                .expect("PUBLISH response timed out");
+
+            assert_eq!(result, Err(unauthorized()));
+            assert_eq!(*hook.seen.lock().unwrap(), vec!["publish"]);
+            assert!(locals
+                .retrieve_track(
+                    None,
+                    &FullTrackName {
+                        namespace,
+                        name: "video".into(),
+                    }
+                )
+                .is_none());
+            assert_eq!(coordinator.registrations.load(Ordering::SeqCst), 0);
+        }
     }
 }

@@ -139,6 +139,37 @@ impl PublishedNamespace {
         });
         Ok(())
     }
+
+    /// Reject the PUBLISH_NAMESPACE with an explicit REQUEST_ERROR code
+    /// (draft-18 §10.6); the error is sent on drop.
+    ///
+    /// Mirrors [`SubscribedNamespace::reject`], letting a caller distinguish
+    /// "not interested" from "not permitted" (e.g. UNAUTHORIZED).
+    ///
+    /// `reason` is sent to the peer in the Reason Phrase, so it must describe
+    /// the rejection without disclosing anything the peer is not entitled to
+    /// learn.
+    ///
+    /// Only meaningful before [`ok`](Self::ok): once accepted, dropping the
+    /// namespace cancels its request stream and no REQUEST_ERROR is sent.
+    ///
+    /// [`SubscribedNamespace::reject`]: super::SubscribedNamespace::reject
+    pub fn reject(mut self, error_code: u64, reason: &str) -> Result<(), ServeError> {
+        tracing::debug!(
+            namespace = %self.info.namespace,
+            request_id = self.info.request_id,
+            error_code,
+            reason,
+            "rejecting PUBLISH_NAMESPACE"
+        );
+        self.error = Some(message::RequestError {
+            id: self.info.request_id,
+            error_code,
+            retry_interval: 0,
+            reason: ReasonPhrase(reason.to_string()),
+        });
+        Ok(())
+    }
 }
 
 impl ops::Deref for PublishedNamespace {
@@ -352,6 +383,36 @@ mod tests {
             recv.outgoing.recv().await,
             Some(StreamAction::Cancel(CANCELLED_STREAM_CODE))
         ));
+    }
+
+    #[tokio::test]
+    async fn reject_sends_the_given_code_and_reason() {
+        let (published, mut recv) = pair().await;
+        published
+            .reject(RequestErrorCode::Unauthorized as u64, "unauthorized")
+            .unwrap();
+
+        match recv.outgoing.recv().await {
+            Some(StreamAction::Response(Message::RequestError(err))) => {
+                assert_eq!(err.id, 6);
+                assert_eq!(err.error_code, RequestErrorCode::Unauthorized as u64);
+                assert_eq!(err.reason.0, "unauthorized");
+            }
+            _ => panic!("expected REQUEST_ERROR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_still_sends_uninterested() {
+        let (published, mut recv) = pair().await;
+        published.close(ServeError::Done).unwrap();
+
+        match recv.outgoing.recv().await {
+            Some(StreamAction::Response(Message::RequestError(err))) => {
+                assert_eq!(err.error_code, RequestErrorCode::Uninterested as u64);
+            }
+            _ => panic!("expected REQUEST_ERROR"),
+        }
     }
 
     #[tokio::test]

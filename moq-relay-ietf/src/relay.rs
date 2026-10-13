@@ -10,6 +10,7 @@ use moq_native_ietf::quic::{self, Endpoint};
 use moq_transport::session::SessionConfig;
 use url::Url;
 
+use crate::auth::{decode_setup_tokens, ScopeAuthorizer, SessionAuth, SESSION_ERROR_UNAUTHORIZED};
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
     metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
@@ -89,6 +90,149 @@ impl RelayConfig {
     }
 }
 
+/// Why a session was refused at setup.
+///
+/// Carries the QUIC application close code and a fixed reason phrase. The
+/// phrase is deliberately coarse: the peer learns that it was refused, not why
+/// validation failed.
+#[derive(Debug)]
+struct SessionRejection {
+    code: u32,
+    reason: &'static str,
+}
+
+/// Authorize an accepted session against its scope's policy.
+///
+/// Returns the session's authorization state, or `None` when the scope has no
+/// policy. Every failure path refuses the session: the relay never proceeds
+/// with a connection it could not positively authorize.
+///
+/// Takes the peer's SETUP options rather than the session so the admission
+/// decision is unit-testable without a live transport.
+async fn authorize_session(
+    authorizer: &ScopeAuthorizer,
+    context: &SessionContext,
+    setup_params: &moq_transport::coding::KeyValuePairs,
+) -> Result<Option<SessionAuth>, SessionRejection> {
+    // Decode before resolving the scope's policy. Draft-18 §10.2.2 makes
+    // rejecting a malformed Token structure, or an alias directive in SETUP,
+    // an unconditional obligation on the receiver -- it is not predicated on
+    // the receiver requiring authorization. Doing this after the policy lookup
+    // would skip both MUSTs for every scope that has no policy, which is the
+    // default.
+    let tokens = match decode_setup_tokens(setup_params) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            // A wire-format violation, so the close code comes from the draft
+            // rather than being UNAUTHORIZED.
+            tracing::debug!(
+                scope = context.scope(),
+                error = %err,
+                "invalid AUTHORIZATION TOKEN option in SETUP"
+            );
+            metrics::counter!(
+                "moq_relay_auth_denied_total",
+                "phase" => "setup",
+                "operation" => "client_setup",
+                "reason" => err.metric_label(),
+            )
+            .increment(1);
+            return Err(SessionRejection {
+                code: err.session_error_code(),
+                reason: err.reason_phrase(),
+            });
+        }
+    };
+
+    let hook = match authorizer.resolve(context.scope()).await {
+        Ok(Some(hook)) => hook,
+        // The scope did not opt in to token authorization.
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            // We could not learn whether this scope requires a token, so we
+            // must not assume it does not.
+            tracing::error!(
+                scope = context.scope(),
+                error = %err,
+                "could not determine the scope's authorization policy"
+            );
+            metrics::counter!("moq_relay_auth_errors_total", "stage" => "scope_config")
+                .increment(1);
+            return Err(SessionRejection {
+                code: SESSION_ERROR_UNAUTHORIZED,
+                reason: "authorization unavailable",
+            });
+        }
+    };
+
+    let decision = hook.on_setup(context, &tokens).await.map_err(|err| {
+        tracing::error!(
+            scope = context.scope(),
+            error = %err,
+            "authorization hook failed during setup"
+        );
+        metrics::counter!("moq_relay_auth_errors_total", "stage" => "setup").increment(1);
+        SessionRejection {
+            code: SESSION_ERROR_UNAUTHORIZED,
+            reason: "authorization unavailable",
+        }
+    })?;
+
+    match decision.into_principal() {
+        Ok(principal) => {
+            tracing::debug!(
+                scope = context.scope(),
+                subject = principal.subject(),
+                "session authorized"
+            );
+            Ok(Some(SessionAuth::new(hook, principal)))
+        }
+        Err(reason) => {
+            tracing::debug!(
+                scope = context.scope(),
+                reason = %reason,
+                "session authorization denied"
+            );
+            metrics::counter!(
+                "moq_relay_auth_denied_total",
+                "phase" => "setup",
+                "operation" => "client_setup",
+                "reason" => reason.label(),
+            )
+            .increment(1);
+            Err(SessionRejection {
+                code: SESSION_ERROR_UNAUTHORIZED,
+                reason: "unauthorized",
+            })
+        }
+    }
+}
+
+/// The scope identity used for this session's coordinator calls and media
+/// lookups.
+///
+/// An unscoped session and one whose `scope_id` is empty are the same thing,
+/// and are normalized to `None` here so that they stay the same thing
+/// everywhere downstream. [`Locals`] already collapses the two into one media
+/// bucket (it keys unscoped sessions under `""`), but [`ScopeAuthorizer`]
+/// caches by `Option<String>`, where `None` and `Some("")` are distinct keys.
+/// Left unnormalized, a coordinator that returned an empty `scope_id` could
+/// have its authorization policy looked up under one key while its media
+/// landed in the other's bucket — an unauthenticated session sharing tracks
+/// with an enforced one.
+///
+/// Not reachable through the in-tree coordinators, whose `scope_id` comes from
+/// a connection path that [`Session::normalize_connection_path`] never yields
+/// empty. It is reachable through a custom [`Coordinator`], which is reason
+/// enough to close it here rather than rely on every implementation not to.
+///
+/// [`Session::normalize_connection_path`]: moq_transport::session::Session::normalize_connection_path
+fn normalize_scope_id(scope_info: Option<&crate::ScopeInfo>) -> Option<String> {
+    scope_info
+        .map(|info| info.scope_id.clone())
+        .filter(|scope_id| !scope_id.is_empty())
+}
+
 /// MoQ Relay server.
 pub struct Relay {
     config: RelayConfig,
@@ -96,6 +240,10 @@ pub struct Relay {
     remotes: RemoteManager,
     upstream_namespaces: UpstreamNamespaces,
     upstream_namespaces_runner: UpstreamNamespacesRunner,
+
+    /// Per-scope authorization policy, resolved from the coordinator and
+    /// cached. Shared by every accepted connection.
+    authorizer: Arc<ScopeAuthorizer>,
 }
 
 impl Relay {
@@ -160,6 +308,7 @@ impl Relay {
         .with_cache_idle_timeout(cache_idle_timeout);
         let (upstream_namespaces, upstream_namespaces_runner) =
             UpstreamNamespaces::new(locals.clone(), remotes.clone(), config.coordinator.clone());
+        let authorizer = Arc::new(ScopeAuthorizer::new(config.coordinator.clone()));
 
         Ok(Self {
             config,
@@ -167,6 +316,7 @@ impl Relay {
             remotes,
             upstream_namespaces,
             upstream_namespaces_runner,
+            authorizer,
         })
     }
 
@@ -178,6 +328,7 @@ impl Relay {
             remotes,
             upstream_namespaces,
             upstream_namespaces_runner,
+            authorizer,
         } = self;
 
         let RelayConfig {
@@ -238,6 +389,39 @@ impl Relay {
                 // Multi-scope forwarding (routing different incoming scopes to different
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
+                // The forward link is bidirectional: the upstream can publish
+                // and subscribe back into this scope over it. Token
+                // authorization is not applied — the relay has no credential
+                // of its own to present, and the upstream is operator-chosen —
+                // so if the scope does require tokens, say so loudly rather
+                // than leaving an unauthenticated path into it undocumented at
+                // runtime.
+                match coordinator.get_scope_config(forward_scope.as_deref()).await {
+                    Ok(config) if config.auth.is_some() => {
+                        tracing::warn!(
+                            url = %url,
+                            scope = forward_scope.as_deref(),
+                            "--announce targets a scope that requires token authorization, but \
+                             the forward link is not authorized: the upstream relay can publish \
+                             and subscribe in this scope without presenting a token. Ensure the \
+                             announce target is trusted and reachable only over a trusted path."
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        // Not fatal — the link is operator-configured either
+                        // way — but the warning above is the only signal that
+                        // this path exists, so its absence must not be silent.
+                        tracing::warn!(
+                            url = %url,
+                            scope = forward_scope.as_deref(),
+                            error = %err,
+                            "could not determine whether the --announce target's scope requires \
+                             token authorization; the forward link is unauthorized regardless"
+                        );
+                    }
+                }
+
                 let forward_context = SessionContext::internal(
                     forward_scope,
                     Some(RelayInfo::new(url.clone())),
@@ -252,6 +436,8 @@ impl Relay {
                         remote_manager.clone(),
                         upstream_namespaces.clone(),
                         forward_context.clone(),
+                        // Relay-initiated and operator-configured: no token.
+                        None,
                     )),
                     consumer: Some(Consumer::new(
                         subscriber,
@@ -260,6 +446,7 @@ impl Relay {
                         remote_manager.clone(),
                         None,
                         forward_context,
+                        None,
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
@@ -334,6 +521,7 @@ impl Relay {
                         let coordinator = coordinator.clone();
                         let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
+                        let authorizer = authorizer.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -396,7 +584,7 @@ impl Relay {
                             // connection is treated as a public client. For connections
                             // classified internal, the peer relay identity is derived from
                             // the inbound socket address (see RelayInfo::from_socket_addr).
-                            let scope = scope_info.as_ref().map(|info| info.scope_id.clone());
+                            let scope = normalize_scope_id(scope_info.as_ref());
                             let context = match connection_tagger.as_ref() {
                                 Some(tagger) => {
                                     let meta = ConnectionMeta::new(
@@ -445,6 +633,39 @@ impl Relay {
                                 );
                             }
 
+                            // Authorize the session, if this scope requires it.
+                            //
+                            // resolve_scope() established *which* scope this
+                            // connection belongs to and its coarse permissions;
+                            // this establishes *who* the peer is, from the
+                            // AUTHORIZATION TOKEN in the client's SETUP. It
+                            // runs before either session half is built so that
+                            // an unauthorized peer never gets one.
+                            let session_auth = match authorize_session(
+                                &authorizer,
+                                &context,
+                                moq_session.setup_params(),
+                            ).await {
+                                Ok(auth) => auth,
+                                Err(rejection) => {
+                                    tracing::info!(
+                                        connection_path = moq_session.connection_path(),
+                                        scope = context.scope(),
+                                        code = rejection.code,
+                                        reason = rejection.reason,
+                                        "session authorization failed, closing"
+                                    );
+                                    // As with scope resolution above this is a
+                                    // QUIC APPLICATION_CLOSE rather than a
+                                    // MoQT-level close; the code is the
+                                    // draft-18 §15.10.1 session error code.
+                                    raw_conn.close(rejection.code, rejection.reason);
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "auth_setup").increment(1);
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                    return Ok(());
+                                }
+                            };
+
                             // Gate Producer/Consumer creation on permissions.
                             // Note the intentional inversion:
                             // - Producer serves SUBSCRIBEs → gated on can_subscribe
@@ -454,13 +675,13 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone())), None)
+                                (publisher.map(|publisher| Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone(), session_auth.clone())), None)
                             } else {
                                 (None, publisher)
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context, session_auth)), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -502,5 +723,346 @@ impl Relay {
 
         remotes.shutdown().await;
         run_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{ScopeInfo, ScopePermissions};
+
+    fn scope_info(scope_id: &str) -> ScopeInfo {
+        ScopeInfo {
+            scope_id: scope_id.to_string(),
+            permissions: ScopePermissions::ReadWrite,
+        }
+    }
+
+    #[test]
+    fn a_named_scope_is_preserved() {
+        assert_eq!(
+            normalize_scope_id(Some(&scope_info("tenant"))),
+            Some("tenant".to_string())
+        );
+        // Including shapes that merely look empty.
+        assert_eq!(
+            normalize_scope_id(Some(&scope_info("/"))),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            normalize_scope_id(Some(&scope_info(" "))),
+            Some(" ".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unscoped_session_stays_unscoped() {
+        assert_eq!(normalize_scope_id(None), None);
+    }
+
+    /// The case this exists for: `Some("")` and `None` must not be distinct
+    /// keys, or a scope's authorization policy and its media could be looked
+    /// up under different ones.
+    #[test]
+    fn an_empty_scope_id_is_normalized_to_unscoped() {
+        assert_eq!(normalize_scope_id(Some(&scope_info(""))), None);
+        assert_eq!(
+            normalize_scope_id(Some(&scope_info(""))),
+            normalize_scope_id(None),
+            "an empty scope id and no scope must agree"
+        );
+    }
+
+    /// `Locals` keys unscoped media under `""`, so normalizing to `None` here
+    /// is what keeps the authorization key and the media key in agreement.
+    #[test]
+    fn normalization_agrees_with_the_locals_bucket() {
+        let normalized = normalize_scope_id(Some(&scope_info("")));
+        assert_eq!(normalized.as_deref().unwrap_or(""), "");
+        assert_eq!(
+            normalize_scope_id(None).as_deref().unwrap_or(""),
+            normalized.as_deref().unwrap_or(""),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session admission
+    // -----------------------------------------------------------------------
+
+    mod admission {
+        use super::*;
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use async_trait::async_trait;
+        use moq_transport::coding::{Encode, KeyValuePair, KeyValuePairs, TrackNamespace, VarInt};
+        use moq_transport::setup::ParameterType;
+
+        use crate::{
+            AuthPublicKey, CoordinatorContext, CoordinatorError, CoordinatorResult,
+            NamespaceOrigin, NamespaceRegistration, ScopeAuthConfig, ScopeConfig,
+        };
+
+        /// Serves a fixed scope configuration, or fails every lookup.
+        struct FixedConfig {
+            config: ScopeConfig,
+            fail: AtomicBool,
+        }
+
+        impl FixedConfig {
+            fn new(config: ScopeConfig) -> Arc<Self> {
+                Arc::new(Self {
+                    config,
+                    fail: AtomicBool::new(false),
+                })
+            }
+
+            fn failing() -> Arc<Self> {
+                let this = Self::new(ScopeConfig::default());
+                this.fail.store(true, Ordering::SeqCst);
+                this
+            }
+        }
+
+        #[async_trait]
+        impl Coordinator for FixedConfig {
+            async fn register_namespace(
+                &self,
+                _scope: Option<&str>,
+                _namespace: &TrackNamespace,
+                _context: &CoordinatorContext,
+            ) -> CoordinatorResult<NamespaceRegistration> {
+                Ok(NamespaceRegistration::new(()))
+            }
+
+            async fn unregister_namespace(
+                &self,
+                _scope: Option<&str>,
+                _namespace: &TrackNamespace,
+            ) -> CoordinatorResult<()> {
+                Ok(())
+            }
+
+            async fn lookup(
+                &self,
+                _scope: Option<&str>,
+                _namespace: &TrackNamespace,
+            ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+                Err(CoordinatorError::NamespaceNotFound)
+            }
+
+            async fn get_scope_config(
+                &self,
+                _scope: Option<&str>,
+            ) -> CoordinatorResult<ScopeConfig> {
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(CoordinatorError::Other(anyhow::anyhow!("backend down")));
+                }
+                Ok(self.config.clone())
+            }
+        }
+
+        fn enforced() -> ScopeConfig {
+            ScopeConfig {
+                auth: Some(ScopeAuthConfig::new(vec![AuthPublicKey::es256(
+                    "-----BEGIN PUBLIC KEY-----\nplaceholder\n-----END PUBLIC KEY-----\n",
+                )])),
+                ..Default::default()
+            }
+        }
+
+        fn context() -> SessionContext {
+            SessionContext::public(Some("tenant".to_string()))
+        }
+
+        fn varint(value: u64) -> Vec<u8> {
+            let mut buf = Vec::new();
+            VarInt::from(value).encode(&mut buf).unwrap();
+            buf
+        }
+
+        fn setup_with(values: Vec<Vec<u8>>) -> KeyValuePairs {
+            let key = u64::from(ParameterType::AuthorizationToken);
+            KeyValuePairs(
+                values
+                    .into_iter()
+                    .map(|value| KeyValuePair::new_bytes(key, value))
+                    .collect(),
+            )
+        }
+
+        /// USE_VALUE (draft-18 0x3) carrying a CAT-typed payload.
+        fn use_value_token() -> Vec<u8> {
+            let mut value = varint(0x3);
+            value.extend_from_slice(&varint(crate::CAT_TOKEN_TYPE));
+            value.extend_from_slice(b"not-a-real-cat");
+            value
+        }
+
+        async fn admit(
+            coordinator: Arc<FixedConfig>,
+            params: &KeyValuePairs,
+        ) -> Result<Option<SessionAuth>, SessionRejection> {
+            let authorizer = ScopeAuthorizer::new(coordinator);
+            authorize_session(&authorizer, &context(), params).await
+        }
+
+        /// A scope with no policy behaves exactly as before: admitted, and the
+        /// session carries no authorization state.
+        #[tokio::test]
+        async fn a_scope_without_policy_admits_with_no_auth_state() {
+            let auth = admit(
+                FixedConfig::new(ScopeConfig::default()),
+                &KeyValuePairs::default(),
+            )
+            .await
+            .expect("admitted");
+            assert!(auth.is_none());
+
+            // A well-formed token is ignored rather than refused.
+            let auth = admit(
+                FixedConfig::new(ScopeConfig::default()),
+                &setup_with(vec![use_value_token()]),
+            )
+            .await
+            .expect("admitted");
+            assert!(auth.is_none());
+        }
+
+        /// The wire-format MUSTs apply whether or not the scope has a policy.
+        #[tokio::test]
+        async fn a_malformed_token_is_refused_even_without_policy() {
+            let err = admit(
+                FixedConfig::new(ScopeConfig::default()),
+                &setup_with(vec![varint(0x2)]), // USE_ALIAS in SETUP
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(err.code, 0x3, "PROTOCOL_VIOLATION (draft-18 §10.2.2)");
+
+            let err = admit(
+                FixedConfig::new(ScopeConfig::default()),
+                &setup_with(vec![varint(0x9)]), // unknown alias type
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(
+                err.code, 0x6,
+                "KEY_VALUE_FORMATTING_ERROR (draft-18 §10.2.2)"
+            );
+        }
+
+        /// A policy whose token is absent, or not a valid CAT, refuses with
+        /// UNAUTHORIZED — never admits. Without `auth-cat` the scope cannot
+        /// build a hook at all; with it, the placeholder key is unusable.
+        /// Either way it must fail closed.
+        #[tokio::test]
+        async fn a_configured_policy_fails_closed() {
+            for params in [
+                KeyValuePairs::default(),
+                setup_with(vec![use_value_token()]),
+            ] {
+                let err = admit(FixedConfig::new(enforced()), &params)
+                    .await
+                    .expect_err("must not admit");
+                assert_eq!(err.code, SESSION_ERROR_UNAUTHORIZED);
+                assert_eq!(err.reason, "unauthorized");
+            }
+        }
+
+        /// If the relay cannot learn the scope's policy it must not assume
+        /// there is none.
+        #[tokio::test]
+        async fn an_unreachable_coordinator_fails_closed() {
+            let err = admit(FixedConfig::failing(), &KeyValuePairs::default())
+                .await
+                .expect_err("must not admit");
+            assert_eq!(err.code, SESSION_ERROR_UNAUTHORIZED);
+            assert_eq!(err.reason, "authorization unavailable");
+        }
+
+        /// The reason phrase is fixed text: nothing from the token or the
+        /// validation failure reaches the peer.
+        #[tokio::test]
+        async fn rejection_reasons_are_fixed_text() {
+            let err = admit(
+                FixedConfig::new(enforced()),
+                &setup_with(vec![use_value_token()]),
+            )
+            .await
+            .expect_err("refused");
+            assert!(!err.reason.contains("not-a-real-cat"));
+            assert!(!err.reason.contains("auth-cat"));
+        }
+
+        /// End to end through the draft-18 wire encoding: a real CAT in a
+        /// USE_VALUE (0x3) SETUP option admits; the same token with the
+        /// wrong key, or a SETUP with no token, is refused.
+        #[cfg(feature = "auth-cat")]
+        #[tokio::test]
+        async fn a_valid_cat_in_setup_is_admitted() {
+            use cat_token::{encode_token, CatToken, Es256Algorithm, MoqtAction, MoqtScopeBuilder};
+            use p256::pkcs8::EncodePublicKey;
+
+            fn key() -> (Es256Algorithm, String) {
+                let signer = Es256Algorithm::new_with_key_pair().expect("keypair");
+                let pem = signer
+                    .verifying_key()
+                    .to_public_key_pem(Default::default())
+                    .expect("pem");
+                (signer, pem)
+            }
+
+            let (signer, pem) = key();
+            let (other_signer, _) = key();
+            let config = ScopeConfig {
+                auth: Some(
+                    ScopeAuthConfig::new(vec![AuthPublicKey::es256(pem)])
+                        .with_issuers(vec!["issuer".to_string()])
+                        .with_audiences(vec!["relay".to_string()]),
+                ),
+                ..Default::default()
+            };
+
+            let mint = |signer: &Es256Algorithm| {
+                let token = CatToken::new()
+                    .with_issuer("issuer")
+                    .with_single_audience("relay")
+                    .with_subject("alice")
+                    .with_expires_in(600)
+                    .with_moqt_scope(
+                        MoqtScopeBuilder::new()
+                            .action(MoqtAction::ClientSetup)
+                            .build(),
+                    );
+                let mut value = varint(0x3); // USE_VALUE, draft-18 §15.5
+                value.extend_from_slice(&varint(crate::CAT_TOKEN_TYPE));
+                value.extend_from_slice(&encode_token(&token, signer).expect("encode"));
+                value
+            };
+
+            let auth = admit(
+                FixedConfig::new(config.clone()),
+                &setup_with(vec![mint(&signer)]),
+            )
+            .await
+            .expect("valid token admits")
+            .expect("enforced scope carries auth state");
+            assert_eq!(auth.subject(), Some("alice"));
+
+            let err = admit(
+                FixedConfig::new(config.clone()),
+                &setup_with(vec![mint(&other_signer)]),
+            )
+            .await
+            .expect_err("wrong key refused");
+            assert_eq!(err.code, SESSION_ERROR_UNAUTHORIZED);
+
+            let err = admit(FixedConfig::new(config), &KeyValuePairs::default())
+                .await
+                .expect_err("missing token refused");
+            assert_eq!(err.code, SESSION_ERROR_UNAUTHORIZED);
+        }
     }
 }
