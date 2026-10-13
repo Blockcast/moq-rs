@@ -411,8 +411,15 @@ fn validate_public_key_pem(pem: &str) -> Result<(), ScopeConfigError> {
 /// and the parsed result is still reused if the config file and every key
 /// file it references are byte-for-byte unchanged. Change detection is by
 /// content rather than mtime so that two edits within one timestamp tick are
-/// not missed. Only a fingerprint is retained, not the bytes, so no copy of
-/// the file outlives the read.
+/// not missed. Only fingerprints of the raw file contents are retained; the
+/// read buffers are dropped once parsed. The parsed policies do keep each
+/// public key's PEM text, which the library needs to build its verifier.
+///
+/// The files are read with the state lock held, so concurrent lookups wait
+/// for one load rather than each reading the files. A filesystem that hangs
+/// (a stale network mount, say) therefore stalls every lookup behind it.
+/// Lookups run on the blocking pool, so the async runtime is unaffected, and
+/// stalled sessions are not admitted.
 pub struct ScopeConfigSource {
     path: PathBuf,
     revalidate_interval: Duration,
@@ -484,8 +491,9 @@ impl ScopeConfigSource {
     /// Load the file, reusing the previous result if nothing changed.
     ///
     /// Logs only when the outcome changes. The library does not cache a
-    /// failed lookup, so a broken file is re-read for every connection, and
-    /// logging each one would bury the first, useful, message.
+    /// failed lookup, so a broken file is re-read once per
+    /// [`REVALIDATE_INTERVAL`] for as long as sessions keep arriving, and
+    /// logging each read would bury the first, useful, message.
     fn load(&self) -> Result<Arc<ScopePolicies>, ScopeConfigError> {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
 
