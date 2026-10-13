@@ -18,6 +18,6 @@ If the publisher disconnects, then all subscribers receive an error and will not
 
 ## Authorization
 
-Per-scope bearer-token authorization is configured via `ScopeConfig.auth`. When a scope has an auth policy, every accepted client session must present a valid token in the SETUP AUTHORIZATION TOKEN option (draft-ietf-moq-transport-18 §10.3.1.4), and the session is closed with UNAUTHORIZED otherwise. Scopes without a policy are unaffected. Known gap: relay-to-relay `--announce` forward links are relay-initiated and currently do not present a token; they emit a warning when connecting to an auth-enabled scope.
+Per-scope bearer-token authorization is configured via `ScopeConfig.auth`. When a scope has an auth policy, every accepted client session must present a valid token in the SETUP AUTHORIZATION TOKEN option (draft-ietf-moq-transport-18 §10.3.1.4), and the session is closed with UNAUTHORIZED otherwise. Scopes without a policy are unaffected. Until a token scheme is built in (the `auth-cat` feature), a scope with a policy cannot verify any token and refuses every session. Known gap: relay-to-relay `--announce` forward links are relay-initiated and currently do not present a token; they emit a warning when connecting to an auth-enabled scope.
 
 The enforcement model and fail-closed contract are documented in `src/auth/mod.rs`.

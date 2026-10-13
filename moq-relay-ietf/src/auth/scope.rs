@@ -17,6 +17,16 @@ use crate::{Coordinator, ScopeAuthConfig};
 /// against the coordinator.
 const BROKEN_CONFIG_TTL: Duration = Duration::from_secs(30);
 
+/// Upper bound on cached scopes.
+///
+/// The cache key is the resolved scope ID, and with the default
+/// [`Coordinator::resolve_scope`] that is the client-chosen connection path, so
+/// without a bound a peer could grow the cache by connecting with fresh paths.
+/// When the cache is full, expired entries are pruned; if it is still full the
+/// policy is resolved normally but not cached. That costs a coordinator call
+/// for that connection but never changes the decision.
+const MAX_CACHED_SCOPES: usize = 1024;
+
 /// Builds and caches the authorization hook for each scope.
 ///
 /// [`Coordinator::get_scope_config`] is the source of truth for a scope's
@@ -123,26 +133,42 @@ impl ScopeAuthorizer {
 
     fn cached(&self, scope: Option<&str>) -> Option<CacheEntry> {
         let cache = self.cache.read().unwrap_or_else(|err| err.into_inner());
-        // `Option<&str>` cannot look up an `Option<String>` key directly, and
-        // the map is small (one entry per active scope), so an equality scan
-        // avoids allocating a key on every cache hit.
+        // `Option<&str>` cannot look up an `Option<String>` key directly, so
+        // the key is allocated. A hashed lookup keeps this O(1) however many
+        // scopes are cached, which a linear scan would not.
         cache
-            .iter()
-            .find(|(key, _)| key.as_deref() == scope)
-            .map(|(_, entry)| entry)
+            .get(&scope.map(str::to_string))
             .filter(|entry| entry.expires_at > Instant::now())
             .cloned()
     }
 
     fn store(&self, scope: Option<&str>, state: CacheState, ttl: Duration) {
         let mut cache = self.cache.write().unwrap_or_else(|err| err.into_inner());
+        let key = scope.map(str::to_string);
+        if cache.len() >= MAX_CACHED_SCOPES && !cache.contains_key(&key) {
+            let now = Instant::now();
+            cache.retain(|_, entry| entry.expires_at > now);
+            if cache.len() >= MAX_CACHED_SCOPES {
+                // Still full of live entries: resolve without caching rather
+                // than evict a scope that is in use.
+                return;
+            }
+        }
         cache.insert(
-            scope.map(str::to_string),
+            key,
             CacheEntry {
                 state,
                 expires_at: Instant::now() + ttl,
             },
         );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.cache
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .len()
     }
 
     /// Drop a scope's cached policy, forcing the next session to re-fetch it.
@@ -485,5 +511,54 @@ mod tests {
         authorizer.invalidate(Some("tenant"));
         authorizer.resolve(Some("tenant")).await.unwrap();
         assert_eq!(coordinator.calls(), 2);
+    }
+
+    /// The key is peer-influenced, so the cache must not grow without bound,
+    /// and a full cache must still produce correct decisions.
+    #[tokio::test]
+    async fn the_cache_is_bounded_and_still_decides_when_full() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        for i in 0..MAX_CACHED_SCOPES + 10 {
+            let scope = format!("/path-{i}");
+            assert!(authorizer.resolve(Some(&scope)).await.unwrap().is_none());
+        }
+        assert_eq!(authorizer.len(), MAX_CACHED_SCOPES);
+
+        // An uncached scope is resolved on every call, not wrongly answered.
+        let calls = coordinator.calls();
+        authorizer.resolve(Some("/overflow")).await.unwrap();
+        authorizer.resolve(Some("/overflow")).await.unwrap();
+        assert_eq!(coordinator.calls(), calls + 2);
+
+        // A cached scope still hits.
+        let calls = coordinator.calls();
+        authorizer.resolve(Some("/path-0")).await.unwrap();
+        assert_eq!(coordinator.calls(), calls);
+    }
+
+    /// A full cache whose entries have expired makes room instead of refusing
+    /// to cache.
+    #[tokio::test]
+    async fn expired_entries_are_pruned_when_the_cache_is_full() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        for i in 0..MAX_CACHED_SCOPES {
+            authorizer.store(
+                Some(&format!("/stale-{i}")),
+                CacheState::Disabled,
+                Duration::from_nanos(1),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        authorizer.resolve(Some("/fresh")).await.unwrap();
+        assert_eq!(authorizer.len(), 1, "expired entries must be pruned");
+
+        let calls = coordinator.calls();
+        authorizer.resolve(Some("/fresh")).await.unwrap();
+        assert_eq!(coordinator.calls(), calls, "the new entry must be cached");
     }
 }
