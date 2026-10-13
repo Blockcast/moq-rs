@@ -24,4 +24,4 @@ The enforcement model and fail-closed contract are documented in `src/auth/mod.r
 
 The `auth-cat` crate feature, which provides Common Access Token (CAT, draft-ietf-moq-c4m) verification, is off by default. A relay built without it cannot verify any token, so every scope with a policy refuses all sessions. Embedders that want token enforcement enable the feature and supply `ScopeAuthConfig` through `Coordinator::get_scope_config`.
 
-**FETCH grant.** FETCH requires the CAT `moqt` claim to include a `Fetch(7)` scope covering the requested namespace and track. Tokens that grant only `Subscribe(4)` are denied.
+**FETCH grant.** This relay does not serve FETCH yet. When relay FETCH serving lands, FETCH will require the CAT `moqt` claim to include a `Fetch(7)` scope covering the requested namespace and track; tokens that grant only `Subscribe(4)` will be denied. `CatAuthHook` already evaluates FETCH this way.
