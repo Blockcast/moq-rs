@@ -953,8 +953,10 @@ mod tests {
             );
         }
 
-        /// No token scheme is compiled in yet, so a configured policy cannot be
-        /// satisfied and must refuse with UNAUTHORIZED — never admit.
+        /// A policy whose token is absent, or not a valid CAT, refuses with
+        /// UNAUTHORIZED — never admits. Without `auth-cat` the scope cannot
+        /// build a hook at all; with it, the placeholder key is unusable.
+        /// Either way it must fail closed.
         #[tokio::test]
         async fn a_configured_policy_fails_closed() {
             for params in [
@@ -992,6 +994,75 @@ mod tests {
             .expect_err("refused");
             assert!(!err.reason.contains("not-a-real-cat"));
             assert!(!err.reason.contains("auth-cat"));
+        }
+
+        /// End to end through the draft-18 wire encoding: a real CAT in a
+        /// USE_VALUE (0x3) SETUP option admits; the same token with the
+        /// wrong key, or a SETUP with no token, is refused.
+        #[cfg(feature = "auth-cat")]
+        #[tokio::test]
+        async fn a_valid_cat_in_setup_is_admitted() {
+            use cat_token::{encode_token, CatToken, Es256Algorithm, MoqtAction, MoqtScopeBuilder};
+            use p256::pkcs8::EncodePublicKey;
+
+            fn key() -> (Es256Algorithm, String) {
+                let signer = Es256Algorithm::new_with_key_pair().expect("keypair");
+                let pem = signer
+                    .verifying_key()
+                    .to_public_key_pem(Default::default())
+                    .expect("pem");
+                (signer, pem)
+            }
+
+            let (signer, pem) = key();
+            let (other_signer, _) = key();
+            let config = ScopeConfig {
+                auth: Some(
+                    ScopeAuthConfig::new(vec![AuthPublicKey::es256(pem)])
+                        .with_issuers(vec!["issuer".to_string()])
+                        .with_audiences(vec!["relay".to_string()]),
+                ),
+                ..Default::default()
+            };
+
+            let mint = |signer: &Es256Algorithm| {
+                let token = CatToken::new()
+                    .with_issuer("issuer")
+                    .with_single_audience("relay")
+                    .with_subject("alice")
+                    .with_expires_in(600)
+                    .with_moqt_scope(
+                        MoqtScopeBuilder::new()
+                            .action(MoqtAction::ClientSetup)
+                            .build(),
+                    );
+                let mut value = varint(0x3); // USE_VALUE, draft-18 §15.5
+                value.extend_from_slice(&varint(crate::CAT_TOKEN_TYPE));
+                value.extend_from_slice(&encode_token(&token, signer).expect("encode"));
+                value
+            };
+
+            let auth = admit(
+                FixedConfig::new(config.clone()),
+                &setup_with(vec![mint(&signer)]),
+            )
+            .await
+            .expect("valid token admits")
+            .expect("enforced scope carries auth state");
+            assert_eq!(auth.subject(), Some("alice"));
+
+            let err = admit(
+                FixedConfig::new(config.clone()),
+                &setup_with(vec![mint(&other_signer)]),
+            )
+            .await
+            .expect_err("wrong key refused");
+            assert_eq!(err.code, SESSION_ERROR_UNAUTHORIZED);
+
+            let err = admit(FixedConfig::new(config), &KeyValuePairs::default())
+                .await
+                .expect_err("missing token refused");
+            assert_eq!(err.code, SESSION_ERROR_UNAUTHORIZED);
         }
     }
 }

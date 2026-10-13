@@ -89,11 +89,17 @@ mod session;
 mod token;
 mod types;
 
+#[cfg(feature = "auth-cat")]
+mod cat;
+
 pub use hook::{AllowAllAuthHook, AuthHook};
 pub use token::{decode_setup_tokens, TokenError, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS};
 pub use types::{
     AuthDecision, AuthError, AuthRequest, AuthToken, AuthzOperation, DenyReason, Principal, Verdict,
 };
+
+#[cfg(feature = "auth-cat")]
+pub use cat::CatAuthHook;
 
 pub(crate) use hook::DenyAllAuthHook;
 pub(crate) use scope::ScopeAuthorizer;

@@ -18,6 +18,10 @@ If the publisher disconnects, then all subscribers receive an error and will not
 
 ## Authorization
 
-Per-scope bearer-token authorization is configured via `ScopeConfig.auth`. When a scope has an auth policy, every accepted client session must present a valid token in the SETUP AUTHORIZATION TOKEN option (draft-ietf-moq-transport-18 §10.3.1.4), and the session is closed with UNAUTHORIZED otherwise. Scopes without a policy are unaffected. Until a token scheme is built in (the `auth-cat` feature), a scope with a policy cannot verify any token and refuses every session. Known gap: relay-to-relay `--announce` forward links are relay-initiated and currently do not present a token; they emit a warning when connecting to an auth-enabled scope.
+Per-scope bearer-token authorization is configured via `ScopeConfig.auth`. When a scope has an auth policy, every accepted client session must present a valid token in the SETUP AUTHORIZATION TOKEN option (draft-ietf-moq-transport-18 §10.3.1.4), and the session is closed with UNAUTHORIZED otherwise. Scopes without a policy admit sessions as before, but in every scope a structurally invalid token option is still a protocol error (§10.2.2): an alias directive in SETUP closes with PROTOCOL_VIOLATION, and an undecodable Token with KEY_VALUE_FORMATTING_ERROR. Known gap: relay-to-relay `--announce` forward links are relay-initiated and currently do not present a token; they emit a warning when connecting to an auth-enabled scope.
 
 The enforcement model and fail-closed contract are documented in `src/auth/mod.rs`.
+
+The `auth-cat` crate feature, which provides Common Access Token (CAT, draft-ietf-moq-c4m) verification, is off by default. A relay built without it cannot verify any token, so every scope with a policy refuses all sessions. Embedders that want token enforcement enable the feature and supply `ScopeAuthConfig` through `Coordinator::get_scope_config`.
+
+**FETCH grant.** FETCH requires the CAT `moqt` claim to include a `Fetch(7)` scope covering the requested namespace and track. Tokens that grant only `Subscribe(4)` are denied.

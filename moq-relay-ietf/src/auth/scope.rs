@@ -196,14 +196,21 @@ fn build_hook(
     config: &ScopeAuthConfig,
     scope: Option<&str>,
 ) -> Result<Arc<dyn AuthHook>, AuthError> {
-    // No token scheme is compiled into this build yet, so every policy is
-    // unbuildable and the scope fails closed with a DenyAll hook.
-    let _ = (config, scope);
-    Err(AuthError::Configuration(
-        "relay was built without the `auth-cat` feature, so it cannot verify \
-         the tokens this scope requires"
-            .to_string(),
-    ))
+    #[cfg(feature = "auth-cat")]
+    {
+        Ok(Arc::new(super::CatAuthHook::new(config, scope)?))
+    }
+
+    #[cfg(not(feature = "auth-cat"))]
+    {
+        // Silence unused-parameter warnings without changing the signature.
+        let _ = (config, scope);
+        Err(AuthError::Configuration(
+            "relay was built without the `auth-cat` feature, so it cannot verify \
+             the tokens this scope requires"
+                .to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +247,13 @@ mod tests {
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        /// Only the key-rotation test needs to change the scripted config, and
+        /// that test requires a hook that actually builds.
+        #[cfg(feature = "auth-cat")]
+        fn set_config(&self, config: ScopeConfig) {
+            *self.config.lock().unwrap() = config;
         }
 
         fn set_failing(&self, failing: bool) {
@@ -283,10 +297,21 @@ mod tests {
         }
     }
 
-    /// Placeholder key material. No hook can be built in this configuration,
-    /// so its content is never parsed.
+    /// A syntactically valid ES256 public key, so configuration parses.
     fn valid_pem() -> String {
-        "-----BEGIN PUBLIC KEY-----\nplaceholder\n-----END PUBLIC KEY-----\n".to_string()
+        use p256::ecdsa::SigningKey;
+        use p256::pkcs8::EncodePublicKey;
+
+        let signing = SigningKey::random(&mut rand_core_compat());
+        p256::ecdsa::VerifyingKey::from(&signing)
+            .to_public_key_pem(Default::default())
+            .expect("pem")
+    }
+
+    /// `p256` re-exports the RNG its own API expects; using it avoids pinning a
+    /// separate `rand` version in dev-dependencies.
+    fn rand_core_compat() -> impl p256::elliptic_curve::rand_core::CryptoRngCore {
+        p256::elliptic_curve::rand_core::OsRng
     }
 
     fn enforced_config() -> ScopeConfig {
@@ -333,8 +358,8 @@ mod tests {
     /// coordinator. It must still deny throughout.
     #[tokio::test]
     async fn a_broken_config_is_cached_and_keeps_denying() {
-        // Unbuildable: the key list is empty (and no token scheme is compiled
-        // in yet either).
+        // Unbuildable in both configurations: with the feature because the key
+        // list is empty, without it because the scheme is unavailable.
         let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
             auth: Some(
                 ScopeAuthConfig::new(vec![])
@@ -427,8 +452,9 @@ mod tests {
         assert!(!hook.on_setup(&session, &[]).await.unwrap().is_allowed());
     }
 
-    /// Without a token scheme compiled in, a scope that requires tokens cannot
-    /// be served, so it must refuse sessions rather than run unauthenticated.
+    /// Without the feature, a scope that requires tokens cannot be served, so
+    /// it must refuse sessions rather than run unauthenticated.
+    #[cfg(not(feature = "auth-cat"))]
     #[tokio::test]
     async fn a_scope_requiring_tokens_is_refused_without_the_feature() {
         let coordinator = Arc::new(ScriptedCoordinator::new(enforced_config()));
@@ -560,5 +586,73 @@ mod tests {
         let calls = coordinator.calls();
         authorizer.resolve(Some("/fresh")).await.unwrap();
         assert_eq!(coordinator.calls(), calls, "the new entry must be cached");
+    }
+
+    /// A usable policy is cached for the TTL the coordinator asked for, so an
+    /// already-elapsed TTL forces a refetch. Needs the feature, since without
+    /// it the policy is unbuildable and takes the broken-config path below.
+    #[cfg(feature = "auth-cat")]
+    #[tokio::test]
+    async fn an_expired_entry_is_refetched() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
+            auth: Some(
+                ScopeAuthConfig::new(vec![AuthPublicKey::es256(valid_pem())])
+                    // Already elapsed by the time the next resolve runs.
+                    .with_ttl(Duration::from_nanos(1)),
+            ),
+            ..Default::default()
+        }));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        authorizer.resolve(Some("tenant")).await.ok();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        authorizer.resolve(Some("tenant")).await.ok();
+
+        assert_eq!(coordinator.calls(), 2, "an expired entry must be refetched");
+    }
+
+    #[cfg(feature = "auth-cat")]
+    #[tokio::test]
+    async fn a_well_formed_scope_gets_a_working_hook() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(enforced_config()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+
+        // No token presented, so denied - but by the CAT hook, on the merits.
+        let decision = hook.on_setup(&session, &[]).await.unwrap();
+        assert!(matches!(
+            decision.deny_reason(),
+            Some(crate::auth::DenyReason::TokenMissing)
+        ));
+    }
+
+    #[cfg(feature = "auth-cat")]
+    #[tokio::test]
+    async fn rotating_keys_reaches_new_sessions_after_the_ttl() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
+            auth: Some(
+                ScopeAuthConfig::new(vec![AuthPublicKey::es256(valid_pem())])
+                    .with_ttl(Duration::from_nanos(1)),
+            ),
+            ..Default::default()
+        }));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        authorizer.resolve(Some("tenant")).await.unwrap();
+
+        // Rotate to a configuration the relay cannot use; after the TTL the
+        // scope must pick it up and start refusing.
+        coordinator.set_config(ScopeConfig {
+            auth: Some(ScopeAuthConfig::new(vec![])),
+            ..Default::default()
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+        assert!(!hook.on_setup(&session, &[]).await.unwrap().is_allowed());
+        assert_eq!(coordinator.calls(), 2);
     }
 }
