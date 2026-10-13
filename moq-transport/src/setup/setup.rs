@@ -16,6 +16,8 @@
 //! }
 //! ```
 
+use std::fmt;
+
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
 
 /// The SETUP message type, which also serves as the control stream type.
@@ -26,10 +28,34 @@ pub const SETUP_TYPE: u64 = 0x2F00;
 /// Replaces the separate CLIENT_SETUP (0x20) and SERVER_SETUP (0x21)
 /// from earlier drafts. Version negotiation is handled entirely by ALPN;
 /// this message carries only Setup Options (PATH, AUTHORITY, etc.).
-#[derive(Debug)]
 pub struct Setup {
     /// Setup Options encoded as length-bounded KVPs.
     pub params: KeyValuePairs,
+}
+
+/// Redacts AUTHORIZATION TOKEN option values, which are bearer credentials.
+impl fmt::Debug for Setup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Params<'a>(&'a KeyValuePairs);
+
+        impl fmt::Debug for Params<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut list = f.debug_list();
+                for param in &self.0 .0 {
+                    if param.key == u64::from(super::ParameterType::AuthorizationToken) {
+                        list.entry(&format_args!("{{{}: <redacted>}}", param.key));
+                    } else {
+                        list.entry(param);
+                    }
+                }
+                list.finish()
+            }
+        }
+
+        f.debug_struct("Setup")
+            .field("params", &Params(&self.params))
+            .finish()
+    }
 }
 
 impl Setup {
@@ -112,6 +138,40 @@ mod tests {
 
         let decoded = Setup::decode(&mut buf).unwrap();
         assert_eq!(decoded.params, setup.params);
+    }
+
+    #[test]
+    fn repeated_authorization_tokens_round_trip_and_are_redacted() {
+        use crate::coding::KeyValuePair;
+        use crate::setup::{decode_setup_tokens, AuthorizationToken};
+
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(ParameterType::Path.into(), b"/clock".to_vec());
+        for token in [
+            AuthorizationToken::new(1, b"first-secret".to_vec()),
+            AuthorizationToken::new(0x63346d, b"second-secret".to_vec()),
+        ] {
+            params.0.push(KeyValuePair::new_bytes(
+                ParameterType::AuthorizationToken.into(),
+                token.encode_value().unwrap(),
+            ));
+        }
+        let setup = Setup { params };
+
+        let debug = format!("{setup:?}");
+        assert!(!debug.contains("first-secret"), "{debug}");
+        assert!(!debug.contains("second-secret"), "{debug}");
+        assert_eq!(debug.matches("<redacted>").count(), 2);
+
+        let mut buf = BytesMut::new();
+        setup.encode(&mut buf).unwrap();
+        let decoded = Setup::decode(&mut buf).unwrap();
+        assert_eq!(decoded.params, setup.params);
+
+        let tokens = decode_setup_tokens(&decoded.params).unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].value, b"first-secret");
+        assert_eq!(tokens[1].token_type, 0x63346d);
     }
 
     #[test]

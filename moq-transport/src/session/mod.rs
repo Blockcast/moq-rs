@@ -710,8 +710,57 @@ impl Session {
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
-        _config: SessionConfig,
+        config: SessionConfig,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config_and_tokens(session, mlog_path, transport, config, Vec::new())
+            .await
+    }
+
+    /// Create an outbound/client connection that presents authorization
+    /// tokens in SETUP.
+    ///
+    /// Each token is sent as its own AUTHORIZATION TOKEN option (§10.3.1.4)
+    /// with alias type USE_VALUE.
+    pub async fn connect_with_tokens(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        tokens: Vec<setup::AuthorizationToken>,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config_and_tokens(
+            session,
+            mlog_path,
+            transport,
+            SessionConfig::default(),
+            tokens,
+        )
+        .await
+    }
+
+    /// Create an outbound/client connection with explicit session config
+    /// that presents authorization tokens in SETUP.
+    pub async fn connect_with_config_and_tokens(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        _config: SessionConfig,
+        tokens: Vec<setup::AuthorizationToken>,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        // Encoded up front so a bad token fails before anything is sent.
+        // Exact duplicates are dropped (§10.2.2); see `encode_setup_options`.
+        let token_options = setup::encode_setup_options(&tokens)?;
+        drop(tokens);
+        if token_options.len() > setup::MAX_SETUP_TOKENS {
+            // Not an error: the limit is a receiver's policy. But this crate's
+            // own receiver (and so moq-relay-ietf) refuses such a SETUP.
+            tracing::warn!(
+                tokens = token_options.len(),
+                limit = setup::MAX_SETUP_TOKENS,
+                "presenting more authorization tokens than moq-transport receivers accept; \
+                 such a peer will refuse the session"
+            );
+        }
+
         let url = session.url().clone();
         let url_path = url.path();
         let path = Self::normalize_connection_path(url_path)?;
@@ -754,6 +803,8 @@ impl Session {
                 );
             }
         }
+
+        params.0.extend(token_options);
 
         let client = setup::Setup { params };
 

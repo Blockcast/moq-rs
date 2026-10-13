@@ -15,6 +15,7 @@ use moq_transport::{
     coding::TrackNamespace,
     serve,
     session::{Publisher, Subscriber},
+    setup::AuthorizationToken,
 };
 
 /// The main entry point for the MoQ Clock IETF example.
@@ -33,7 +34,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Cli::parse();
+    let mut config = Cli::parse();
+    let authorization_tokens: Vec<AuthorizationToken> =
+        std::mem::take(&mut config.authorization_tokens)
+            .into_iter()
+            .map(|token| AuthorizationToken::new(token.token_type, token.value))
+            .collect();
     let tls = config.tls.load()?;
 
     // Create the QUIC endpoint
@@ -52,9 +58,10 @@ async fn main() -> anyhow::Result<()> {
     // Depending on whether we are publishing or subscribing, create the appropriate session
     if config.publish {
         // Create the publisher session
-        let (session, mut publisher) = Publisher::connect(session, transport)
-            .await
-            .context("failed to create MoQ Transport session")?;
+        let (session, mut publisher) =
+            Publisher::connect_with_tokens(session, transport, authorization_tokens)
+                .await
+                .context("failed to create MoQ Transport session")?;
 
         if config.datagrams {
             tracing::info!("publishing clock via datagrams");
@@ -91,9 +98,10 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         // Create the subscriber session
-        let (session, mut subscriber) = Subscriber::connect(session, transport)
-            .await
-            .context("failed to create MoQ Transport session")?;
+        let (session, mut subscriber) =
+            Subscriber::connect_with_tokens(session, transport, authorization_tokens)
+                .await
+                .context("failed to create MoQ Transport session")?;
 
         let track_namespace = TrackNamespace::from_utf8_path(&config.namespace);
 

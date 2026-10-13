@@ -251,6 +251,17 @@ impl Publisher {
         Ok((session, publisher))
     }
 
+    /// Connect while presenting authorization tokens in SETUP.
+    pub async fn connect_with_tokens(
+        session: web_transport::Session,
+        transport: super::Transport,
+        tokens: Vec<crate::setup::AuthorizationToken>,
+    ) -> Result<(Session, Publisher), SessionError> {
+        let (session, publisher, _) =
+            Session::connect_with_tokens(session, None, transport, tokens).await?;
+        Ok((session, publisher))
+    }
+
     /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
     /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
     ///
