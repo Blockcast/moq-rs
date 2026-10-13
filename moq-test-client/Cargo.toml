@@ -24,6 +24,7 @@ moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
 web-transport = { workspace = true }
 
 bytes = "1"
+rand = "0.8"
 url = "2"
 
 # Async stuff

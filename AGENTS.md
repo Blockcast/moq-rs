@@ -4,7 +4,7 @@
 
 - This repository targets MoQT `draft-ietf-moq-transport-18`.
 - Core protocol code lives in `moq-transport`; relay behavior lives in `moq-relay-ietf`.
-- `moq-test-client` is the interop test harness: it runs TAP-emitting scenarios against a relay. The `moq-test-*` scenarios implement the moq-test protocol (draft-afrind-moq-test) as self-publishing scoreboard tests that need no relay-side moq-test support.
+- `moq-test-client` is the interop test harness: it runs TAP-emitting scenarios against a relay. The `moq-test-*` scenarios implement the moq-test protocol (draft-afrind-moq-test) as self-publishing scoreboard tests that need no relay-side moq-test support. The `data-*` scenarios implement moq-interop-runner data-plane specs with the same generator: publisher-first, PUBLISH_NAMESPACE of a `("moq-test", <test-id>, <run-id>)` routing prefix, and a SUBSCRIBE for that prefix plus the scenario's moq-test tuple.
 - `moq-relay-ietf` is production critical, so prefer small, tested changes over broad refactors.
 - Avoid breaking public APIs, wire behavior, CLI flags, and operator workflows unless explicitly requested.
 - Do not add `unsafe` code unless there is a clear performance or FFI need and the safety invariant is documented at the call site.
@@ -19,7 +19,7 @@
 - Run `cargo build --workspace` when shared APIs, relay behavior, or test-client behavior changes.
 - Consider `cargo clippy --workspace --all-targets` before larger changes or when review asks for lint coverage.
 - List interop scenarios with `cargo run -p moq-test-client -- --list`.
-- Run a scenario against a local relay with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --test moq-test-datagram` (any `--list` name works; omit `--test` to run them all).
+- Run a scenario against a local relay with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --test data-subgroup-basic` (any `--list` name works; omit `--test` to run them all).
 - Run an ad-hoc moq-test tuple with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --moq-test-tuple "moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0"` (16 `/`-separated fields; blanks select defaults).
 - When tests fail, diagnose from compiler/test output first and keep fixes scoped to the failing behavior.
 - Run the fuzz harness from `moq-relay-ietf/` with nightly:

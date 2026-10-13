@@ -28,6 +28,12 @@
 //! (draft-afrind-moq-test) as a self-publishing scoreboard test: the client
 //! generates a deterministic object set from the tuple, publishes it through
 //! the relay, subscribes, and verifies the exact set plus terminal signals.
+//!
+//! The `data-*` tests implement the moq-interop-runner data-plane
+//! specifications with the same generator and scoreboard: the publisher
+//! publishes a `("moq-test", <test-id>, <run-id>)` routing prefix and serves
+//! moq-test tuples below it, and the subscriber subscribes to the prefix
+//! followed by the scenario's canonical tuple.
 
 use std::net;
 use std::time::{Duration, Instant};
@@ -101,8 +107,9 @@ pub enum TestCase {
     PublishTrackSubscribe,
     /// T0.9: SUBSCRIBE with RENDEZVOUS_TIMEOUT expires with TIMEOUT
     RendezvousTimeout,
-    /// moq-test: one subgroup per group, scoreboard-verified
-    MoqTestSubgroupPerGroup,
+    /// Data plane: publisher-first moq-test tuple below a routing prefix,
+    /// one subgroup per group (interop-runner `data-subgroup-basic`)
+    DataSubgroupBasic,
     /// moq-test: one subgroup per group with End of Group markers
     MoqTestSubgroupPerGroupEog,
     /// moq-test: one subgroup per object
@@ -133,7 +140,7 @@ impl TestCase {
             TestCase::PublishTrackOnly,
             TestCase::PublishTrackSubscribe,
             TestCase::RendezvousTimeout,
-            TestCase::MoqTestSubgroupPerGroup,
+            TestCase::DataSubgroupBasic,
             TestCase::MoqTestSubgroupPerGroupEog,
             TestCase::MoqTestSubgroupPerObject,
             TestCase::MoqTestTwoSubgroupsEog,
@@ -156,7 +163,7 @@ impl TestCase {
             TestCase::PublishTrackOnly => "publish-track-only",
             TestCase::PublishTrackSubscribe => "publish-track-subscribe",
             TestCase::RendezvousTimeout => "rendezvous-timeout",
-            TestCase::MoqTestSubgroupPerGroup => "moq-test-subgroup-per-group",
+            TestCase::DataSubgroupBasic => "data-subgroup-basic",
             TestCase::MoqTestSubgroupPerGroupEog => "moq-test-subgroup-per-group-eog",
             TestCase::MoqTestSubgroupPerObject => "moq-test-subgroup-per-object",
             TestCase::MoqTestTwoSubgroupsEog => "moq-test-two-subgroups-eog",
@@ -180,6 +187,9 @@ pub struct TestResult {
     /// Multi-connection tests where the subscriber connected first (affects
     /// CID labeling only).
     subscriber_first: bool,
+    /// Revision of the interop-runner prose specification implemented, for
+    /// tests that have one.
+    spec_revision: Option<u32>,
 }
 
 impl TestResult {
@@ -196,6 +206,7 @@ impl TestResult {
             message: None,
             cids,
             subscriber_first,
+            spec_revision: None,
         }
     }
 
@@ -207,6 +218,7 @@ impl TestResult {
             message: Some(message),
             cids: Vec::new(),
             subscriber_first: false,
+            spec_revision: None,
         }
     }
 }
@@ -240,6 +252,28 @@ async fn run_moqtest(args: &Args, test_case: TestCase) -> Result<scenarios::Test
     run_moqtest_scenario(args, scenario).await
 }
 
+/// Run a named interop-runner data-plane scenario.
+async fn run_data_plane(args: &Args, test_case: TestCase) -> Result<scenarios::TestConnectionIds> {
+    let scenario = moqtest::data_plane_scenario(test_case.name())?
+        .ok_or_else(|| anyhow::anyhow!("unregistered data-plane scenario"))?;
+    let (cids, report) = tokio::time::timeout(
+        scenarios::TEST_TIMEOUT,
+        moqtest::run_data_plane(args, scenario),
+    )
+    .await
+    .context("test timed out")??;
+
+    if report.passed() {
+        tracing::info!("data-plane test passed: {}", report.summary());
+        Ok(cids)
+    } else {
+        bail!(
+            "data-plane verification failed: {}",
+            report.failures.join("; ")
+        )
+    }
+}
+
 /// Run a single test case
 async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
     let start = Instant::now();
@@ -258,8 +292,8 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
         TestCase::PublishTrackOnly => scenarios::test_publish_track_only(args).await,
         TestCase::PublishTrackSubscribe => scenarios::test_publish_track_subscribe(args).await,
         TestCase::RendezvousTimeout => scenarios::test_rendezvous_timeout(args).await,
-        TestCase::MoqTestSubgroupPerGroup
-        | TestCase::MoqTestSubgroupPerGroupEog
+        TestCase::DataSubgroupBasic => run_data_plane(args, test_case).await,
+        TestCase::MoqTestSubgroupPerGroupEog
         | TestCase::MoqTestSubgroupPerObject
         | TestCase::MoqTestTwoSubgroupsEog
         | TestCase::MoqTestDatagram
@@ -270,11 +304,15 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
     };
 
     let duration = start.elapsed();
+    let spec_revision = moqtest::data_plane_scenario(test_case.name())
+        .ok()
+        .flatten()
+        .map(|scenario| scenario.spec_revision);
 
     // T0.5 and every moq-test scenario connect the subscriber first.
     let subscriber_first = test_case == TestCase::SubscribeBeforePublishNamespace
         || test_case.name().starts_with("moq-test-");
-    match result {
+    let mut result = match result {
         Ok(cids) => TestResult::success(
             test_case.name().to_string(),
             duration,
@@ -282,7 +320,9 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
             subscriber_first,
         ),
         Err(e) => TestResult::failure(test_case.name().to_string(), duration, format!("{:#}", e)),
-    }
+    };
+    result.spec_revision = spec_revision;
+    result
 }
 
 fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
@@ -292,6 +332,9 @@ fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
     // YAML diagnostic block
     println!("  ---");
     println!("  duration_ms: {}", result.duration.as_millis());
+    if let Some(revision) = result.spec_revision {
+        println!("  test_spec_revision: {revision}");
+    }
 
     // Connection IDs for mlog correlation
     match result.cids.len() {
