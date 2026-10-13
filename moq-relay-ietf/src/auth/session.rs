@@ -15,8 +15,6 @@ use crate::SessionContext;
 /// authorization carry `None` instead, so the request path costs a single
 /// `Option` check.
 #[derive(Clone)]
-// Read by the per-request gates, which land separately from session admission.
-#[allow(dead_code)]
 pub(crate) struct SessionAuth {
     hook: Arc<dyn AuthHook>,
     principal: Principal,
@@ -31,7 +29,6 @@ impl std::fmt::Debug for SessionAuth {
     }
 }
 
-#[allow(dead_code)]
 impl SessionAuth {
     pub(crate) fn new(hook: Arc<dyn AuthHook>, principal: Principal) -> Self {
         Self { hook, principal }
@@ -112,7 +109,6 @@ impl SessionAuth {
 /// Sessions in scopes without an authorization policy carry no [`SessionAuth`]
 /// and are always permitted. Keeping that check in one place stops each call
 /// site from re-deriving the `None` case.
-#[allow(dead_code)]
 pub(crate) async fn authorize(
     auth: Option<&SessionAuth>,
     session: &SessionContext,

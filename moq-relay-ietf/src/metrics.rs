@@ -25,7 +25,12 @@
 //! | `moq_relay_connection_errors_total` | `stage` | Connection failures (stage: session_accept, scope_resolve, auth_setup, session_run) |
 //! | `moq_relay_publishers_total` | - | Total publishers (PUBLISH_NAMESPACE requests) received |
 //! | `moq_relay_announce_ok_total` | `kind` | Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE (kind: client, proxied) |
-//! | `moq_relay_announce_errors_total` | `phase` | PUBLISH_NAMESPACE failures (phase: local_register, remote_register, coordinator_register, coordinator_lookup, send_ok, forward, peer_fanout) |
+//! | `moq_relay_announce_errors_total` | `phase` | PUBLISH_NAMESPACE failures (phase: auth, local_register, remote_register, coordinator_register, coordinator_lookup, send_ok, forward, peer_fanout) |
+//! | `moq_relay_publish_errors_total` | `phase` | PUBLISH failures (phase: auth, auth_fanout, session_limit, take_reader, local_register, coordinator_register, send_ok) |
+//! | `moq_relay_subscribe_errors_total` | `phase` | SUBSCRIBE rejected by the relay (phase: auth) |
+//! | `moq_relay_subscribe_namespace_errors_total` | `phase` | SUBSCRIBE_NAMESPACE rejected by the relay (phase: auth) |
+//! | `moq_relay_subscribe_tracks_errors_total` | `phase` | SUBSCRIBE_TRACKS rejected by the relay (phase: auth) |
+//! | `moq_relay_track_status_errors_total` | `phase` | TRACK_STATUS rejected by the relay (phase: auth) |
 //! | `moq_relay_subscribers_total` | - | Total subscribers (SUBSCRIBE requests) received |
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
@@ -37,7 +42,7 @@
 //! | `moq_relay_cache_idle_evictions_total` | `source` | Unwatched cache entries evicted, releasing an upstream subscription (source: local, remote) |
 //! | `moq_relay_change_channel_lagged_total` | `channel` | Change notifications skipped by a lagging receiver, forcing a resync (channel: namespace, track) |
 //! | `moq_relay_lease_registry_lock_poisoned_total` | `operation` | Upstream namespace lease registry lock found poisoned (operation: acquire, release) |
-//! | `moq_relay_auth_denied_total` | `phase`, `operation`, `reason` | Operations refused by authorization. `phase`: setup, request. `operation`: client_setup, publish_namespace, publish, subscribe, subscribe_namespace, track_status, fetch. `reason`: token_missing, token_invalid, token_expired, token_replayed, token_malformed, scope_mismatch, issuer_unknown, policy_denied, hook_fault, alias_in_setup, too_many_tokens |
+//! | `moq_relay_auth_denied_total` | `phase`, `operation`, `reason` | Operations refused by authorization. `phase`: setup, request. `operation`: client_setup, publish_namespace, publish, subscribe, subscribe_namespace, track_status, fetch (SUBSCRIBE_TRACKS is counted as subscribe_namespace, its interim gate). `reason`: token_missing, token_invalid, token_expired, token_replayed, token_malformed, scope_mismatch, issuer_unknown, policy_denied, hook_fault, alias_in_setup, too_many_tokens |
 //! | `moq_relay_auth_errors_total` | `stage` | Authorization could not reach a verdict (stage: scope_config, setup, request). Distinct from `auth_denied_total`: these indicate a relay or configuration fault, not a rejected peer, and are the ones worth alerting on |
 //!
 //! ## Gauges
@@ -92,7 +97,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_publish_errors_total",
-        "Publisher-initiated PUBLISH failures by phase (take_reader, local_register, coordinator_register, send_ok)"
+        "PUBLISH failures by phase (auth, auth_fanout, session_limit, take_reader, local_register, coordinator_register, send_ok)"
     );
     describe_counter!(
         "moq_relay_announce_ok_total",
@@ -102,7 +107,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_announce_errors_total",
-        "PUBLISH_NAMESPACE failures by phase (local_register, remote_register, \
+        "PUBLISH_NAMESPACE failures by phase (auth, local_register, remote_register, \
          coordinator_register, coordinator_lookup, send_ok, forward, peer_fanout)"
     );
     describe_counter!(
@@ -157,6 +162,22 @@ pub fn describe_metrics() {
         "moq_relay_auth_errors_total",
         "Authorization failures that prevented a verdict being reached, by stage (scope_config, setup, request). \
          Distinct from moq_relay_auth_denied_total: these indicate a relay or configuration fault, not a rejected peer"
+    );
+    describe_counter!(
+        "moq_relay_subscribe_errors_total",
+        "SUBSCRIBE requests rejected by the relay, by phase (auth)"
+    );
+    describe_counter!(
+        "moq_relay_subscribe_namespace_errors_total",
+        "SUBSCRIBE_NAMESPACE requests rejected by the relay, by phase (auth)"
+    );
+    describe_counter!(
+        "moq_relay_subscribe_tracks_errors_total",
+        "SUBSCRIBE_TRACKS requests rejected by the relay, by phase (auth)"
+    );
+    describe_counter!(
+        "moq_relay_track_status_errors_total",
+        "TRACK_STATUS requests rejected by the relay, by phase (auth)"
     );
 
     // Gauges

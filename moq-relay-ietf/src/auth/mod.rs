@@ -46,7 +46,17 @@
 //! | SUBSCRIBE_TRACKS (§10.19) | `SubscribeNamespace` *(interim)* | 3 |
 //!
 //! FETCH requires `Fetch(7)`; a token that grants only `Subscribe(4)` cannot
-//! fetch. SUBSCRIBE_TRACKS is new in draft-18 and has no CAT action yet.
+//! fetch. This relay does not serve FETCH yet (the session layer answers it
+//! as not supported), so no FETCH gate exists; the mapping is in place for
+//! when relay FETCH serving lands.
+//!
+//! SUBSCRIBE_TRACKS is new in draft-18 and has no CAT action yet, so the
+//! request is gated as `SubscribeNamespace` on its prefix. That grants
+//! discovery only: every PUBLISH it generates is separately authorized as a
+//! `Subscribe` for that exact track, as is every NAMESPACE a
+//! SUBSCRIBE_NAMESPACE would disclose (as `SubscribeNamespace` on the exact
+//! namespace). Tracks and namespaces outside the grant are withheld rather
+//! than failing the request.
 //!
 //! # Revocation, and what it does not cover
 //!
@@ -103,8 +113,6 @@ pub use cat::CatAuthHook;
 
 pub(crate) use hook::DenyAllAuthHook;
 pub(crate) use scope::ScopeAuthorizer;
-// `authorize` is consumed by the per-request gates, which land separately.
-#[allow(unused_imports)]
 pub(crate) use session::{authorize, SessionAuth};
 
 use crate::DEFAULT_SCOPE_AUTH_TTL;
