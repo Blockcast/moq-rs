@@ -13,17 +13,17 @@ use crate::{
     coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
     mlog,
-    serve::{FullTrackName, ServeError, TrackReader, TracksReader},
+    serve::{ServeError, TrackReader, TracksReader},
 };
 
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, NameRegistry,
-    ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
-    PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed, SubscribedNamespace,
-    SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks, SubscribedTracksInfo,
-    SubscribedTracksRecv, TrackStatusRequested, Writer,
+    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, ObjectForwarderRecv,
+    PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, Reader,
+    RequestId, Session, SessionError, Subscribed, SubscribedNamespace, SubscribedNamespaceInfo,
+    SubscribedNamespaceRecv, SubscribedTracks, SubscribedTracksInfo, SubscribedTracksRecv,
+    TrackStatusRequested, Writer,
 };
 use crate::message::RequestErrorCode;
 
@@ -95,16 +95,9 @@ pub struct Publisher {
     /// Active outbound PUBLISH requests, keyed by request id.
     publisheds: Arc<Mutex<HashMap<u64, PublishedEntry>>>,
 
-    /// Active outbound PUBLISHes keyed by Full Track Name, for the §5.1
-    /// same-role duplicate-subscription check.
-    published_names: Arc<Mutex<NameRegistry>>,
-
     /// When a Subscribe is received and we have a matching publish_namespace entry, the
     /// subscription is routed to that PublishNamespaceRecv.  Otherwise it goes here.
     subscribeds: Arc<Mutex<HashMap<u64, ObjectForwarderRecv>>>,
-
-    /// Active inbound SUBSCRIBEs keyed by Full Track Name.
-    subscribed_names: Arc<Mutex<NameRegistry>>,
 
     /// Subscriptions for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_subscribed: Queue<Subscribed>,
@@ -222,9 +215,7 @@ impl Publisher {
             webtransport,
             publish_namespaces: Default::default(),
             publisheds: Default::default(),
-            published_names: Default::default(),
             subscribeds: Default::default(),
-            subscribed_names: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
             subscribed_namespace_prefixes: Default::default(),
@@ -505,11 +496,6 @@ impl Publisher {
         track: TrackReader,
         mut params: KeyValuePairs,
     ) -> Result<Published, SessionError> {
-        let full_name = FullTrackName {
-            namespace: track.namespace.clone(),
-            name: track.name.clone(),
-        };
-
         if let Some(largest) = track.largest_location() {
             params
                 .set_largest_object(largest)
@@ -522,29 +508,9 @@ impl Publisher {
             .unwrap_or(true);
         let largest_location = params.largest_object().map_err(SessionError::Decode)?;
 
-        // §5.1: this endpoint can have at most one publisher-role subscription
-        // per track. Inbound SUBSCRIBE and outbound PUBLISH both make us the
-        // publisher, so the duplicate check spans both maps and stays atomic
-        // with the name reservation.
-        let request_id = {
-            let subscribed_names = self
-                .subscribed_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            let mut published_names = self
-                .published_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_name(&full_name)
-                || published_names.contains_name(&full_name)
-            {
-                return Err(SessionError::Serve(ServeError::Duplicate));
-            }
-
-            let request_id = self.request_id.allocate()?;
-            published_names.insert(full_name, request_id);
-            request_id
-        };
+        // §5.1: an endpoint MAY hold several subscriptions to one track, so a
+        // PUBLISH needs no name reservation.
+        let request_id = self.request_id.allocate()?;
 
         // The request ID doubles as the Track Alias, matching SUBSCRIBE serving.
         let track_alias = request_id;
@@ -569,10 +535,7 @@ impl Publisher {
                     PublishedEntry::new(PublishedRecv::new(recv_state)),
                 );
             }
-            Err(_) => {
-                self.drop_published_name(request_id);
-                return Err(SessionError::Internal);
-            }
+            Err(_) => return Err(SessionError::Internal),
         }
 
         let msg = message::Publish {
@@ -856,14 +819,7 @@ impl Publisher {
     }
 
     fn remove_published(&self, id: u64) -> Option<PublishedEntry> {
-        self.drop_published_name(id);
         self.publisheds.lock().ok()?.remove(&id)
-    }
-
-    fn drop_published_name(&self, id: u64) {
-        if let Ok(mut names) = self.published_names.lock() {
-            names.remove_by_request_id(id);
-        }
     }
 
     pub async fn serve_subscribe(
@@ -1244,10 +1200,6 @@ impl Publisher {
 
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
-        let full_name = FullTrackName {
-            namespace: msg.track_namespace.clone(),
-            name: msg.track_name.clone(),
-        };
 
         let subscribed = {
             let mut subscribeds = self
@@ -1255,53 +1207,14 @@ impl Publisher {
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
 
+            // §10.1: a reused Request ID closes the session. A second SUBSCRIBE
+            // for the same track under a new ID is a separate subscription
+            // (§5.1), so there is no name check.
             if subscribeds.contains_key(&msg.id) {
-                let id = msg.id;
-                drop(subscribeds);
-                // Draft-16 §5.1: duplicate SUBSCRIBE for the same request ID
-                // MUST be rejected with DUPLICATE_SUBSCRIPTION, not a session close.
-                self.send_request_error(
-                    "subscribe",
-                    message::RequestError {
-                        id,
-                        error_code: RequestErrorCode::DuplicateSubscription as u64,
-                        retry_interval: 0,
-                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
-                    },
-                );
-                return Ok(());
+                return Err(SessionError::InvalidRequestId);
             }
-
-            let mut subscribed_names = self
-                .subscribed_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            let published_names = self
-                .published_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_name(&full_name)
-                || published_names.contains_name(&full_name)
-            {
-                let id = msg.id;
-                drop(published_names);
-                drop(subscribed_names);
-                drop(subscribeds);
-                self.send_request_error(
-                    "subscribe",
-                    message::RequestError {
-                        id,
-                        error_code: RequestErrorCode::DuplicateSubscription as u64,
-                        retry_interval: 0,
-                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
-                    },
-                );
-                return Ok(());
-            }
-            drop(published_names);
 
             let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
-            subscribed_names.insert(full_name, send.info.id);
             subscribeds.insert(send.info.id, recv);
 
             send
@@ -1424,7 +1337,6 @@ impl Publisher {
                 let _ = subscribed.recv_unsubscribe();
             }
         }
-        let _ = Self::drop_subscribed_name(&self.subscribed_names, id);
     }
 
     fn remove_subscribe(&mut self, id: u64) -> Result<(), SessionError> {
@@ -1432,18 +1344,6 @@ impl Publisher {
             .lock()
             .map_err(|_| SessionError::Internal)?
             .remove(&id);
-        Self::drop_subscribed_name(&self.subscribed_names, id)
-    }
-
-    fn drop_subscribed_name(
-        subscribed_names: &Arc<Mutex<NameRegistry>>,
-        id: u64,
-    ) -> Result<(), SessionError> {
-        subscribed_names
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .remove_by_request_id(id);
-
         Ok(())
     }
 
@@ -1484,24 +1384,23 @@ impl Publisher {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-    };
+    use std::collections::HashMap;
 
     use crate::{
         coding::{KeyValuePairs, ReasonPhrase, TrackName, TrackNamespace, TrackNamespacePrefix},
         data,
         message::{self, Message},
         serve::{self, FullTrackName, ServeError, Tracks},
-        session::{test_support::loopback_session_pair, Reader, RequestId, Session, Writer},
+        session::{
+            test_support::loopback_session_pair, Reader, RequestId, Session, SessionError, Writer,
+        },
         watch::Queue,
     };
     use bytes::Bytes;
 
     use super::{
-        split_published_state, AbortPublishedOnDrop, NameRegistry, PublishNamespace,
-        PublishedEntry, PublishedRecv, Publisher,
+        split_published_state, AbortPublishedOnDrop, PublishNamespace, PublishedEntry,
+        PublishedRecv, Publisher,
     };
 
     fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
@@ -1538,7 +1437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_rejects_name_reserved_by_outbound_publish() {
+    async fn subscribe_accepts_a_second_subscription_to_the_same_track() {
         let (publisher_session, _peer_session) = loopback_session_pair().await;
         let (outgoing, mut outgoing_recv) = Queue::default().split();
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1550,54 +1449,41 @@ mod tests {
             bidi_task_tx,
         );
         let full_name = full_track_name("room/123", "video");
-        publisher
-            .published_names
-            .lock()
-            .unwrap()
-            .insert(full_name.clone(), 1);
+        // §5.1: concurrent subscriptions to one track are allowed, each under
+        // its own Request ID. This is what lets a replacement SUBSCRIBE race
+        // the cancellation of the one it replaces.
+        for id in [0, 2] {
+            publisher
+                .recv_subscribe(message::Subscribe {
+                    id,
+                    track_namespace: full_name.namespace.clone(),
+                    track_name: full_name.name.clone(),
+                    params: KeyValuePairs::default(),
+                })
+                .unwrap();
+        }
+        assert_eq!(publisher.subscribeds.lock().unwrap().len(), 2);
+        assert!(
+            futures::FutureExt::now_or_never(outgoing_recv.pop()).is_none(),
+            "no REQUEST_ERROR"
+        );
 
-        publisher
-            .recv_subscribe(message::Subscribe {
+        // §10.1: reusing a Request ID is a session error, not a REQUEST_ERROR.
+        assert!(matches!(
+            publisher.recv_subscribe(message::Subscribe {
                 id: 2,
                 track_namespace: full_name.namespace,
                 track_name: full_name.name,
                 params: KeyValuePairs::default(),
-            })
-            .unwrap();
-
-        let Some(Message::RequestError(error)) = outgoing_recv.pop().await else {
-            panic!("expected REQUEST_ERROR");
-        };
-        assert_eq!(error.id, 2);
-        assert_eq!(
-            error.error_code,
-            message::RequestErrorCode::DuplicateSubscription as u64
-        );
+            }),
+            Err(SessionError::InvalidRequestId)
+        ));
     }
 
     fn subgroup_track() -> (serve::SubgroupsWriter, serve::TrackReader) {
         let (writer, reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
         (writer.subgroups().unwrap(), reader)
-    }
-
-    #[test]
-    fn drop_subscribed_name_removes_only_matching_request_id() {
-        let subscribed_names = Arc::new(Mutex::new(NameRegistry::default()));
-        let unsubscribed_track = full_track_name("bb1", "video.m4s");
-        let active_track = full_track_name("bb1", "audio.m4s");
-
-        {
-            let mut names = subscribed_names.lock().unwrap();
-            names.insert(unsubscribed_track.clone(), 6);
-            names.insert(active_track.clone(), 8);
-        }
-
-        Publisher::drop_subscribed_name(&subscribed_names, 6).unwrap();
-
-        let names = subscribed_names.lock().unwrap();
-        assert!(!names.contains_name(&unsubscribed_track));
-        assert_eq!(names.get_by_name(&active_track), Some(8));
     }
 
     #[test]
@@ -1634,12 +1520,6 @@ mod tests {
             bidi_task_tx,
         );
         let request_id = 0;
-        let track = full_track_name("test", "track");
-        publisher
-            .published_names
-            .lock()
-            .unwrap()
-            .insert(track.clone(), request_id);
         let (_state, recv_state) = split_published_state(true);
         publisher.publisheds.lock().unwrap().insert(
             request_id,
@@ -1651,11 +1531,6 @@ mod tests {
             request_id: Some(request_id),
         });
 
-        assert!(!publisher
-            .published_names
-            .lock()
-            .unwrap()
-            .contains_name(&track));
         assert!(!publisher
             .publisheds
             .lock()
@@ -1937,11 +1812,7 @@ mod tests {
         let mut request_reader = request.await.unwrap();
         assert!(request_reader.done().await.unwrap());
         request_driver.await.unwrap().unwrap();
-        assert!(!publisher
-            .published_names
-            .lock()
-            .unwrap()
-            .contains_name(&full_track_name("test", "track")));
+        assert!(publisher.publisheds.lock().unwrap().is_empty());
         drop(subgroup);
         drop(subgroups);
     }

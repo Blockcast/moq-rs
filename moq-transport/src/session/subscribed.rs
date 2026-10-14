@@ -630,13 +630,12 @@ impl Subscribed {
             // did not wait, TIMEOUT when it held the subscription and no publisher
             // arrived before the subscriber's RENDEZVOUS_TIMEOUT elapsed.
             ServeError::Timeout => RequestErrorCode::Timeout as u64,
-            ServeError::Duplicate => RequestErrorCode::DuplicateSubscription as u64,
             ServeError::Cancel | ServeError::Done => RequestErrorCode::Uninterested as u64,
             ServeError::Mode
             | ServeError::Size
             | ServeError::NotImplemented(_)
             | ServeError::NotImplementedWithId(_, _) => RequestErrorCode::NotSupported as u64,
-            ServeError::Internal(_) | ServeError::InternalWithId(_, _) => {
+            ServeError::Duplicate | ServeError::Internal(_) | ServeError::InternalWithId(_, _) => {
                 RequestErrorCode::InternalError as u64
             }
         }
@@ -3286,9 +3285,10 @@ mod tests {
             Subscribed::request_error_code(&ServeError::NotFound),
             RequestErrorCode::DoesNotExist as u64
         );
+        // Draft-20 has no DUPLICATE_SUBSCRIPTION; a local duplicate is internal.
         assert_eq!(
             Subscribed::request_error_code(&ServeError::Duplicate),
-            RequestErrorCode::DuplicateSubscription as u64
+            RequestErrorCode::InternalError as u64
         );
         // A rendezvous hold that expired is TIMEOUT, not DOES_NOT_EXIST.
         assert_eq!(

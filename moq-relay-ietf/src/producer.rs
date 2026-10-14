@@ -908,11 +908,8 @@ impl Producer {
     /// serving the same scope. The recheck interval covers that by ending the wait
     /// periodically for the caller to ask the coordinator again.
     ///
-    /// Waking the subscriber promptly matters beyond tidiness. A held
-    /// subscription keeps its entry in the publisher's per-session name map, and
-    /// a second SUBSCRIBE for the same track on that session is rejected with
-    /// DUPLICATE_SUBSCRIPTION, so a subscriber that gave up and retried would be
-    /// turned away by its own abandoned hold.
+    /// Waking the subscriber promptly matters beyond tidiness: an abandoned
+    /// hold keeps its subscription state until the wait ends.
     async fn await_rendezvous(
         subscribed: &Subscribed,
         scope: Option<&str>,

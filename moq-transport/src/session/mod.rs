@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
-mod name_registry;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -22,7 +21,6 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
-pub(crate) use name_registry::NameRegistry;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
@@ -136,7 +134,6 @@ enum BidiRequestKind {
 #[derive(Clone, Copy)]
 enum FollowupEnd {
     PublishDone,
-    OtherTerminal,
     Cancelled,
 }
 
@@ -1287,10 +1284,7 @@ impl Session {
                                     // REQUEST_ERROR does.
                                     let is_terminal = matches!(
                                         response.message,
-                                        Message::RequestError(_)
-                                            | Message::PublishDone(_)
-                                            | Message::PublishNamespaceDone(_)
-                                            | Message::Unsubscribe(_)
+                                        Message::RequestError(_) | Message::PublishDone(_)
                                     ) || (bounded_response
                                         && matches!(response.message, Message::RequestOk(_)));
                                     if let Err(err) = Self::encode_bidi_response(
@@ -1339,7 +1333,7 @@ impl Session {
                                             }
                                             deferred_publish_done = true;
                                         }
-                                        Ok(FollowupEnd::PublishDone | FollowupEnd::OtherTerminal | FollowupEnd::Cancelled) => {
+                                        Ok(FollowupEnd::PublishDone | FollowupEnd::Cancelled) => {
                                             return Ok(false);
                                         }
                                         Err(err) => return Err(err),
@@ -1403,10 +1397,9 @@ impl Session {
     /// Read messages the requester sends after its opening request on the same
     /// bidi stream, and dispatch them like any other inbound control message.
     ///
-    /// Draft-18 puts the whole life of a request on one stream, so terminal
-    /// follow-ups such as PUBLISH_DONE (ending an inbound PUBLISH) and
-    /// UNSUBSCRIBE (ending an inbound SUBSCRIBE) arrive here rather than on the
-    /// control stream. Like every other message after the request, they omit
+    /// The whole life of a request is on one stream, so PUBLISH_DONE (ending an
+    /// inbound PUBLISH) arrives here rather than on the control stream. Other
+    /// requests end by RESET_STREAM/STOP_SENDING (§3.3.3), not a message. Like every other message after the request, they omit
     /// the Request ID, which is why the stream's known `request_id` is injected.
     ///
     /// Returns when the request ends: the requester reset the stream, or sent
@@ -1450,9 +1443,6 @@ impl Session {
 
             let terminal = match &msg {
                 Message::PublishDone(_) => Some(FollowupEnd::PublishDone),
-                Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {
-                    Some(FollowupEnd::OtherTerminal)
-                }
                 _ => None,
             };
 
@@ -2460,12 +2450,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(responses.lock().unwrap().is_empty());
-        assert!(
-            !subscriber.has_subscriber_name(&crate::serve::FullTrackName {
-                namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
-                name: "track".into(),
-            })
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2533,12 +2517,6 @@ mod tests {
         ));
         assert!(response_reader.done().await.unwrap());
         handler.await.unwrap().unwrap();
-        assert!(
-            !subscriber.has_subscriber_name(&crate::serve::FullTrackName {
-                namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
-                name: "track".into(),
-            })
-        );
     }
 
     // ========================================================================

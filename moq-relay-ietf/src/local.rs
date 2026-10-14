@@ -260,9 +260,12 @@ impl CacheLease {
     /// Resolve once the cache entry is ready for ordered upstream cancellation.
     ///
     /// The entry remains as a closing generation until
-    /// [`finish_release`](Self::finish_release) is called after the peer has
-    /// ended the old request stream. Subscribers wait for that transition so a
-    /// replacement SUBSCRIBE cannot overtake the old UNSUBSCRIBE.
+    /// [`finish_release`](Self::finish_release) is called after the old request
+    /// stream has been cancelled locally. Subscribers wait for that transition,
+    /// so a replacement SUBSCRIBE is never opened before the old one is
+    /// cancelled. On the wire the replacement can still reach the peer first;
+    /// draft-20 §5.1 allows concurrent subscriptions to one track, so the peer
+    /// briefly serves both rather than rejecting the new one.
     ///
     /// Never resolves when the idle timeout is disabled, preserving the previous
     /// behaviour of holding the upstream subscription for the session's lifetime.
