@@ -34,6 +34,15 @@
 - Requests (SUBSCRIBE, PUBLISH_NAMESPACE, etc.) are sent on individual bidirectional streams; responses on the same stream omit the Request ID field.
 - `MAX_REQUEST_ID` and `REQUESTS_BLOCKED` do not exist in draft-18.
 
+## Token Authorization
+
+Sessions tagged `SessionInterface::Internal` are relay peers and skip token
+authorization at setup and on every request. Their SETUP tokens must still be
+decoded, with malformed tokens and forbidden alias directives rejected
+(draft-18 section 10.2.2). Only an embedder that has authenticated the peer may
+tag it internal; a source subnet or listener address does not authenticate a
+peer on its own.
+
 ## External Contributions
 
 - Treat public GitHub mirror and community PRs with heightened scrutiny for protocol correctness, resource bounds, panic-free production paths, and safe peer-facing errors.
