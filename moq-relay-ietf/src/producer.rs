@@ -2054,6 +2054,51 @@ mod tests {
         slot_limit: usize,
         auth: Option<SessionAuth>,
     ) -> (web_transport::Session, Subscriber, Arc<Semaphore>) {
+        spawn_relay_session_with_auth_mode(
+            locals,
+            remotes,
+            coordinator,
+            child_limit,
+            slot_limit,
+            auth,
+            true,
+        )
+        .await
+    }
+
+    /// Spawn the loopback relay without consuming the client's FETCH stream.
+    /// The raw FETCH test drains that stream directly; starting the normal
+    /// client runner would reject the unsupported FETCH data stream and send
+    /// STOP_SENDING while the relay is writing it.
+    async fn spawn_relay_session_without_client_run(
+        locals: Locals,
+        remotes: RemoteManager,
+        coordinator: Arc<dyn Coordinator>,
+        child_limit: usize,
+        slot_limit: usize,
+        auth: Option<SessionAuth>,
+    ) -> (web_transport::Session, Subscriber, Arc<Semaphore>) {
+        spawn_relay_session_with_auth_mode(
+            locals,
+            remotes,
+            coordinator,
+            child_limit,
+            slot_limit,
+            auth,
+            false,
+        )
+        .await
+    }
+
+    async fn spawn_relay_session_with_auth_mode(
+        locals: Locals,
+        remotes: RemoteManager,
+        coordinator: Arc<dyn Coordinator>,
+        child_limit: usize,
+        slot_limit: usize,
+        auth: Option<SessionAuth>,
+        run_client: bool,
+    ) -> (web_transport::Session, Subscriber, Arc<Semaphore>) {
         let (server_transport, client_transport) = loopback_webtransport_pair().await;
         let request_transport = client_transport.clone();
         let (server, client) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2085,7 +2130,16 @@ mod tests {
         let slot_permits = producer.subscribe_tracks_session_slot_permits.clone();
 
         tokio::spawn(async move { server.run().await });
-        tokio::spawn(async move { client.run().await });
+        if run_client {
+            tokio::spawn(async move { client.run().await });
+        } else {
+            // Keep the client-side Session alive while the test owns the uni
+            // stream. Dropping it closes the WebTransport connection.
+            tokio::spawn(async move {
+                let _client = client;
+                std::future::pending::<()>().await;
+            });
+        }
         tokio::spawn(async move { producer.run().await });
 
         (request_transport, subscriber, slot_permits)
@@ -3142,6 +3196,24 @@ mod tests {
         (transport, subscriber)
     }
 
+    async fn spawn_authorized_session_without_client_run(
+        locals: Locals,
+        coordinator: Arc<CountingCoordinator>,
+        hook: Arc<RecordingHook>,
+    ) -> (web_transport::Session, Subscriber) {
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let (transport, subscriber, _) = spawn_relay_session_without_client_run(
+            locals,
+            remotes,
+            coordinator,
+            MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+            Some(session_auth(hook)),
+        )
+        .await;
+        (transport, subscriber)
+    }
+
     /// End to end: a denied SUBSCRIBE is answered with UNAUTHORIZED (draft-18
     /// §10.6) before any lookup, so the relay neither consults the
     /// coordinator nor holds the request for a rendezvous.
@@ -3395,7 +3467,7 @@ mod tests {
         group
             .write(bytes::Bytes::from_static(b"y"))
             .expect("object");
-        let (transport, _subscriber) = spawn_authorized_session(
+        let (transport, _subscriber) = spawn_authorized_session_without_client_run(
             locals,
             Arc::new(CountingCoordinator::default()),
             RecordingHook::new(|_| allow()),
@@ -3405,6 +3477,22 @@ mod tests {
         // FETCH_OK is the last message on the request stream, so it ends in
         // a FIN and frees the request slot.
         let (mut send, mut recv) = transport.open_bi().await.expect("open stream");
+        // The normal client session runner rejects FETCH uni streams because
+        // the subscriber-side FETCH reader is not implemented yet. This test
+        // owns the response stream, so drain it directly instead of letting
+        // that runner race the relay's writer with STOP_SENDING(0).
+        let fetch_data = {
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let mut stream = transport.accept_uni().await.expect("accept FETCH stream");
+                while stream
+                    .read(usize::MAX)
+                    .await
+                    .expect("read FETCH stream")
+                    .is_some()
+                {}
+            })
+        };
         let mut frame = Vec::new();
         fetch(0, &namespace, "live")
             .encode(&mut frame)
@@ -3427,6 +3515,10 @@ mod tests {
             fin.is_none() && rest.is_empty(),
             "nothing may follow FETCH_OK"
         );
+        tokio::time::timeout(Duration::from_secs(2), fetch_data)
+            .await
+            .expect("FETCH stream drain timed out")
+            .expect("FETCH stream drain task failed");
         let mut payload = Cursor::new(payload);
         assert!(!bool::decode(&mut payload).expect("End Of Track"));
         assert_eq!(
