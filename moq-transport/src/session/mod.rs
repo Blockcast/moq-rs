@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
+mod fetch;
 mod fetched;
 mod publish_namespace;
 mod publish_received;
@@ -22,6 +23,7 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
+pub use fetch::{Fetch, FetchError};
 pub use fetched::*;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;

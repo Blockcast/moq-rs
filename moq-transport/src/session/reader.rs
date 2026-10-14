@@ -24,6 +24,16 @@ impl Reader {
     }
 
     pub async fn decode<T: Decode>(&mut self) -> Result<T, SessionError> {
+        self.decode_with(|r| T::decode(r)).await
+    }
+
+    /// Like [`Self::decode`], with a decoder that may carry state. It can be
+    /// called again after `DecodeError::More`, so it must not commit state
+    /// until it returns `Ok`.
+    pub async fn decode_with<T>(
+        &mut self,
+        mut decode: impl FnMut(&mut io::Cursor<&BytesMut>) -> Result<T, DecodeError>,
+    ) -> Result<T, SessionError> {
         tracing::trace!(
             "[READER] decode: attempting to decode {} (buffer_len={})",
             std::any::type_name::<T>(),
@@ -34,7 +44,7 @@ impl Reader {
             let mut cursor = io::Cursor::new(&self.buffer);
 
             // Try to decode with the current buffer.
-            let required = match T::decode(&mut cursor) {
+            let required = match decode(&mut cursor) {
                 Ok(msg) => {
                     let consumed = cursor.position() as usize;
                     self.buffer.advance(consumed);

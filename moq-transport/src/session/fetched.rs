@@ -274,45 +274,26 @@ impl Fetched {
         let locations: Vec<Location> = held.iter().map(|object| object.location).collect();
         let steps = plan_fetch(&range, &locations);
 
+        let cancelled = self.cancelled();
         let mut writer = Writer::new(self.publisher.open_uni().await?);
-        writer
-            .encode(&FetchHeader {
-                header_type: StreamHeaderType::Fetch,
-                request_id: self.msg.id,
-            })
-            .await?;
-        let mut state = FetchStreamState::new(range.descending);
-        for step in steps {
-            let mut buf = BytesMut::new();
-            match step {
-                FetchStep::Unknown(at) => {
-                    state.encode(
-                        &FetchItem::EndOfRange {
-                            kind: FetchRangeKind::Unknown,
-                            group_id: at.group_id,
-                            object_id: at.object_id,
-                        },
-                        &mut buf,
-                    )?;
-                }
-                FetchStep::Object(index) => {
-                    let object = &mut held[index];
-                    let payload = object.reader.read_all().await?;
-                    state.encode(
-                        &FetchItem::Object(FetchObject {
-                            group_id: object.location.group_id,
-                            subgroup_id: Some(object.subgroup_id),
-                            object_id: object.location.object_id,
-                            publisher_priority: object.priority,
-                            properties: object.reader.extension_headers.clone(),
-                            payload_length: payload.len(),
-                        }),
-                        &mut buf,
-                    )?;
-                    buf.extend_from_slice(&payload);
-                }
+        let written = async {
+            writer
+                .encode(&FetchHeader {
+                    header_type: StreamHeaderType::Fetch,
+                    request_id: self.msg.id,
+                })
+                .await?;
+            write_steps(&mut writer, &mut held, steps, range.descending).await
+        };
+        tokio::select! {
+            written = written => written?,
+            () = cancelled => {
+                // §5.2: on cancellation the publisher MUST reset the data
+                // stream; the session already reset the request stream.
+                writer.reset(super::fetch::CANCELLED);
+                self.responded = true;
+                return Ok(());
             }
-            writer.write(&buf).await?;
         }
         writer.finish()?;
 
@@ -326,6 +307,65 @@ impl Fetched {
         });
         Ok(())
     }
+
+    /// Resolves once the requester cancels: the session stops routing
+    /// responses for this request when its request stream ends early.
+    fn cancelled(&self) -> impl std::future::Future<Output = ()> + 'static {
+        let sink = self
+            .publisher
+            .bidi_response_map
+            .lock()
+            .ok()
+            .and_then(|responses| responses.get(&self.msg.id).cloned());
+        async move {
+            match sink {
+                Some(sink) => sink.closed().await,
+                None => std::future::pending().await,
+            }
+        }
+    }
+}
+
+async fn write_steps(
+    writer: &mut Writer,
+    held: &mut [HeldObject],
+    steps: Vec<FetchStep>,
+    descending: bool,
+) -> Result<(), SessionError> {
+    let mut state = FetchStreamState::new(descending);
+    for step in steps {
+        let mut buf = BytesMut::new();
+        match step {
+            FetchStep::Unknown(at) => {
+                state.encode(
+                    &FetchItem::EndOfRange {
+                        kind: FetchRangeKind::Unknown,
+                        group_id: at.group_id,
+                        object_id: at.object_id,
+                    },
+                    &mut buf,
+                )?;
+            }
+            FetchStep::Object(index) => {
+                let object = &mut held[index];
+                let payload = object.reader.read_all().await?;
+                state.encode(
+                    &FetchItem::Object(FetchObject {
+                        group_id: object.location.group_id,
+                        subgroup_id: Some(object.subgroup_id),
+                        object_id: object.location.object_id,
+                        publisher_priority: object.priority,
+                        properties: object.reader.extension_headers.clone(),
+                        payload_length: payload.len(),
+                    }),
+                    &mut buf,
+                )?;
+                buf.extend_from_slice(&payload);
+            }
+        }
+        writer.write(&buf).await?;
+    }
+    Ok(())
 }
 
 impl Drop for Fetched {
@@ -694,5 +734,67 @@ mod tests {
             other => panic!("expected FETCH_OK, got {other:?}"),
         }
         drop((group5, group6, continued));
+    }
+
+    /// A requester's cancel ends the session's response route, and the
+    /// publisher then MUST reset the data stream (draft-20 §5.2).
+    #[tokio::test]
+    async fn cancelled_fetch_resets_its_data_stream() {
+        use crate::coding::{TrackName, TrackNamespace};
+        use crate::serve::{Subgroup, Track};
+        use crate::session::{test_support::loopback_session_pair, RequestId};
+        use crate::watch::Queue;
+        use bytes::Bytes;
+
+        let (session, peer) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(outgoing, session, None, RequestId::new(0, 1), bidi_task_tx);
+        let (route, routed) = tokio::sync::mpsc::unbounded_channel();
+        publisher.bidi_response_map.lock().unwrap().insert(4, route);
+
+        let (writer, track) = Track::new(TrackNamespace::from_utf8_path("live"), "video").produce();
+        let mut group = writer
+            .subgroups()
+            .unwrap()
+            .create(Subgroup {
+                group_id: 1,
+                subgroup_id: 0,
+                priority: 0,
+            })
+            .unwrap();
+        // Half an Object: serving blocks on the rest of its payload.
+        let mut object = group.create(2, None).unwrap();
+        object.write(Bytes::from("a")).unwrap();
+
+        let _session = publisher.clone();
+        let served = tokio::spawn(
+            Fetched::new(
+                publisher,
+                message::Fetch {
+                    id: 4,
+                    track_namespace: TrackNamespace::from_utf8_path("live"),
+                    track_name: TrackName::from("video"),
+                    params: KeyValuePairs::default(),
+                },
+            )
+            .serve(track),
+        );
+        let mut data = peer.accept_uni().await.unwrap();
+        drop(routed);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), served)
+            .await
+            .expect("serve outlived the cancel")
+            .unwrap()
+            .unwrap();
+        let mut sink = Vec::new();
+        loop {
+            match data.read_buf(&mut sink).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("data stream must be reset, not FINed"),
+                Err(_) => break,
+            }
+        }
     }
 }

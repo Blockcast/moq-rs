@@ -373,6 +373,9 @@ pub struct Subscriber {
     /// Channel for sending bidi reader futures to `Session::run`, which polls
     /// them cooperatively under structured concurrency (no task is spawned).
     bidi_task_tx: super::BidiTaskSender,
+
+    /// Outbound FETCHes waiting for their data stream.
+    fetches: super::fetch::FetchStreams,
 }
 
 #[derive(Default)]
@@ -436,6 +439,7 @@ impl Subscriber {
             publish_received_queue: Default::default(),
             bidi_task_tx,
             bidi_response_map,
+            fetches: Default::default(),
         }
     }
 
@@ -569,6 +573,48 @@ impl Subscriber {
             params: Default::default(),
         });
         // TODO(itzmanish): make async and wait for response?
+    }
+
+    /// Send a FETCH (draft-20 §10.13) for `params`' LOCATION_FILTER and
+    /// GROUP_ORDER. Objects arrive through [`super::Fetch::next`] while
+    /// `Session::run` is polled; dropping the [`super::Fetch`] cancels it.
+    pub async fn fetch(
+        &mut self,
+        track_namespace: TrackNamespace,
+        track_name: impl Into<TrackName>,
+        params: KeyValuePairs,
+    ) -> Result<super::Fetch, SessionError> {
+        let msg = message::Fetch {
+            id: self.get_next_request_id()?,
+            track_namespace,
+            track_name: track_name.into(),
+            params,
+        };
+        // Registered first: the data stream can beat the stream open.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .insert(msg.id, tx);
+        let opened = self.open_request_stream(&msg.clone().into()).await;
+        let (mut writer, reader) = match opened {
+            Ok(streams) => streams,
+            Err(err) => {
+                if let Ok(mut fetches) = self.fetches.lock() {
+                    fetches.remove(&msg.id);
+                }
+                return Err(err);
+            }
+        };
+        // No REQUEST_UPDATE follows, so FIN now (§3.3.2).
+        writer.finish()?;
+        super::Fetch::new(
+            self.webtransport.clone(),
+            self.fetches.clone(),
+            &msg,
+            reader,
+            rx,
+        )
     }
 
     /// Subscribe to a track by creating a new subscribe request to the publisher.  Block until subscription is closed.
@@ -930,12 +976,12 @@ impl Subscriber {
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
             message::Publisher::RequestError(msg) => self.recv_request_error(msg)?,
-            // FETCH_OK is part of draft-16, but FETCH is not implemented here yet.
+            // FETCH_OK belongs on the FETCH's request stream, read by `Fetch`.
             message::Publisher::FetchOk(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     request_id = msg.id,
-                    "received FETCH_OK for unsupported FETCH — ignoring"
+                    "received FETCH_OK outside its request stream — ignoring"
                 );
             }
         }
@@ -1771,7 +1817,22 @@ impl Subscriber {
             stream_header.header_type
         );
 
-        // No fetch support yet
+        if let Some(fetch_header) = &stream_header.fetch_header {
+            let waiting = self
+                .fetches
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .remove(&fetch_header.request_id);
+            // A cancelled or unknown FETCH: its data is of no interest.
+            let rejected = match waiting {
+                Some(tx) => tx.send(reader).err(),
+                None => Some(reader),
+            };
+            if let Some(mut reader) = rejected {
+                reader.stop(super::fetch::CANCELLED);
+            }
+            return Ok(());
+        }
         if !stream_header.header_type.is_subgroup() {
             return Err(SessionError::unimplemented("non-SUBGROUP stream types"));
         }
@@ -4467,5 +4528,62 @@ mod tests {
 
         assert!(subscriber.publishes_received.lock().unwrap().is_empty());
         assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
+    }
+
+    /// Dropping a FETCH cancels it with STOP_SENDING(CANCELLED) on the
+    /// request stream, after its own direction was FINed (draft-20 §5.2).
+    #[tokio::test]
+    async fn dropping_a_fetch_stops_its_request_stream() {
+        let (session, peer) = loopback_session_pair().await;
+        let mut subscriber = test_subscriber(session);
+        let fetch = subscriber
+            .fetch(
+                TrackNamespace::from_utf8_path("live"),
+                "video",
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let (mut send, mut recv) = peer.accept_bi().await.unwrap();
+        let mut request = Vec::new();
+        while let Some(chunk) = recv.read(usize::MAX).await.unwrap() {
+            request.extend_from_slice(&chunk);
+        }
+        assert_eq!(request.first(), Some(&(message::wire_id::Fetch as u8)));
+
+        drop(fetch);
+        let stopped = tokio::time::timeout(Duration::from_secs(2), send.closed())
+            .await
+            .expect("no STOP_SENDING")
+            .unwrap();
+        assert_eq!(stopped, Some(1));
+        assert!(subscriber.fetches.lock().unwrap().is_empty());
+    }
+
+    /// Data for a FETCH this endpoint is not waiting on is stopped; the
+    /// session survives, since it can trail a cancel.
+    #[tokio::test]
+    async fn fetch_stream_for_an_unknown_request_is_stopped() {
+        use crate::coding::Encode;
+
+        let (session, peer) = loopback_session_pair().await;
+        let subscriber = test_subscriber(session.clone());
+        let mut send = peer.open_uni().await.unwrap();
+        let mut header = bytes::BytesMut::new();
+        data::FetchHeader {
+            header_type: data::StreamHeaderType::Fetch,
+            request_id: 9,
+        }
+        .encode(&mut header)
+        .unwrap();
+        send.write(&header).await.unwrap();
+
+        let stream = session.accept_uni().await.unwrap();
+        subscriber.recv_stream(stream).await.unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(2), send.closed())
+            .await
+            .expect("no STOP_SENDING")
+            .unwrap();
+        assert_eq!(stopped, Some(1));
     }
 }
