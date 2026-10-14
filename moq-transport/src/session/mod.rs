@@ -1260,8 +1260,13 @@ impl Session {
         if dispatch_result.is_ok() {
             if let Some(id) = req_id {
                 if let Some(ref mut rx) = rx {
-                    let follow_ups =
-                        Self::read_request_follow_ups(&mut reader, id, publisher, subscriber);
+                    let follow_ups = Self::read_request_follow_ups(
+                        &mut reader,
+                        id,
+                        request_kind,
+                        publisher,
+                        subscriber,
+                    );
                     tokio::pin!(follow_ups);
 
                     // Keep a selected response write indivisible with respect
@@ -1411,6 +1416,7 @@ impl Session {
     async fn read_request_follow_ups(
         reader: &mut Reader,
         request_id: u64,
+        request_kind: BidiRequestKind,
         publisher: &mut Option<Publisher>,
         subscriber: &mut Option<Subscriber>,
     ) -> Result<FollowupEnd, SessionError> {
@@ -1445,6 +1451,16 @@ impl Session {
                 }
                 _ => None,
             };
+
+            // PUBLISH_STATE_NOTIFY follows an inbound PUBLISH from its
+            // publisher; on any other request it falls through to
+            // recv_message, which closes the session.
+            if let (BidiRequestKind::Publish, Message::PublishStateNotify(notify), Some(s)) =
+                (request_kind, &msg, subscriber.as_ref())
+            {
+                s.recv_publish_state_notify(notify);
+                continue;
+            }
 
             let dispatched = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => subscriber

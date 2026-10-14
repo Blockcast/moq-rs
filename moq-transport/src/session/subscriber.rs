@@ -823,6 +823,10 @@ impl Subscriber {
                             match response {
                                 Ok(msg) => {
                                     let terminal = matches!(msg, Message::PublishDone(_) | Message::RequestError(_));
+                                    if let Message::PublishStateNotify(notify) = &msg {
+                                        subscriber_clone.recv_publish_state_notify(notify);
+                                        continue;
+                                    }
                                     if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
                                         if let Err(err) = subscriber_clone.recv_message(pub_msg) {
                                             break Err(err);
@@ -941,6 +945,16 @@ impl Subscriber {
         let _ = self.outgoing.push(msg.into());
     }
 
+    /// PUBLISH_STATE_NOTIFY on a subscription this endpoint receives
+    /// (draft-20 §10.10). Informative only: it is never answered.
+    pub(super) fn recv_publish_state_notify(&self, msg: &message::PublishStateNotify) {
+        tracing::debug!(
+            target: "moq_transport::control",
+            params = msg.params.0.len(),
+            "received PUBLISH_STATE_NOTIFY"
+        );
+    }
+
     /// Receive a message from the publisher via the control stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         match &msg {
@@ -962,13 +976,13 @@ impl Subscriber {
                 ));
             }
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg)?,
-            // Informative only (draft-20 §10.10): no response, no required action.
-            message::Publisher::PublishStateNotify(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    params = msg.params.0.len(),
-                    "received PUBLISH_STATE_NOTIFY"
-                );
+            // Only valid on a subscription stream from its publisher; those
+            // paths call recv_publish_state_notify directly.
+            message::Publisher::PublishStateNotify(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "PUBLISH_STATE_NOTIFY is only valid on a subscription from its publisher"
+                        .to_string(),
+                ));
             }
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
@@ -3448,6 +3462,128 @@ mod tests {
             "SUBSCRIBE unexpectedly opened without bidi stream credit"
         );
         assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
+    }
+
+    /// PUBLISH_STATE_NOTIFY outside a subscription (e.g. on the control
+    /// stream) closes the session (draft-20 §10.10).
+    #[tokio::test]
+    async fn publish_state_notify_outside_a_subscription_is_a_protocol_violation() {
+        let (client, _server) = loopback_session_pair().await;
+        let mut subscriber = test_subscriber(client);
+        let result = subscriber.recv_message(message::Publisher::PublishStateNotify(
+            message::PublishStateNotify::default(),
+        ));
+        assert!(matches!(result, Err(SessionError::ProtocolViolation(_))));
+    }
+
+    /// A follow-up PUBLISH_STATE_NOTIFY is accepted after an inbound PUBLISH
+    /// (sent by its publisher) and closes the session after an inbound
+    /// SUBSCRIBE (sent by the subscriber).
+    #[tokio::test]
+    async fn publish_state_notify_follow_up_depends_on_request_kind() {
+        async fn follow_up(
+            kind: super::super::BidiRequestKind,
+        ) -> Option<Result<(), SessionError>> {
+            let (client, server) = loopback_session_pair().await;
+            let peer = tokio::spawn(async move {
+                let (send, _recv) = server.open_bi().await.unwrap();
+                let mut writer = Writer::new(send);
+                Session::encode_bidi_response(
+                    &mut writer,
+                    &Message::PublishStateNotify(message::PublishStateNotify::default()),
+                )
+                .await
+                .unwrap();
+                // Keep the stream open so an accepted notice parks the reader.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+            let (_send, recv) = client.accept_bi().await.unwrap();
+            let mut reader = Reader::new(recv);
+            let mut publisher = None;
+            let mut subscriber = Some(test_subscriber(client));
+            let result = tokio::time::timeout(
+                Duration::from_millis(300),
+                Session::read_request_follow_ups(
+                    &mut reader,
+                    0,
+                    kind,
+                    &mut publisher,
+                    &mut subscriber,
+                ),
+            )
+            .await
+            .ok()
+            .map(|r| r.map(|_| ()));
+            peer.abort();
+            result
+        }
+
+        assert!(
+            follow_up(super::super::BidiRequestKind::Publish)
+                .await
+                .is_none(),
+            "an accepted notice keeps reading the PUBLISH stream"
+        );
+        assert!(matches!(
+            follow_up(super::super::BidiRequestKind::Subscribe).await,
+            Some(Err(SessionError::ProtocolViolation(_)))
+        ));
+    }
+
+    /// The publisher of an outbound SUBSCRIBE may send PUBLISH_STATE_NOTIFY
+    /// before SUBSCRIBE_OK; the subscription still opens.
+    #[tokio::test]
+    async fn outbound_subscribe_accepts_publish_state_notify() {
+        let (client, server) = loopback_session_pair().await;
+        let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
+
+        let peer = tokio::spawn(async move {
+            let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            let request_id = match peer_reader.decode::<Message>().await.unwrap() {
+                Message::Subscribe(msg) => msg.id,
+                msg => panic!("unexpected request: {}", msg.name()),
+            };
+            for msg in [
+                Message::PublishStateNotify(message::PublishStateNotify::default()),
+                Message::SubscribeOk(message::SubscribeOk {
+                    id: request_id,
+                    track_alias: 42,
+                    params: Default::default(),
+                    track_extensions: Default::default(),
+                }),
+            ] {
+                Session::encode_bidi_response(&mut peer_writer, &msg)
+                    .await
+                    .unwrap();
+            }
+            // Hold the session and stream open while the subscription is checked.
+            (server, peer_writer, peer_reader)
+        });
+
+        let opening = tokio::spawn(async move {
+            let result = subscriber.subscribe_open(test_track("video")).await;
+            (subscriber, result)
+        });
+        let pump = tokio::time::timeout(Duration::from_secs(2), bidi_task_rx.recv())
+            .await
+            .expect("SUBSCRIBE response pump was not registered")
+            .expect("SUBSCRIBE response pump queue closed");
+        let pump = tokio::spawn(pump);
+
+        let (_subscriber, subscribe) = tokio::time::timeout(Duration::from_secs(2), opening)
+            .await
+            .expect("SUBSCRIBE did not open")
+            .unwrap();
+        assert!(subscribe.is_ok(), "SUBSCRIBE failed: {:?}", subscribe.err());
+        let _keep_open = peer.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !pump.is_finished(),
+            "the notice must not end the subscription"
+        );
+        pump.abort();
     }
 
     #[tokio::test]

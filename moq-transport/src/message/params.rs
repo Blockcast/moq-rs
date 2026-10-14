@@ -139,6 +139,9 @@ impl Encode for LocationFilter {
                 end_group,
                 end_object,
             } => {
+                if end_group.is_none() && end_object.is_some() {
+                    return Err(EncodeError::MissingField("EndGroup".to_string()));
+                }
                 // An open-ended filter from {0, 0} is unfiltered, and as two
                 // fields it would read back as NextObject.
                 if start == Location::new(0, 0) && end_group.is_none() {
@@ -147,10 +150,7 @@ impl Encode for LocationFilter {
                 start.group_id.encode(w)?;
                 start.object_id.encode(w)?;
                 match (end_group, end_object) {
-                    (None, None) => {}
-                    (None, Some(_)) => {
-                        return Err(EncodeError::MissingField("EndGroup".to_string()))
-                    }
+                    (None, _) => {}
                     (Some(end_group), end_object) => {
                         end_group
                             .checked_sub(start.group_id)
@@ -523,8 +523,6 @@ mod tests {
         assert_eq!(params.rendezvous_timeout().unwrap(), Some(30_000));
     }
 
-    /// 0x04 is even, so the KVP codec carries it as a varint. A peer sending a
-    /// byte string under that key is malformed rather than something to coerce.
     fn decode_filter(bytes: &[u8]) -> Result<LocationFilter, DecodeError> {
         decode_bytes_value(bytes)
     }
@@ -633,12 +631,14 @@ mod tests {
         };
         assert!(encode_bytes_value(&from_origin).unwrap().is_empty());
         // EndObject needs an end group, and the end group cannot precede the start.
-        assert!(encode_bytes_value(&LocationFilter::Absolute {
-            start: Location::new(5, 0),
-            end_group: None,
-            end_object: Some(1),
-        })
-        .is_err());
+        for start in [Location::new(5, 0), Location::new(0, 0)] {
+            assert!(encode_bytes_value(&LocationFilter::Absolute {
+                start,
+                end_group: None,
+                end_object: Some(1),
+            })
+            .is_err());
+        }
         assert!(encode_bytes_value(&LocationFilter::Absolute {
             start: Location::new(5, 0),
             end_group: Some(4),
@@ -647,6 +647,8 @@ mod tests {
         .is_err());
     }
 
+    /// 0x04 is even, so the KVP codec carries it as a varint. A peer sending a
+    /// byte string under that key is malformed rather than something to coerce.
     #[test]
     fn rendezvous_timeout_rejects_a_bytes_value() {
         let mut params = KeyValuePairs::default();
