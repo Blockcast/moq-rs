@@ -1049,23 +1049,6 @@ impl Publisher {
                     "PUBLISH_NAMESPACE_CANCEL is not part of draft-18".to_string(),
                 ));
             }
-            // Draft-18 removed the dedicated PUBLISH_OK type in favour of
-            // REQUEST_OK, so we never send it. Accepting it on receive keeps
-            // draft-16 peers working and costs nothing, since the payload is the
-            // same shape. Retiring the type belongs with the other draft-16
-            // leftovers still decoded here.
-            message::Subscriber::PublishOk(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "PUBLISH accepted with the draft-16 PUBLISH_OK type"
-                );
-                let msg = message::RequestOk {
-                    id: msg.id,
-                    params: msg.params,
-                };
-                self.recv_publish_ok(&msg)?;
-            }
         }
 
         Ok(())

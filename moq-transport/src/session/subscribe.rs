@@ -7,7 +7,7 @@ use std::{ops, time::Duration};
 use crate::{
     coding::{KeyValuePairs, Location, ReasonPhrase, TrackName, TrackNamespace},
     data,
-    message::{self, FilterType, GroupOrder, SubscriptionFilter, TrackExtensions},
+    message::{self, GroupOrder, LocationFilter, TrackExtensions},
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
@@ -25,6 +25,8 @@ pub struct DeliveryFilter {
     pub forward: bool,
     pub start_location: Option<Location>,
     pub end_group_id: Option<u64>,
+    /// Inclusive last object in `end_group_id`; `None` includes the whole group.
+    pub end_object_id: Option<u64>,
 }
 
 impl DeliveryFilter {
@@ -42,6 +44,9 @@ impl DeliveryFilter {
 
         if let Some(end_group_id) = self.end_group_id {
             if group_id > end_group_id {
+                return false;
+            }
+            if group_id == end_group_id && self.end_object_id.is_some_and(|end| object_id > end) {
                 return false;
             }
         }
@@ -64,17 +69,9 @@ pub struct SubscribeInfo {
     /// Forward Flag
     pub forward: bool,
 
-    /// Filter type
-    pub filter_type: FilterType,
-
-    /// The starting location for this subscription. Only present for "AbsoluteStart" and "AbsoluteRange" filter types.
-    pub start_location: Option<Location>,
-    /// End group id, inclusive, for the subscription, if applicable. Only present for "AbsoluteRange" filter type.
-    pub end_group_id: Option<u64>,
-
-    /// None means the SUBSCRIPTION_FILTER parameter was omitted and the
+    /// None means the LOCATION_FILTER parameter was omitted and the
     /// subscription is unfiltered.
-    pub filter: Option<SubscriptionFilter>,
+    pub filter: Option<LocationFilter>,
 
     /// Optional parameters
     pub params: KeyValuePairs,
@@ -85,13 +82,7 @@ pub struct SubscribeInfo {
 
 impl SubscribeInfo {
     pub fn new_from_subscribe(msg: &message::Subscribe) -> Result<Self, SessionError> {
-        let filter = msg.params.subscription_filter()?;
-        let filter_type = filter
-            .as_ref()
-            .map(|filter| filter.filter_type)
-            .unwrap_or(FilterType::AbsoluteStart);
-        let start_location = filter.as_ref().and_then(|filter| filter.start_location);
-        let end_group_id = filter.as_ref().and_then(|filter| filter.end_group_id);
+        let filter = msg.params.location_filter()?;
         msg.params.rendezvous_timeout()?;
 
         Ok(Self {
@@ -101,9 +92,6 @@ impl SubscribeInfo {
             subscriber_priority: msg.params.subscriber_priority()?.unwrap_or(128),
             group_order: msg.params.group_order()?.unwrap_or(GroupOrder::Publisher),
             forward: msg.params.forward()?.unwrap_or(true),
-            filter_type,
-            start_location,
-            end_group_id,
             filter,
             params: msg.params.clone(),
             track_status: false,
@@ -111,25 +99,35 @@ impl SubscribeInfo {
     }
 
     pub fn delivery_filter(&self, largest_location: Option<Location>) -> DeliveryFilter {
-        let Some(filter) = &self.filter else {
-            return DeliveryFilter {
-                forward: self.forward,
-                start_location: None,
-                end_group_id: None,
-            };
-        };
-
-        let start_location = match filter.filter_type {
-            FilterType::LargestObject => Some(next_object_location(largest_location)),
-            FilterType::NextGroupStart => Some(next_group_location(largest_location)),
-            FilterType::AbsoluteStart | FilterType::AbsoluteRange => filter.start_location,
-        };
-
-        DeliveryFilter {
+        let mut delivery = DeliveryFilter {
             forward: self.forward,
-            start_location,
-            end_group_id: filter.end_group_id,
+            start_location: None,
+            end_group_id: None,
+            end_object_id: None,
+        };
+
+        match self.filter.unwrap_or(LocationFilter::Unfiltered) {
+            LocationFilter::Unfiltered => {}
+            LocationFilter::NextObject => {
+                delivery.start_location = Some(next_object_location(largest_location));
+            }
+            LocationFilter::RelativeGroup(groups) => {
+                // {Largest.Group + 1 - n, 0}, clamped to [0, 2^64 - 1].
+                let next = next_group_location(largest_location).group_id;
+                delivery.start_location = Some(Location::new(next.saturating_sub(groups), 0));
+            }
+            LocationFilter::Absolute {
+                start,
+                end_group,
+                end_object,
+            } => {
+                delivery.start_location = Some(start);
+                delivery.end_group_id = end_group;
+                delivery.end_object_id = end_object;
+            }
         }
+
+        delivery
     }
 }
 
@@ -1017,10 +1015,10 @@ mod tests {
     }
 
     #[test]
-    fn largest_object_filter_starts_after_largest_object() {
+    fn next_object_filter_starts_after_largest_object() {
         let mut params = KeyValuePairs::default();
         params
-            .set_subscription_filter(&SubscriptionFilter::largest_object())
+            .set_location_filter(&LocationFilter::NextObject)
             .unwrap();
         let info = subscribe_info_with(params);
         let filter = info.delivery_filter(Some(Location::new(2, 3)));
@@ -1034,10 +1032,10 @@ mod tests {
     fn absolute_range_filter_limits_start_and_end_group() {
         let mut params = KeyValuePairs::default();
         params
-            .set_subscription_filter(&SubscriptionFilter {
-                filter_type: FilterType::AbsoluteRange,
-                start_location: Some(Location::new(2, 3)),
-                end_group_id: Some(4),
+            .set_location_filter(&LocationFilter::Absolute {
+                start: Location::new(2, 3),
+                end_group: Some(4),
+                end_object: None,
             })
             .unwrap();
         let info = subscribe_info_with(params);
@@ -1047,6 +1045,43 @@ mod tests {
         assert!(filter.allows(2, 3));
         assert!(filter.allows(4, 10));
         assert!(!filter.allows(5, 0));
+    }
+
+    #[test]
+    fn absolute_filter_end_object_is_inclusive_within_end_group() {
+        let mut params = KeyValuePairs::default();
+        params
+            .set_location_filter(&LocationFilter::Absolute {
+                start: Location::new(2, 0),
+                end_group: Some(4),
+                end_object: Some(5),
+            })
+            .unwrap();
+        let filter = subscribe_info_with(params).delivery_filter(None);
+
+        assert!(filter.allows(3, 100));
+        assert!(filter.allows(4, 5));
+        assert!(!filter.allows(4, 6));
+    }
+
+    #[test]
+    fn relative_group_filter_counts_back_from_next_group() {
+        let filter_for = |groups| {
+            let mut params = KeyValuePairs::default();
+            params
+                .set_location_filter(&LocationFilter::RelativeGroup(groups))
+                .unwrap();
+            subscribe_info_with(params).delivery_filter(Some(Location::new(7, 9)))
+        };
+
+        // 0 = Next Group, 1 = current group, 2 = one group prior.
+        assert!(!filter_for(0).allows(7, 10));
+        assert!(filter_for(0).allows(8, 0));
+        assert!(filter_for(1).allows(7, 0));
+        assert!(!filter_for(1).allows(6, 99));
+        assert!(filter_for(2).allows(6, 0));
+        // Clamped at group 0 rather than underflowing.
+        assert!(filter_for(100).allows(0, 0));
     }
 
     #[test]

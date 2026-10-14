@@ -1309,6 +1309,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let receive = async move {
@@ -1450,6 +1451,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
 
@@ -1584,6 +1586,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
 
@@ -1658,6 +1661,7 @@ mod tests {
                         forward: true,
                         start_location: None,
                         end_group_id: None,
+                        end_object_id: None,
                     },
                 )
                 .await
@@ -1758,6 +1762,7 @@ mod tests {
                         forward: true,
                         start_location: None,
                         end_group_id: None,
+                        end_object_id: None,
                     },
                 )
                 .await
@@ -1894,11 +1899,7 @@ mod tests {
             .insert(0, response_tx);
         let mut params = KeyValuePairs::default();
         params
-            .set_subscription_filter(&message::SubscriptionFilter {
-                filter_type: message::FilterType::NextGroupStart,
-                start_location: None,
-                end_group_id: None,
-            })
+            .set_location_filter(&message::LocationFilter::RelativeGroup(0))
             .unwrap();
         let (subscribed, _recv) = Subscribed::new(
             publisher,
@@ -1992,6 +1993,7 @@ mod tests {
                         forward: true,
                         start_location: None,
                         end_group_id: None,
+                        end_object_id: None,
                     },
                 )
                 .await,
@@ -2042,6 +2044,7 @@ mod tests {
                         forward: true,
                         start_location: None,
                         end_group_id: None,
+                        end_object_id: None,
                     },
                 )
                 .await,
@@ -2093,6 +2096,7 @@ mod tests {
             forward: true,
             start_location: Some(Location::new(0, 5)),
             end_group_id: None,
+            end_object_id: None,
         };
 
         let receive = async move {
@@ -2176,6 +2180,7 @@ mod tests {
                 forward: true,
                 start_location,
                 end_group_id: None,
+                end_object_id: None,
             };
             let receive = async move {
                 let stream = peer_session.accept_uni().await.unwrap();
@@ -2300,6 +2305,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
 
@@ -2355,6 +2361,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let receive = async move {
@@ -2443,6 +2450,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let receive = async move {
@@ -2521,6 +2529,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let receive = async move {
@@ -2922,6 +2931,7 @@ mod tests {
             forward: true,
             start_location: None,
             end_group_id: None,
+            end_object_id: None,
         }
     }
 
@@ -2976,6 +2986,7 @@ mod tests {
                 forward: false,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         )
         .await;

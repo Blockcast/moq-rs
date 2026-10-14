@@ -6,22 +6,33 @@ use bytes::Buf as _;
 use crate::coding::{
     Decode, DecodeError, Encode, EncodeError, KeyValuePair, KeyValuePairs, Location, Value,
 };
-use crate::message::{wire_id, FilterType, GroupOrder};
+use crate::message::{wire_id, GroupOrder};
 
-/// Draft-16 message-parameter type IDs.
+/// Message-parameter type IDs (draft-20 §15.7).
 pub mod parameter_type {
+    /// OBJECT_DELIVERY_TIMEOUT.
     pub const DELIVERY_TIMEOUT: u64 = 0x02;
     pub const AUTHORIZATION_TOKEN: u64 = 0x03;
     /// draft-18 §10.2.6. Milliseconds a subscriber will wait for a publisher to
     /// appear. Valid on SUBSCRIBE only, unlike the delivery timeouts.
     pub const RENDEZVOUS_TIMEOUT: u64 = 0x04;
+    pub const SUBGROUP_DELIVERY_TIMEOUT: u64 = 0x06;
     pub const EXPIRES: u64 = 0x08;
     pub const LARGEST_OBJECT: u64 = 0x09;
+    pub const FILL_TIMEOUT: u64 = 0x0A;
     pub const FORWARD: u64 = 0x10;
     pub const SUBSCRIBER_PRIORITY: u64 = 0x20;
-    pub const SUBSCRIPTION_FILTER: u64 = 0x21;
+    pub const LOCATION_FILTER: u64 = 0x21;
     pub const GROUP_ORDER: u64 = 0x22;
+    pub const FILL_PARAMETERS: u64 = 0x23;
+    pub const SUBGROUP_FILTER: u64 = 0x25;
+    pub const OBJECTID_FILTER: u64 = 0x26;
+    pub const PRIORITY_FILTER: u64 = 0x27;
+    pub const OBJECT_PROPERTY_FILTER: u64 = 0x28;
+    pub const TRACK_PROPERTY_FILTER: u64 = 0x29;
     pub const NEW_GROUP_REQUEST: u64 = 0x32;
+    pub const TRACK_NAMESPACE_PREFIX: u64 = 0x34;
+    pub const INCLUDE_PROPERTIES: u64 = 0x35;
 }
 
 /// Message-parameter type IDs whose value is a single raw `uint8` byte rather
@@ -32,7 +43,7 @@ pub mod parameter_type {
 /// byte-valued parameters carried by SUBSCRIBE / FETCH. Notably
 /// SUBSCRIBER_PRIORITY defaults to 128, which a varint encodes in two bytes —
 /// desynchronising the parameter block for peers (imquic, moq-go) that expect a
-/// single byte. SUBSCRIPTION_FILTER (0x21) stays length-prefixed bytes and the
+/// single byte. LOCATION_FILTER (0x21) stays length-prefixed bytes and the
 /// varint-valued parameters (timeouts, EXPIRES, NEW_GROUP_REQUEST) are
 /// unaffected, so they are intentionally absent here.
 pub const U8_VALUE_PARAMETER_TYPES: &[u64] = &[
@@ -60,11 +71,100 @@ pub mod extension_type {
     pub const PRIOR_OBJECT_ID_GAP: u64 = 0x3E;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SubscriptionFilter {
-    pub filter_type: FilterType,
-    pub start_location: Option<Location>,
-    pub end_group_id: Option<u64>,
+/// LOCATION_FILTER value (draft-20 §5.1.2). The number of vi64 fields present
+/// in the length-prefixed value selects the form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocationFilter {
+    /// Zero fields: no filter. In REQUEST_UPDATE this removes the current filter.
+    Unfiltered,
+    /// One field (StartGroup): start at {Largest.Group + 1 - n, 0}; open-ended.
+    /// `RelativeGroup(0)` is the Next Group, `RelativeGroup(1)` the current one.
+    RelativeGroup(u64),
+    /// Two zero fields: start at the Next Object; open-ended.
+    NextObject,
+    /// Absolute start, optional inclusive end group, optional inclusive end
+    /// object within the end group. `end_object` requires `end_group`.
+    Absolute {
+        start: Location,
+        end_group: Option<u64>,
+        end_object: Option<u64>,
+    },
+}
+
+impl Decode for LocationFilter {
+    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+        let mut fields = [0u64; 4];
+        let mut n = 0;
+        while r.has_remaining() {
+            if n == fields.len() {
+                return Err(DecodeError::InvalidParameter);
+            }
+            fields[n] = u64::decode(r)?;
+            n += 1;
+        }
+
+        Ok(match n {
+            0 => Self::Unfiltered,
+            1 => Self::RelativeGroup(fields[0]),
+            2 if fields[0] == 0 && fields[1] == 0 => Self::NextObject,
+            _ => Self::Absolute {
+                start: Location::new(fields[0], fields[1]),
+                end_group: if n >= 3 {
+                    // StartGroup + EndGroupDelta overflowing is a PROTOCOL_VIOLATION.
+                    Some(
+                        fields[0]
+                            .checked_add(fields[2])
+                            .ok_or(DecodeError::InvalidParameter)?,
+                    )
+                } else {
+                    None
+                },
+                end_object: (n == 4).then_some(fields[3]),
+            },
+        })
+    }
+}
+
+impl Encode for LocationFilter {
+    fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        match *self {
+            Self::Unfiltered => {}
+            Self::RelativeGroup(groups) => groups.encode(w)?,
+            Self::NextObject => {
+                0u64.encode(w)?;
+                0u64.encode(w)?;
+            }
+            Self::Absolute {
+                start,
+                end_group,
+                end_object,
+            } => {
+                // An open-ended filter from {0, 0} is unfiltered, and as two
+                // fields it would read back as NextObject.
+                if start == Location::new(0, 0) && end_group.is_none() {
+                    return Ok(());
+                }
+                start.group_id.encode(w)?;
+                start.object_id.encode(w)?;
+                match (end_group, end_object) {
+                    (None, None) => {}
+                    (None, Some(_)) => {
+                        return Err(EncodeError::MissingField("EndGroup".to_string()))
+                    }
+                    (Some(end_group), end_object) => {
+                        end_group
+                            .checked_sub(start.group_id)
+                            .ok_or(EncodeError::InvalidValue)?
+                            .encode(w)?;
+                        if let Some(end_object) = end_object {
+                            end_object.encode(w)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Draft-16 Track Extensions are a trailing sequence of KVPs with no count or length prefix.
@@ -194,59 +294,6 @@ impl Encode for TrackExtensions {
     }
 }
 
-impl SubscriptionFilter {
-    pub fn largest_object() -> Self {
-        Self {
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
-        }
-    }
-}
-
-impl Decode for SubscriptionFilter {
-    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        let filter_type = FilterType::decode(r)?;
-
-        let (start_location, end_group_id) = match filter_type {
-            FilterType::AbsoluteStart => (Some(Location::decode(r)?), None),
-            FilterType::AbsoluteRange => (Some(Location::decode(r)?), Some(u64::decode(r)?)),
-            FilterType::NextGroupStart | FilterType::LargestObject => (None, None),
-        };
-
-        Ok(Self {
-            filter_type,
-            start_location,
-            end_group_id,
-        })
-    }
-}
-
-impl Encode for SubscriptionFilter {
-    fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        self.filter_type.encode(w)?;
-
-        match self.filter_type {
-            FilterType::AbsoluteStart => {
-                self.start_location
-                    .ok_or_else(|| EncodeError::MissingField("StartLocation".to_string()))?
-                    .encode(w)?;
-            }
-            FilterType::AbsoluteRange => {
-                self.start_location
-                    .ok_or_else(|| EncodeError::MissingField("StartLocation".to_string()))?
-                    .encode(w)?;
-                self.end_group_id
-                    .ok_or_else(|| EncodeError::MissingField("EndGroupId".to_string()))?
-                    .encode(w)?;
-            }
-            FilterType::NextGroupStart | FilterType::LargestObject => {}
-        }
-
-        Ok(())
-    }
-}
-
 fn encode_bytes_value<T: Encode>(value: &T) -> Result<Vec<u8>, EncodeError> {
     let mut buf = Vec::new();
     value.encode(&mut buf)?;
@@ -368,20 +415,16 @@ impl KeyValuePairs {
         }
     }
 
-    pub fn set_subscription_filter(
-        &mut self,
-        filter: &SubscriptionFilter,
-    ) -> Result<(), EncodeError> {
-        self.set_bytesvalue(
-            parameter_type::SUBSCRIPTION_FILTER,
-            encode_bytes_value(filter)?,
-        );
+    pub fn set_location_filter(&mut self, filter: &LocationFilter) -> Result<(), EncodeError> {
+        self.set_bytesvalue(parameter_type::LOCATION_FILTER, encode_bytes_value(filter)?);
         Ok(())
     }
 
-    pub fn subscription_filter(&self) -> Result<Option<SubscriptionFilter>, DecodeError> {
+    /// `None` means the parameter was omitted; `Some(Unfiltered)` means it was
+    /// present with length 0 (an explicit clear in REQUEST_UPDATE).
+    pub fn location_filter(&self) -> Result<Option<LocationFilter>, DecodeError> {
         match self
-            .get(parameter_type::SUBSCRIPTION_FILTER)
+            .get(parameter_type::LOCATION_FILTER)
             .map(|kvp| &kvp.value)
         {
             Some(Value::BytesValue(value)) => decode_bytes_value(value).map(Some),
@@ -453,16 +496,16 @@ mod tests {
     #[test]
     fn key_value_pairs_message_parameter_methods_round_trip_typed_values() {
         let mut params = KeyValuePairs::default();
-        let filter = SubscriptionFilter {
-            filter_type: FilterType::AbsoluteRange,
-            start_location: Some(Location::new(1, 2)),
-            end_group_id: Some(3),
+        let filter = LocationFilter::Absolute {
+            start: Location::new(1, 2),
+            end_group: Some(3),
+            end_object: Some(4),
         };
 
         params.set_forward(false);
         params.set_subscriber_priority(7);
         params.set_group_order(GroupOrder::Descending);
-        params.set_subscription_filter(&filter).unwrap();
+        params.set_location_filter(&filter).unwrap();
         params.set_largest_object(Location::new(4, 5)).unwrap();
         params.set_expires(6);
         params.set_delivery_timeout(8);
@@ -472,7 +515,7 @@ mod tests {
         assert_eq!(params.forward().unwrap(), Some(false));
         assert_eq!(params.subscriber_priority().unwrap(), Some(7));
         assert_eq!(params.group_order().unwrap(), Some(GroupOrder::Descending));
-        assert_eq!(params.subscription_filter().unwrap(), Some(filter));
+        assert_eq!(params.location_filter().unwrap(), Some(filter));
         assert_eq!(params.largest_object().unwrap(), Some(Location::new(4, 5)));
         assert_eq!(params.expires().unwrap(), Some(6));
         assert_eq!(params.delivery_timeout().unwrap(), Some(8));
@@ -482,6 +525,128 @@ mod tests {
 
     /// 0x04 is even, so the KVP codec carries it as a varint. A peer sending a
     /// byte string under that key is malformed rather than something to coerce.
+    fn decode_filter(bytes: &[u8]) -> Result<LocationFilter, DecodeError> {
+        decode_bytes_value(bytes)
+    }
+
+    /// Golden vectors for every LOCATION_FILTER form (draft-20 §5.1.2).
+    #[test]
+    fn location_filter_golden_vectors() {
+        let cases: &[(&[u8], LocationFilter)] = &[
+            (&[], LocationFilter::Unfiltered),
+            (&[0x05], LocationFilter::RelativeGroup(5)),
+            (&[0x00, 0x00], LocationFilter::NextObject),
+            (
+                &[0x0a, 0x03],
+                LocationFilter::Absolute {
+                    start: Location::new(10, 3),
+                    end_group: None,
+                    end_object: None,
+                },
+            ),
+            (
+                &[0x0a, 0x03, 0x02],
+                LocationFilter::Absolute {
+                    start: Location::new(10, 3),
+                    end_group: Some(12),
+                    end_object: None,
+                },
+            ),
+            (
+                &[0x0a, 0x03, 0x02, 0x07],
+                LocationFilter::Absolute {
+                    start: Location::new(10, 3),
+                    end_group: Some(12),
+                    end_object: Some(7),
+                },
+            ),
+            // Three or four fields are absolute even when the start is {0, 0}.
+            (
+                &[0x00, 0x00, 0x00],
+                LocationFilter::Absolute {
+                    start: Location::new(0, 0),
+                    end_group: Some(0),
+                    end_object: None,
+                },
+            ),
+        ];
+        for (bytes, filter) in cases {
+            assert_eq!(
+                decode_filter(bytes).unwrap(),
+                *filter,
+                "decode {bytes:02x?}"
+            );
+            assert_eq!(
+                encode_bytes_value(filter).unwrap(),
+                bytes.to_vec(),
+                "encode {filter:?}"
+            );
+        }
+    }
+
+    /// The whole parameter inside a message-parameter block: count, type 0x21,
+    /// byte length, then the fields.
+    #[test]
+    fn location_filter_parameter_block_golden() {
+        let mut params = KeyValuePairs::default();
+        params
+            .set_location_filter(&LocationFilter::Absolute {
+                start: Location::new(10, 3),
+                end_group: Some(12),
+                end_object: None,
+            })
+            .unwrap();
+        let mut buf = BytesMut::new();
+        params.encode_message_params(&mut buf).unwrap();
+        assert_eq!(buf.to_vec(), vec![0x01, 0x21, 0x03, 0x0a, 0x03, 0x02]);
+
+        let decoded = KeyValuePairs::decode_message_params(&mut buf.freeze()).unwrap();
+        assert_eq!(
+            decoded.location_filter().unwrap(),
+            params.location_filter().unwrap()
+        );
+    }
+
+    #[test]
+    fn location_filter_rejects_malformed_values() {
+        // More than four fields.
+        assert!(decode_filter(&[1, 2, 3, 4, 5]).is_err());
+        // StartGroup + EndGroupDelta overflows 2^64 - 1.
+        let mut overflow = vec![0xff; 9];
+        overflow.extend_from_slice(&[0x00, 0x01]);
+        assert!(decode_filter(&overflow).is_err());
+        // A truncated vi64 inside the length.
+        assert!(decode_filter(&[0x0a, 0x80]).is_err());
+        // An integer-typed value where a length-prefixed one is required.
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(parameter_type::LOCATION_FILTER, 1);
+        assert!(params.location_filter().is_err());
+    }
+
+    #[test]
+    fn location_filter_encoding_edge_cases() {
+        // Open-ended from {0, 0} is unfiltered, not NextObject.
+        let from_origin = LocationFilter::Absolute {
+            start: Location::new(0, 0),
+            end_group: None,
+            end_object: None,
+        };
+        assert!(encode_bytes_value(&from_origin).unwrap().is_empty());
+        // EndObject needs an end group, and the end group cannot precede the start.
+        assert!(encode_bytes_value(&LocationFilter::Absolute {
+            start: Location::new(5, 0),
+            end_group: None,
+            end_object: Some(1),
+        })
+        .is_err());
+        assert!(encode_bytes_value(&LocationFilter::Absolute {
+            start: Location::new(5, 0),
+            end_group: Some(4),
+            end_object: None,
+        })
+        .is_err());
+    }
+
     #[test]
     fn rendezvous_timeout_rejects_a_bytes_value() {
         let mut params = KeyValuePairs::default();

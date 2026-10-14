@@ -5,12 +5,12 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError, TrackName, TrackNa
 
 /// A track matching SUBSCRIBE_TRACKS that cannot be sent as PUBLISH.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublishBlocked {
+pub struct PublishSkipped {
     pub track_namespace_suffix: TrackNamespacePrefix,
     pub track_name: TrackName,
 }
 
-impl Decode for PublishBlocked {
+impl Decode for PublishSkipped {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         Ok(Self {
             track_namespace_suffix: TrackNamespacePrefix::decode(r)?,
@@ -19,7 +19,7 @@ impl Decode for PublishBlocked {
     }
 }
 
-impl Encode for PublishBlocked {
+impl Encode for PublishSkipped {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.track_namespace_suffix.encode(w)?;
         self.track_name.encode(w)
@@ -33,7 +33,7 @@ mod tests {
 
     #[test]
     fn encode_decode() {
-        let message = PublishBlocked {
+        let message = PublishSkipped {
             track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("participant/100"),
             track_name: "video".into(),
         };
@@ -41,6 +41,6 @@ mod tests {
 
         message.encode(&mut buf).unwrap();
 
-        assert_eq!(PublishBlocked::decode(&mut buf).unwrap(), message);
+        assert_eq!(PublishSkipped::decode(&mut buf).unwrap(), message);
     }
 }

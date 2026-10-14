@@ -51,9 +51,9 @@ struct SubscribeTracksSlot {
     desired: Option<TrackReader>,
     active: Option<TrackReader>,
     /// draft-18 section 6.1 forbids a later PUBLISH for this track after
-    /// PUBLISH_BLOCKED. The parent SUBSCRIBE_TRACKS owns this tombstone until
+    /// PUBLISH_SKIPPED. The parent SUBSCRIBE_TRACKS owns this tombstone until
     /// it is cancelled, which drops its slot map and releases the permit.
-    publish_blocked_tombstone: bool,
+    publish_skipped_tombstone: bool,
     _session_slot_permit: OwnedSemaphorePermit,
 }
 
@@ -66,7 +66,7 @@ enum SubscribeTracksSlotAction {
 
 impl SubscribeTracksSlot {
     fn set_desired(&mut self, track: TrackReader) -> bool {
-        if self.publish_blocked_tombstone
+        if self.publish_skipped_tombstone
             || self
                 .active
                 .as_ref()
@@ -93,7 +93,7 @@ impl SubscribeTracksSlot {
         {
             self.desired = None;
         }
-        if self.active.is_some() || self.publish_blocked_tombstone {
+        if self.active.is_some() || self.publish_skipped_tombstone {
             SubscribeTracksSlotAction::None
         } else if self.desired.is_some() {
             SubscribeTracksSlotAction::Publish
@@ -110,7 +110,7 @@ impl SubscribeTracksSlot {
         {
             self.desired = None;
         }
-        self.active.is_none() && self.desired.is_none() && !self.publish_blocked_tombstone
+        self.active.is_none() && self.desired.is_none() && !self.publish_skipped_tombstone
     }
 }
 
@@ -1241,7 +1241,7 @@ impl Producer {
                 SubscribeTracksSlot {
                     desired: Some(track),
                     active: None,
-                    publish_blocked_tombstone: false,
+                    publish_skipped_tombstone: false,
                     _session_slot_permit: permit,
                 },
             );
@@ -1318,7 +1318,7 @@ impl Producer {
                                 slots.insert(full_name.clone(), SubscribeTracksSlot {
                                     desired: Some(track),
                                     active: None,
-                                    publish_blocked_tombstone: false,
+                                    publish_skipped_tombstone: false,
                                     _session_slot_permit: permit,
                                 });
                             }
@@ -1390,7 +1390,7 @@ impl Producer {
             .map(|track| (full_name_for_track(&track), track))
             .collect();
         for (full_name, slot) in slots.iter_mut() {
-            if slot.publish_blocked_tombstone {
+            if slot.publish_skipped_tombstone {
                 continue;
             }
             slot.desired = current.get(full_name).cloned();
@@ -1415,7 +1415,7 @@ impl Producer {
                 SubscribeTracksSlot {
                     desired: Some(track),
                     active: None,
-                    publish_blocked_tombstone: false,
+                    publish_skipped_tombstone: false,
                     _session_slot_permit: permit,
                 },
             );
@@ -1423,7 +1423,7 @@ impl Producer {
         let pending: Vec<_> = slots
             .iter()
             .filter(|(_, slot)| {
-                slot.desired.is_some() && slot.active.is_none() && !slot.publish_blocked_tombstone
+                slot.desired.is_some() && slot.active.is_none() && !slot.publish_skipped_tombstone
             })
             .map(|(full_name, _)| full_name.clone())
             .collect();
@@ -1432,7 +1432,7 @@ impl Producer {
                 .await?;
         }
         slots.retain(|_, slot| {
-            slot.desired.is_some() || slot.active.is_some() || slot.publish_blocked_tombstone
+            slot.desired.is_some() || slot.active.is_some() || slot.publish_skipped_tombstone
         });
         Ok(())
     }
@@ -1448,7 +1448,7 @@ impl Producer {
         let Some(slot) = slots.get(full_name) else {
             return Ok(());
         };
-        if slot.active.is_some() || slot.publish_blocked_tombstone {
+        if slot.active.is_some() || slot.publish_skipped_tombstone {
             return Ok(());
         }
         let Some(track) = slot.desired.clone() else {
@@ -1494,12 +1494,12 @@ impl Producer {
         {
             Ok(permit) => permit,
             Err(_) => {
-                request.publish_blocked(&full_name.namespace, &full_name.name)?;
+                request.publish_skipped(&full_name.namespace, &full_name.name)?;
                 if let Some(slot) = slots.get_mut(full_name) {
                     // This terminal marker is retained only until this parent
                     // SUBSCRIBE_TRACKS ends; draft-18 section 6.1 forbids a
                     // later generated PUBLISH for the same track.
-                    slot.publish_blocked_tombstone = true;
+                    slot.publish_skipped_tombstone = true;
                     slot.desired = None;
                 }
                 return Ok(());
@@ -1753,7 +1753,7 @@ mod tests {
             Decode, DecodeError, Encode, KeyValuePairs, TrackName, TrackNamespace,
             TrackNamespacePrefix,
         },
-        message::{wire_id, Message, PublishBlocked, RequestErrorCode, SubscribeTracks},
+        message::{wire_id, Message, PublishSkipped, RequestErrorCode, SubscribeTracks},
         serve::{ServeError, Track},
         session::{Session as TransportSession, SessionError, Subscriber, Transport},
     };
@@ -2083,7 +2083,7 @@ mod tests {
             SubscribeTracksSlot {
                 desired: None,
                 active: None,
-                publish_blocked_tombstone: true,
+                publish_skipped_tombstone: true,
                 _session_slot_permit: permit,
             },
         )]);
@@ -2148,10 +2148,10 @@ mod tests {
             read_bidi_response_frame(&mut response_recv, &mut response_buffer),
         )
         .await
-        .expect("PUBLISH_BLOCKED timed out");
-        assert_eq!(message_type, wire_id::PublishBlocked);
-        let blocked = PublishBlocked::decode(&mut Cursor::new(payload))
-            .expect("decode PUBLISH_BLOCKED payload");
+        .expect("PUBLISH_SKIPPED timed out");
+        assert_eq!(message_type, wire_id::PublishSkipped);
+        let blocked = PublishSkipped::decode(&mut Cursor::new(payload))
+            .expect("decode PUBLISH_SKIPPED payload");
         assert_eq!(blocked.track_name, TrackName::from("blocked"));
         assert_eq!(slot_permits.available_permits(), 1);
 
@@ -2198,10 +2198,10 @@ mod tests {
             read_bidi_response_frame(&mut response_recv, &mut response_buffer),
         )
         .await
-        .expect("resynced PUBLISH_BLOCKED timed out");
-        assert_eq!(message_type, wire_id::PublishBlocked);
-        let blocked = PublishBlocked::decode(&mut Cursor::new(payload))
-            .expect("decode resynced PUBLISH_BLOCKED payload");
+        .expect("resynced PUBLISH_SKIPPED timed out");
+        assert_eq!(message_type, wire_id::PublishSkipped);
+        let blocked = PublishSkipped::decode(&mut Cursor::new(payload))
+            .expect("decode resynced PUBLISH_SKIPPED payload");
         assert_eq!(blocked.track_name, TrackName::from("resynced"));
         assert_eq!(slot_permits.available_permits(), 0);
 
@@ -2226,7 +2226,7 @@ mod tests {
         let mut slot = SubscribeTracksSlot {
             desired: Some(first.clone()),
             active: Some(first.clone()),
-            publish_blocked_tombstone: false,
+            publish_skipped_tombstone: false,
             _session_slot_permit: permits.try_acquire_owned().expect("acquire slot permit"),
         };
 
@@ -2253,7 +2253,7 @@ mod tests {
         let mut slot = SubscribeTracksSlot {
             desired: Some(replacement.clone()),
             active: Some(first.clone()),
-            publish_blocked_tombstone: false,
+            publish_skipped_tombstone: false,
             _session_slot_permit: permits.try_acquire_owned().expect("acquire slot permit"),
         };
 

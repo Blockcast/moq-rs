@@ -4,7 +4,7 @@
 
 //! Messages used for the MoQ Transport handshake.
 //!
-//! In draft-18, both peers open a unidirectional control stream and send a
+//! In draft-20, both peers open a unidirectional control stream and send a
 //! unified SETUP message. Version negotiation is handled entirely by ALPN.
 
 mod auth_token;
@@ -24,10 +24,10 @@ pub use version::*;
 /// Used for version negotiation: the server picks the first entry that the client also offers.
 /// For native QUIC, these are offered as TLS ALPN values.
 /// For WebTransport, these are offered/selected via the WT-Available-Protocols / WT-Protocol headers.
-pub const SUPPORTED_ALPNS: &[&str] = &["moqt-18"];
+pub const SUPPORTED_ALPNS: &[&str] = &["moqt-20"];
 
 /// The preferred (most recent) ALPN, used as the default for single-version contexts.
-pub const ALPN: &[u8] = b"moqt-18";
+pub const ALPN: &[u8] = b"moqt-20";
 
 /// Select the best mutually-supported MoQT version from a list of protocols offered by a peer.
 ///
@@ -46,14 +46,21 @@ mod tests {
 
     #[test]
     fn negotiate_exact_match() {
-        let offered = vec!["moqt-18".to_string()];
-        assert_eq!(negotiate_version(&offered), Some("moqt-18"));
+        let offered = vec!["moqt-20".to_string()];
+        assert_eq!(negotiate_version(&offered), Some("moqt-20"));
     }
 
     #[test]
     fn negotiate_picks_our_preference() {
-        let offered = vec!["moqt-16".to_string(), "moqt-18".to_string()];
-        assert_eq!(negotiate_version(&offered), Some("moqt-18"));
+        let offered = vec!["moqt-18".to_string(), "moqt-20".to_string()];
+        assert_eq!(negotiate_version(&offered), Some("moqt-20"));
+    }
+
+    #[test]
+    fn draft_18_only_peer_is_not_negotiated() {
+        // This branch speaks draft-20 only; draft-18 lives on `draft-18-dev`.
+        let offered = vec!["moqt-18".to_string()];
+        assert_eq!(negotiate_version(&offered), None);
     }
 
     #[test]

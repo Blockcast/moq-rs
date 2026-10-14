@@ -956,12 +956,20 @@ impl Subscriber {
             }
             message::Publisher::Publish(msg) => self.recv_publish(msg)?,
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
-            message::Publisher::PublishBlocked(_) => {
+            message::Publisher::PublishSkipped(_) => {
                 return Err(SessionError::ProtocolViolation(
-                    "PUBLISH_BLOCKED is only valid on a SUBSCRIBE_TRACKS stream".to_string(),
+                    "PUBLISH_SKIPPED is only valid on a SUBSCRIBE_TRACKS stream".to_string(),
                 ));
             }
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg)?,
+            // Informative only (draft-20 §10.10): no response, no required action.
+            message::Publisher::PublishStateNotify(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    params = msg.params.0.len(),
+                    "received PUBLISH_STATE_NOTIFY"
+                );
+            }
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
             message::Publisher::RequestError(msg) => self.recv_request_error(msg)?,
@@ -3192,6 +3200,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let verify = async move {

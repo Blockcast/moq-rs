@@ -511,11 +511,11 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::PublishBlocked(m) => {
+            Message::PublishSkipped(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     direction,
-                    msg_type = "PUBLISH_BLOCKED",
+                    msg_type = "PUBLISH_SKIPPED",
                     namespace_suffix = %m.track_namespace_suffix,
                     track_name = %m.track_name,
                     "MoQT control message"
@@ -527,7 +527,8 @@ impl Session {
                     direction,
                     msg_type = "FETCH",
                     request_id = m.id,
-                    fetch_type = ?m.fetch_type,
+                    namespace = %m.track_namespace,
+                    track_name = %m.track_name,
                     "MoQT control message"
                 );
             }
@@ -562,12 +563,12 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::PublishOk(m) => {
+            Message::PublishStateNotify(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     direction,
-                    msg_type = "PUBLISH_OK",
-                    request_id = m.id,
+                    msg_type = "PUBLISH_STATE_NOTIFY",
+                    params = m.params.0.len(),
                     "MoQT control message"
                 );
             }
@@ -1518,11 +1519,11 @@ impl Session {
             Message::NamespaceDone(m) => {
                 m.track_namespace_suffix.encode(&mut payload)?;
             }
-            Message::PublishBlocked(m) => {
+            Message::PublishSkipped(m) => {
                 m.track_namespace_suffix.encode(&mut payload)?;
                 m.track_name.encode(&mut payload)?;
             }
-            Message::PublishOk(m) => {
+            Message::PublishStateNotify(m) => {
                 m.params.encode_message_params(&mut payload)?;
             }
             Message::FetchOk(m) => {
@@ -1646,18 +1647,17 @@ impl Session {
                     track_namespace_suffix,
                 }))
             }
-            wire_id::PublishBlocked => {
+            wire_id::PublishSkipped => {
                 let track_namespace_suffix = crate::coding::TrackNamespacePrefix::decode(&mut buf)?;
                 let track_name = crate::coding::TrackName::decode(&mut buf)?;
-                Ok(Message::PublishBlocked(message::PublishBlocked {
+                Ok(Message::PublishSkipped(message::PublishSkipped {
                     track_namespace_suffix,
                     track_name,
                 }))
             }
-            wire_id::PublishOk => {
+            wire_id::PublishStateNotify => {
                 let params = crate::coding::KeyValuePairs::decode_message_params(&mut buf)?;
-                Ok(Message::PublishOk(message::PublishOk {
-                    id: request_id,
+                Ok(Message::PublishStateNotify(message::PublishStateNotify {
                     params,
                 }))
             }
@@ -1908,7 +1908,7 @@ pub(crate) mod test_support {
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], key)
             .expect("configure raw QUIC server certificate");
-        server_crypto.alpn_protocols = vec![b"moqt-18".to_vec()];
+        server_crypto.alpn_protocols = vec![b"moqt-20".to_vec()];
         let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .expect("configure raw QUIC server crypto");
         let server = quinn::Endpoint::server(
@@ -1923,7 +1923,7 @@ pub(crate) mod test_support {
         let mut client_crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        client_crypto.alpn_protocols = vec![b"moqt-18".to_vec()];
+        client_crypto.alpn_protocols = vec![b"moqt-20".to_vec()];
         let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .expect("configure raw QUIC client crypto");
         let mut client =
@@ -2703,8 +2703,8 @@ mod tests {
     }
 
     #[test]
-    fn encode_bidi_publish_blocked_matches_plain_message_encoding() {
-        let msg = Message::PublishBlocked(message::PublishBlocked {
+    fn encode_bidi_publish_skipped_matches_plain_message_encoding() {
+        let msg = Message::PublishSkipped(message::PublishSkipped {
             track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
                 "participant=5",
             ),
@@ -2717,11 +2717,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_bidi_publish_blocked() {
+    async fn decode_bidi_publish_skipped() {
         let (requester, responder) = test_support::loopback_session_pair().await;
         let (_request_send, response_recv) = requester.open_bi().await.unwrap();
         let (response_send, _request_recv) = responder.accept_bi().await.unwrap();
-        let msg = Message::PublishBlocked(message::PublishBlocked {
+        let msg = Message::PublishSkipped(message::PublishSkipped {
             track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
                 "participant=5",
             ),
@@ -2731,12 +2731,12 @@ mod tests {
             .await
             .unwrap();
 
-        let Message::PublishBlocked(blocked) =
+        let Message::PublishSkipped(blocked) =
             Session::decode_bidi_response(&mut Reader::new(response_recv), 42)
                 .await
                 .unwrap()
         else {
-            panic!("expected PUBLISH_BLOCKED");
+            panic!("expected PUBLISH_SKIPPED");
         };
         assert_eq!(
             blocked.track_namespace_suffix,
@@ -2774,6 +2774,7 @@ mod tests {
         .is_none());
         assert!(Message::GoAway(message::GoAway {
             uri: crate::coding::SessionUri(String::new()),
+            timeout: 0,
         })
         .response_target_id()
         .is_none());
@@ -2797,17 +2798,16 @@ mod tests {
     }
 
     #[test]
-    fn encode_bidi_publish_ok_omits_request_id() {
-        use message::wire_id;
-        let msg = Message::PublishOk(message::PublishOk {
-            id: 55,
-            params: crate::coding::KeyValuePairs::default(),
-        });
+    fn encode_bidi_publish_state_notify() {
+        let mut params = crate::coding::KeyValuePairs::default();
+        params
+            .set_largest_object(crate::coding::Location::new(7, 2))
+            .unwrap();
+        let msg = Message::PublishStateNotify(message::PublishStateNotify { params });
         let bytes = encode_bidi_response_bytes(&msg);
-        assert_eq!(bytes[0], wire_id::PublishOk as u8);
-        assert!(
-            !bytes.contains(&55),
-            "Request ID must not appear in bidi encoding"
+        assert_eq!(
+            bytes.to_vec(),
+            vec![0x22, 0x00, 0x04, 0x01, 0x09, 0x07, 0x02]
         );
     }
 

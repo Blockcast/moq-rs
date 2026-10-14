@@ -168,6 +168,7 @@ impl Published {
             forward,
             start_location: None,
             end_group_id: None,
+            end_object_id: None,
         };
 
         let result = match forwarder.serve(track, delivery_filter).await {

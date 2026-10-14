@@ -57,7 +57,8 @@ publisher_msgs! {
     // Publisher-initiated subscriptions.
     Publish,
     PublishDone,
-    PublishBlocked,
+    PublishSkipped,
+    PublishStateNotify,
     // Responses to subscriber-initiated requests.
     SubscribeOk,
     RequestOk,

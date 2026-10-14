@@ -109,7 +109,7 @@ impl SubscribedTracks {
             .map_err(|_| ServeError::Cancel)
     }
 
-    pub fn publish_blocked(
+    pub fn publish_skipped(
         &mut self,
         namespace: &TrackNamespace,
         track_name: &TrackName,
@@ -122,13 +122,13 @@ impl SubscribedTracks {
             state.closed.clone()?;
             if !state.responded {
                 return Err(ServeError::internal_ctx(
-                    "PUBLISH_BLOCKED before SUBSCRIBE_TRACKS accepted",
+                    "PUBLISH_SKIPPED before SUBSCRIBE_TRACKS accepted",
                 ));
             }
         }
         self.outgoing
             .try_send(SubscribedTracksOutput::Message(
-                message::PublishBlocked {
+                message::PublishSkipped {
                     track_namespace_suffix: suffix,
                     track_name: track_name.clone(),
                 }
@@ -398,15 +398,15 @@ mod tests {
         request.ok().unwrap();
         let _ = recv.outgoing.recv().await;
         request
-            .publish_blocked(
+            .publish_skipped(
                 &TrackNamespace::from_utf8_path("room/123/participant/5"),
                 &TrackName::from("video"),
             )
             .unwrap();
-        let Some(SubscribedTracksOutput::Message(Message::PublishBlocked(blocked))) =
+        let Some(SubscribedTracksOutput::Message(Message::PublishSkipped(blocked))) =
             recv.outgoing.recv().await
         else {
-            panic!("expected PUBLISH_BLOCKED");
+            panic!("expected PUBLISH_SKIPPED");
         };
         assert_eq!(
             blocked.track_namespace_suffix.to_utf8_path(),
