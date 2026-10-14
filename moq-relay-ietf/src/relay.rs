@@ -103,9 +103,9 @@ struct SessionRejection {
 
 /// Authorize an accepted session against its scope's policy.
 ///
-/// Returns the session's authorization state, or `None` when the scope has no
-/// policy. Every failure path refuses the session: the relay never proceeds
-/// with a connection it could not positively authorize.
+/// Returns the session's token authorization state, or `None` for internal
+/// relay peers and scopes without a policy. Token decoding errors refuse every
+/// session; policy lookup and authorization failures refuse public sessions.
 ///
 /// Takes the peer's SETUP options rather than the session so the admission
 /// decision is unit-testable without a live transport.
@@ -143,6 +143,12 @@ async fn authorize_session(
             });
         }
     };
+
+    // Embedders must tag only authenticated relay peers as Internal: these
+    // sessions bypass token authorization at setup and on later requests.
+    if context.interface == SessionInterface::Internal {
+        return Ok(None);
+    }
 
     let hook = match authorizer.resolve(context.scope()).await {
         Ok(Some(hook)) => hook,
@@ -796,9 +802,15 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         use async_trait::async_trait;
-        use moq_transport::coding::{Encode, KeyValuePair, KeyValuePairs, TrackNamespace, VarInt};
+        use moq_transport::coding::{
+            Encode, KeyValuePair, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix,
+            VarInt,
+        };
         use moq_transport::setup::ParameterType;
+        use p256::pkcs8::EncodePublicKey;
 
+        use crate::auth::{authorize, AuthzOperation};
+        use crate::ConnectionTags;
         use crate::{
             AuthPublicKey, CoordinatorContext, CoordinatorError, CoordinatorResult,
             NamespaceOrigin, NamespaceRegistration, ScopeAuthConfig, ScopeConfig,
@@ -906,6 +918,106 @@ mod tests {
         ) -> Result<Option<SessionAuth>, SessionRejection> {
             let authorizer = ScopeAuthorizer::new(coordinator);
             authorize_session(&authorizer, &context(), params).await
+        }
+
+        fn enforced_with_valid_key() -> ScopeConfig {
+            let key = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            let pem = p256::ecdsa::VerifyingKey::from(&key)
+                .to_public_key_pem(Default::default())
+                .expect("public key PEM");
+            ScopeConfig {
+                auth: Some(ScopeAuthConfig::new(vec![AuthPublicKey::es256(pem)])),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn internal_session_without_token_is_admitted_and_authorizes_requests() {
+            let context = SessionContext::internal(Some("tenant".to_string()), None);
+            let namespace = TrackNamespace::from_utf8_path("sports/football");
+            let track = TrackName::from("video");
+            let prefix = TrackNamespacePrefix::from_utf8_path("sports");
+
+            for coordinator in [
+                FixedConfig::new(enforced_with_valid_key()),
+                FixedConfig::new(ScopeConfig::default()),
+                FixedConfig::failing(),
+            ] {
+                let authorizer = ScopeAuthorizer::new(coordinator);
+                let auth = authorize_session(&authorizer, &context, &KeyValuePairs::default())
+                    .await
+                    .expect("internal relay session must be admitted without a token");
+
+                for operation in [
+                    AuthzOperation::Subscribe {
+                        namespace: &namespace,
+                        track: &track,
+                    },
+                    AuthzOperation::Fetch {
+                        namespace: &namespace,
+                        track: &track,
+                    },
+                    AuthzOperation::PublishNamespace {
+                        namespace: &namespace,
+                    },
+                    AuthzOperation::SubscribeNamespace { prefix: &prefix },
+                    AuthzOperation::Publish {
+                        namespace: &namespace,
+                        track: &track,
+                    },
+                    AuthzOperation::TrackStatus {
+                        namespace: &namespace,
+                        track: &track,
+                    },
+                ] {
+                    let label = operation.label();
+                    authorize(auth.as_ref(), &context, operation, Some(1))
+                        .await
+                        .unwrap_or_else(|reason| {
+                            panic!("internal relay {label} must be authorized: {reason}")
+                        });
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn untagged_session_without_token_on_enforced_scope_is_denied() {
+            let authorizer = ScopeAuthorizer::new(FixedConfig::new(enforced_with_valid_key()));
+            let context = SessionContext::from_tags(
+                Some("tenant".to_string()),
+                &ConnectionTags::default(),
+                None,
+            );
+            let rejection = authorize_session(&authorizer, &context, &KeyValuePairs::default())
+                .await
+                .expect_err("untagged session must present a token on an enforced scope");
+            assert_eq!(rejection.code, SESSION_ERROR_UNAUTHORIZED);
+            assert_eq!(rejection.reason, "unauthorized");
+        }
+
+        #[tokio::test]
+        async fn malformed_setup_tokens_are_rejected_on_both_interfaces() {
+            for config in [enforced_with_valid_key(), ScopeConfig::default()] {
+                let authorizer = ScopeAuthorizer::new(FixedConfig::new(config));
+                for context in [
+                    SessionContext::internal(Some("tenant".to_string()), None),
+                    context(),
+                ] {
+                    // Draft-18 section 10.2.2 requires distinct close codes for a
+                    // malformed structure and a forbidden alias directive in SETUP.
+                    for (value, code, reason) in [
+                        (vec![0x3], 0x6, "malformed authorization token"),
+                        (vec![0x2], 0x3, "token alias not permitted in setup"),
+                    ] {
+                        let rejection =
+                            authorize_session(&authorizer, &context, &setup_with(vec![value]))
+                                .await
+                                .expect_err("invalid Token structure must reject SETUP");
+                        assert_eq!(rejection.code, code);
+                        assert_eq!(rejection.reason, reason);
+                    }
+                }
+            }
         }
 
         /// A scope with no policy behaves exactly as before: admitted, and the
