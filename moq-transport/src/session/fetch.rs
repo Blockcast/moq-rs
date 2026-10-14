@@ -43,8 +43,10 @@ pub struct Fetch {
     id: u64,
     session: web_transport::Session,
     streams: FetchStreams,
-    /// The response half of the request stream; ours is FINed after FETCH.
-    request: Option<Reader>,
+    /// FETCH_OK or REQUEST_ERROR from the request stream (ours is FINed after
+    /// FETCH). Decoded in a task so that losing a `select!` never drops a
+    /// half-read frame; dropping this receiver cancels the request stream.
+    response: Option<oneshot::Receiver<Result<Message, SessionError>>>,
     /// Start Location of an Absolute filter, checked against FETCH_OK.
     start: Option<Location>,
     descending: bool,
@@ -64,14 +66,17 @@ impl Fetch {
             Some(LocationFilter::Absolute { start, .. }) => Some(start),
             _ => None,
         };
+        let descending = msg.params.group_order()? == Some(GroupOrder::Descending);
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(decode_response(request, msg.id, tx));
         Ok(Self {
             id: msg.id,
             session,
             streams,
-            request: Some(request),
+            response: Some(rx),
             start,
             // §10.2.8: an omitted GROUP_ORDER is Ascending.
-            descending: msg.params.group_order()? == Some(GroupOrder::Descending),
+            descending,
             data: Data::Pending(data),
             ok: None,
         })
@@ -88,6 +93,9 @@ impl Fetch {
 
     /// The next Object or End of Range on the data stream, with the Object's
     /// payload (empty for an End of Range). `None` after the stream's FIN.
+    ///
+    /// Not cancel-safe once the data stream is open: drop the `Fetch` instead
+    /// of abandoning a pending call.
     pub async fn next(&mut self) -> Result<Option<(FetchItem, Bytes)>, FetchError> {
         loop {
             match &mut self.data {
@@ -116,10 +124,10 @@ impl Fetch {
                 }
                 Data::Pending(pending) => {
                     // The data stream and the response arrive in either order.
-                    let reader = match &mut self.request {
-                        Some(response) if self.ok.is_none() => tokio::select! {
+                    let reader = match &mut self.response {
+                        Some(response) => tokio::select! {
                             reader = pending => reader,
-                            response = Session::decode_bidi_response(response, self.id) => {
+                            response = response => {
                                 self.recv_response(response)?;
                                 continue;
                             }
@@ -139,16 +147,19 @@ impl Fetch {
     /// Wait for FETCH_OK, which can arrive before or after the Objects.
     pub async fn ok(&mut self) -> Result<&message::FetchOk, FetchError> {
         if self.ok.is_none() {
-            let response = self.request.as_mut().ok_or(SessionError::Internal)?;
-            let response = Session::decode_bidi_response(response, self.id).await;
+            let response = self.response.as_mut().ok_or(SessionError::Internal)?.await;
             self.recv_response(response)?;
         }
         Ok(self.ok.as_ref().expect("set above"))
     }
 
-    fn recv_response(&mut self, response: Result<Message, SessionError>) -> Result<(), FetchError> {
+    fn recv_response(
+        &mut self,
+        response: Result<Result<Message, SessionError>, oneshot::error::RecvError>,
+    ) -> Result<(), FetchError> {
         // FETCH_OK and REQUEST_ERROR are each the last message on the stream.
-        self.request = None;
+        self.response = None;
+        let response = response.map_err(|_| SessionError::Internal)?;
         match violation(&self.session, response)? {
             Message::FetchOk(ok) => {
                 // §10.14: an End Location before the Start Location.
@@ -178,6 +189,24 @@ impl Fetch {
                 )),
             )),
         }
+    }
+}
+
+/// Decode the one response on the request stream, or stop the stream with
+/// CANCELLED once the `Fetch` is dropped (§5.2).
+async fn decode_response(
+    mut request: Reader,
+    id: u64,
+    mut tx: oneshot::Sender<Result<Message, SessionError>>,
+) {
+    let response = tokio::select! {
+        response = Session::decode_bidi_response(&mut request, id) => response,
+        _ = tx.closed() => Err(SessionError::Internal),
+    };
+    if tx.is_closed() {
+        request.stop(CANCELLED);
+    } else {
+        let _ = tx.send(response);
     }
 }
 
@@ -224,9 +253,6 @@ impl Drop for Fetch {
         }
         // §5.2: cancelling MUST send STOP_SENDING on the request stream, and
         // MAY on an open data stream.
-        if let Some(mut response) = self.request.take() {
-            response.stop(CANCELLED);
-        }
         if let Data::Open(reader, _) = &mut self.data {
             reader.stop(CANCELLED);
         }

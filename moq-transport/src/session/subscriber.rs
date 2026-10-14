@@ -590,6 +590,9 @@ impl Subscriber {
             track_name: track_name.into(),
             params,
         };
+        // Reject a malformed filter before anything is sent or registered.
+        msg.params.location_filter()?;
+        msg.params.group_order()?;
         // Registered first: the data stream can beat the stream open.
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.fetches
@@ -4558,6 +4561,74 @@ mod tests {
             .unwrap();
         assert_eq!(stopped, Some(1));
         assert!(subscriber.fetches.lock().unwrap().is_empty());
+    }
+
+    /// FETCH_OK split across reads survives the data stream winning the race
+    /// in `Fetch::next`: no half-read response bytes are lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_fetch_ok_survives_the_data_stream_arriving_first() {
+        use crate::coding::Encode;
+
+        let (session, peer) = loopback_session_pair().await;
+        let mut subscriber = test_subscriber(session.clone());
+        let mut fetch = subscriber
+            .fetch(
+                TrackNamespace::from_utf8_path("live"),
+                "video",
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let (mut send, mut recv) = peer.accept_bi().await.unwrap();
+        while recv.read(usize::MAX).await.unwrap().is_some() {}
+
+        let ok = message::FetchOk {
+            id: fetch.request_id(),
+            end_of_track: true,
+            end_location: crate::coding::Location::new(5, 10),
+            params: KeyValuePairs::default(),
+            track_extensions: Default::default(),
+        };
+        let frame =
+            super::super::Session::encode_bidi_response_frame(&Message::FetchOk(ok.clone()))
+                .unwrap()
+                .freeze();
+        let (head, tail) = frame.split_at(frame.len() / 2);
+        send.write(head).await.unwrap();
+
+        let peer_data = peer.clone();
+        let id = fetch.request_id();
+        let routed = tokio::spawn(async move {
+            // Let `next` park mid-frame on the response before data arrives.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut uni = peer_data.open_uni().await.unwrap();
+            let mut header = bytes::BytesMut::new();
+            data::FetchHeader {
+                header_type: data::StreamHeaderType::Fetch,
+                request_id: id,
+            }
+            .encode(&mut header)
+            .unwrap();
+            uni.write(&header).await.unwrap();
+            uni.finish().unwrap();
+            let stream = session.accept_uni().await.unwrap();
+            subscriber.recv_stream(stream).await.unwrap();
+        });
+
+        let item = tokio::time::timeout(Duration::from_secs(2), fetch.next())
+            .await
+            .expect("FETCH data timed out")
+            .unwrap();
+        assert!(item.is_none(), "empty FETCH stream ends at FIN");
+        routed.await.unwrap();
+
+        send.write(tail).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), fetch.ok())
+            .await
+            .expect("FETCH_OK timed out")
+            .expect("FETCH_OK intact");
+        assert_eq!(got.end_location, ok.end_location);
+        assert!(got.end_of_track);
     }
 
     /// Data for a FETCH this endpoint is not waiting on is stopped; the
