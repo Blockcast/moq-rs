@@ -8,6 +8,7 @@
 //! unified SETUP message. Version negotiation is handled entirely by ALPN.
 
 mod auth_token;
+mod authorization_token;
 mod param_types;
 mod setup;
 mod version;
@@ -15,6 +16,8 @@ mod version;
 pub use auth_token::{
     decode_setup_tokens, AliasType, SetupToken, TokenError, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
 };
+pub(crate) use authorization_token::encode_setup_options;
+pub use authorization_token::AuthorizationToken;
 pub use param_types::*;
 pub use setup::*;
 pub use version::*;

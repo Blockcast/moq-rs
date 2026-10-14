@@ -1666,6 +1666,7 @@ name = "moq-clock-ietf"
 version = "0.6.20"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "moq-native-ietf",

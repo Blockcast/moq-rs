@@ -491,6 +491,17 @@ impl Subscriber {
         Ok((session, subscriber))
     }
 
+    /// Connect while presenting authorization tokens in SETUP.
+    pub async fn connect_with_tokens(
+        session: web_transport::Session,
+        transport: super::Transport,
+        tokens: Vec<crate::setup::AuthorizationToken>,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) =
+            Session::connect_with_tokens(session, None, transport, tokens).await?;
+        Ok((session, subscriber))
+    }
+
     pub(super) fn close_session(&self, code: u32, reason: &str) {
         self.webtransport.close(code, reason);
     }

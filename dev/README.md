@@ -75,3 +75,12 @@ And run the subscriber in a separate terminal:
 ```bash
 ./dev/clock
 ```
+
+To test against a scope that requires CAT bearer-token authorization, pass one or more tokens with the `--auth-token` flag:
+
+```bash
+./dev/clock --publish --auth-token 1:BASE64URL_ENCODED_TOKEN
+./dev/clock --auth-token 1:BASE64URL_ENCODED_TOKEN
+```
+
+The format is `TYPE:VALUE`. `TYPE` is the token type as a decimal or `0x`-prefixed integer (1 is a Common Access Token), and `VALUE` is URL-safe base64, padded or not. Each token is sent in SETUP as its own AUTHORIZATION TOKEN option (draft-18 §10.3.1.4) with alias type USE_VALUE. The flag may be repeated. **This flag is for testing only**: the token value is visible in process arguments on the host. See `moq-relay-ietf/README.md` for configuring a relay to require tokens.
