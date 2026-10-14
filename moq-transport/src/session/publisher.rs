@@ -939,6 +939,17 @@ impl Publisher {
         msg: message::SubscribeTracks,
     ) -> Result<SubscribedTracksRecv, SessionError> {
         let forward = msg.params.forward()?.unwrap_or(true);
+        if msg
+            .params
+            .range_filters(message::LOCAL_MAX_FILTER_RANGES)
+            .is_err()
+        {
+            return Ok(SubscribedTracksRecv::rejected(
+                msg.id,
+                RequestErrorCode::InvalidFilter as u64,
+                "invalid filter",
+            ));
+        }
         {
             let mut prefixes = self
                 .subscribed_tracks_prefixes
@@ -1077,6 +1088,19 @@ impl Publisher {
         );
     }
 
+    /// Send REQUEST_ERROR INVALID_FILTER (draft-20 §5.1.4).
+    fn send_invalid_filter(&mut self, request_id: u64, request_kind: &str) {
+        self.send_request_error(
+            request_kind,
+            message::RequestError {
+                id: request_id,
+                error_code: RequestErrorCode::InvalidFilter as u64,
+                retry_interval: 0,
+                reason: crate::coding::ReasonPhrase("invalid filter".to_string()),
+            },
+        );
+    }
+
     /// Handle REQUEST_OK from a subscriber, accepting one of our requests
     /// (draft-18 §10.5).
     ///
@@ -1200,6 +1224,7 @@ impl Publisher {
 
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
+        let request_id = msg.id;
 
         let subscribed = {
             let mut subscribeds = self
@@ -1214,10 +1239,21 @@ impl Publisher {
                 return Err(SessionError::InvalidRequestId);
             }
 
-            let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
-            subscribeds.insert(send.info.id, recv);
-
-            send
+            if msg
+                .params
+                .range_filters(message::LOCAL_MAX_FILTER_RANGES)
+                .is_err()
+            {
+                None
+            } else {
+                let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
+                subscribeds.insert(send.info.id, recv);
+                Some(send)
+            }
+        };
+        let Some(subscribed) = subscribed else {
+            self.send_invalid_filter(request_id, "subscribe");
+            return Ok(());
         };
 
         // Route to an active PUBLISH_NAMESPACE if present.
@@ -1478,6 +1514,76 @@ mod tests {
             }),
             Err(SessionError::InvalidRequestId)
         ));
+    }
+
+    fn subgroup_filter_params() -> KeyValuePairs {
+        let mut params = KeyValuePairs::default();
+        params
+            .push_range_filter(
+                message::parameter_type::SUBGROUP_FILTER,
+                Some(&message::RangeFilter {
+                    set_id: 0,
+                    property_type: None,
+                    ranges: vec![(0, Some(1))],
+                }),
+            )
+            .unwrap();
+        params
+    }
+
+    fn is_invalid_filter(msg: Option<Message>, id: u64) -> bool {
+        matches!(
+            msg,
+            Some(Message::RequestError(err))
+                if err.id == id
+                    && err.error_code == message::RequestErrorCode::InvalidFilter as u64
+        )
+    }
+
+    /// This endpoint grants MAX_FILTER_RANGES 0, so a peer may send no Range
+    /// Filter; one that does gets REQUEST_ERROR INVALID_FILTER (draft-20
+    /// §10.3.1.6), not a subscription that silently ignores the filter.
+    #[tokio::test]
+    async fn range_filters_beyond_the_granted_limit_are_invalid_filter() {
+        let (publisher_session, _peer_session) = loopback_session_pair().await;
+        let (outgoing, mut outgoing_recv) = Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let full_name = full_track_name("room/123", "video");
+
+        publisher
+            .recv_subscribe(message::Subscribe {
+                id: 0,
+                track_namespace: full_name.namespace.clone(),
+                track_name: full_name.name.clone(),
+                params: subgroup_filter_params(),
+            })
+            .unwrap();
+        assert!(publisher.subscribeds.lock().unwrap().is_empty());
+        let reply = futures::FutureExt::now_or_never(outgoing_recv.pop()).flatten();
+        assert!(is_invalid_filter(reply, 0));
+
+        let mut tracks = publisher
+            .recv_subscribe_tracks(message::SubscribeTracks {
+                id: 2,
+                track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("room"),
+                params: subgroup_filter_params(),
+            })
+            .unwrap();
+        assert!(is_invalid_filter(tracks.try_take_message(), 2));
+        // A rejected request reserves no prefix and reaches no application.
+        assert!(publisher
+            .subscribed_tracks_prefixes
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(futures::FutureExt::now_or_never(publisher.subscribed_tracks()).is_none());
     }
 
     fn subgroup_track() -> (serve::SubgroupsWriter, serve::TrackReader) {

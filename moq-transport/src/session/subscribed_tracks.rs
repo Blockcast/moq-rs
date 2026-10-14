@@ -207,6 +207,14 @@ pub(super) struct SubscribedTracksRecv {
 }
 
 impl SubscribedTracksRecv {
+    #[cfg(test)]
+    pub(super) fn try_take_message(&mut self) -> Option<Message> {
+        match self.outgoing.try_recv().ok()? {
+            SubscribedTracksOutput::Message(msg) => Some(msg),
+            SubscribedTracksOutput::Reset(_) => None,
+        }
+    }
+
     pub(super) fn rejected(request_id: u64, error_code: u64, reason: &str) -> Self {
         let (outgoing, incoming) = tokio::sync::mpsc::channel(1);
         let _ = outgoing.try_send(SubscribedTracksOutput::Message(request_error(

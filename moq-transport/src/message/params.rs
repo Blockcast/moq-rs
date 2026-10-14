@@ -50,14 +50,168 @@ pub const U8_VALUE_PARAMETER_TYPES: &[u64] = &[
     parameter_type::FORWARD,             // 0x10
     parameter_type::SUBSCRIBER_PRIORITY, // 0x20
     parameter_type::GROUP_ORDER,         // 0x22
+    parameter_type::INCLUDE_PROPERTIES,  // 0x35
 ];
 
 const TWO_VARINT_VALUE_PARAMETER_TYPES: &[u64] = &[parameter_type::LARGEST_OBJECT];
 
+/// Even-typed parameters that are length-prefixed anyway (draft-20 §5.1.4).
+/// Every Range Filter carries a Length, so reading these two as varints would
+/// desynchronise the rest of the block.
+const BYTES_VALUE_PARAMETER_TYPES: &[u64] = &[
+    parameter_type::OBJECTID_FILTER,
+    parameter_type::OBJECT_PROPERTY_FILTER,
+];
+
+/// The five Range Filter parameter types (draft-20 §5.1.4).
+pub const RANGE_FILTER_TYPES: &[u64] = &[
+    parameter_type::SUBGROUP_FILTER,
+    parameter_type::OBJECTID_FILTER,
+    parameter_type::PRIORITY_FILTER,
+    parameter_type::OBJECT_PROPERTY_FILTER,
+    parameter_type::TRACK_PROPERTY_FILTER,
+];
+
+/// The MAX_FILTER_RANGES this endpoint grants its peer. Nothing evaluates Range
+/// Filters yet, so this endpoint does not send the option, and the default of 0
+/// obliges the peer not to send any (draft-20 §10.3.1.6).
+pub const LOCAL_MAX_FILTER_RANGES: u64 = 0;
+
+const OBJECT_FILTER_MESSAGES: &[u64] = &[
+    wire_id::Subscribe,
+    wire_id::Fetch,
+    wire_id::SubscribeTracks,
+    wire_id::RequestUpdate,
+];
+
 /// Message scopes enforced for supported parameters with restricted use.
 /// Unknown parameter types remain available for negotiated extensions.
-const MESSAGE_PARAMETER_SCOPES: &[(u64, &[u64])] =
-    &[(parameter_type::RENDEZVOUS_TIMEOUT, &[wire_id::Subscribe])];
+const MESSAGE_PARAMETER_SCOPES: &[(u64, &[u64])] = &[
+    (parameter_type::RENDEZVOUS_TIMEOUT, &[wire_id::Subscribe]),
+    (parameter_type::SUBGROUP_FILTER, OBJECT_FILTER_MESSAGES),
+    (parameter_type::OBJECTID_FILTER, OBJECT_FILTER_MESSAGES),
+    (parameter_type::PRIORITY_FILTER, OBJECT_FILTER_MESSAGES),
+    (
+        parameter_type::OBJECT_PROPERTY_FILTER,
+        OBJECT_FILTER_MESSAGES,
+    ),
+    (
+        parameter_type::TRACK_PROPERTY_FILTER,
+        &[wire_id::SubscribeTracks, wire_id::RequestUpdate],
+    ),
+    (
+        parameter_type::INCLUDE_PROPERTIES,
+        &[
+            wire_id::Subscribe,
+            wire_id::TrackStatus,
+            wire_id::Fetch,
+            wire_id::SubscribeTracks,
+        ],
+    ),
+];
+
+/// One Range Filter parameter value (draft-20 §5.1.4). A zero Length means "no
+/// filter" and decodes to `None` rather than to a value of this type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeFilter {
+    pub set_id: u8,
+    /// The even Property Type of OBJECT_/TRACK_PROPERTY_FILTER; `None` for the
+    /// other three types, which carry no such field.
+    pub property_type: Option<u64>,
+    /// Inclusive, absolute `(start, end)` pairs, OR'd. Only the last may have
+    /// `end == None`, meaning open-ended.
+    pub ranges: Vec<(u64, Option<u64>)>,
+}
+
+impl RangeFilter {
+    fn has_property_type(filter_type: u64) -> bool {
+        matches!(
+            filter_type,
+            parameter_type::OBJECT_PROPERTY_FILTER | parameter_type::TRACK_PROPERTY_FILTER
+        )
+    }
+
+    /// Decode the value of Range Filter parameter `filter_type`. Every error is
+    /// an INVALID_FILTER: the Length already bounds the value, so a malformed
+    /// filter does not desynchronise the parameter block.
+    pub fn decode_value(filter_type: u64, value: &[u8]) -> Result<Option<Self>, DecodeError> {
+        let mut r = bytes::Bytes::copy_from_slice(value);
+        if !r.has_remaining() {
+            return Ok(None);
+        }
+        let set_id = u8::decode(&mut r)?;
+        let property_type = if Self::has_property_type(filter_type) {
+            let property_type = u64::decode(&mut r)?;
+            // §10.2.13-14: only even (integer-valued) Properties can be ranged.
+            if property_type % 2 != 0 {
+                return Err(DecodeError::InvalidFilterType);
+            }
+            Some(property_type)
+        } else {
+            None
+        };
+
+        let mut ranges = Vec::new();
+        let mut prev_end = 0u64;
+        while r.has_remaining() {
+            // Start is a delta from the prior End (or 0); End from its own Start.
+            let start = prev_end
+                .checked_add(u64::decode(&mut r)?)
+                .ok_or(DecodeError::InvalidFilterType)?;
+            let end = if r.has_remaining() {
+                let end = start
+                    .checked_add(u64::decode(&mut r)?)
+                    .ok_or(DecodeError::InvalidFilterType)?;
+                prev_end = end;
+                Some(end)
+            } else {
+                None
+            };
+            // §10.2.12: Publisher Priority is 8 bits.
+            if filter_type == parameter_type::PRIORITY_FILTER
+                && end.unwrap_or(start) > u8::MAX.into()
+            {
+                return Err(DecodeError::InvalidFilterType);
+            }
+            ranges.push((start, end));
+        }
+
+        Ok(Some(Self {
+            set_id,
+            property_type,
+            ranges,
+        }))
+    }
+
+    pub fn encode_value(&self, filter_type: u64) -> Result<Vec<u8>, EncodeError> {
+        if self.property_type.is_some() != Self::has_property_type(filter_type) {
+            return Err(EncodeError::InvalidValue);
+        }
+        let mut w = Vec::new();
+        self.set_id.encode(&mut w)?;
+        if let Some(property_type) = self.property_type {
+            property_type.encode(&mut w)?;
+        }
+        let mut prev_end = 0u64;
+        for (i, &(start, end)) in self.ranges.iter().enumerate() {
+            start
+                .checked_sub(prev_end)
+                .ok_or(EncodeError::InvalidValue)?
+                .encode(&mut w)?;
+            match end {
+                Some(end) => {
+                    end.checked_sub(start)
+                        .ok_or(EncodeError::InvalidValue)?
+                        .encode(&mut w)?;
+                    prev_end = end;
+                }
+                None if i + 1 == self.ranges.len() => {}
+                None => return Err(EncodeError::InvalidValue),
+            }
+        }
+        Ok(w)
+    }
+}
 
 /// Draft-16 extension-header type IDs.
 pub mod extension_type {
@@ -344,6 +498,7 @@ impl KeyValuePairs {
             r,
             U8_VALUE_PARAMETER_TYPES,
             TWO_VARINT_VALUE_PARAMETER_TYPES,
+            BYTES_VALUE_PARAMETER_TYPES,
         )
     }
 
@@ -354,24 +509,104 @@ impl KeyValuePairs {
             w,
             U8_VALUE_PARAMETER_TYPES,
             TWO_VARINT_VALUE_PARAMETER_TYPES,
+            BYTES_VALUE_PARAMETER_TYPES,
         )
     }
 
+    /// Whether every parameter may appear on `message_type`, and every value
+    /// whose range violation is a PROTOCOL_VIOLATION is in range.
     pub(crate) fn parameters_allowed_on(&self, message_type: u64) -> bool {
-        if message_type == wire_id::SubscribeTracks {
-            return self.0.iter().all(|parameter| {
+        let scoped = if message_type == wire_id::SubscribeTracks {
+            self.0.iter().all(|parameter| {
                 matches!(
                     parameter.key,
-                    parameter_type::AUTHORIZATION_TOKEN | parameter_type::FORWARD
-                )
-            });
+                    parameter_type::AUTHORIZATION_TOKEN
+                        | parameter_type::FORWARD
+                        | parameter_type::INCLUDE_PROPERTIES
+                ) || RANGE_FILTER_TYPES.contains(&parameter.key)
+            })
+        } else {
+            self.0.iter().all(|parameter| {
+                MESSAGE_PARAMETER_SCOPES
+                    .iter()
+                    .find(|(parameter_type, _)| *parameter_type == parameter.key)
+                    .is_none_or(|(_, message_types)| message_types.contains(&message_type))
+            })
+        };
+        scoped && self.include_properties().is_ok()
+    }
+
+    /// INCLUDE_PROPERTIES (draft-20 §10.2.21). A value other than 0 or 1 closes
+    /// the session with PROTOCOL_VIOLATION.
+    pub fn include_properties(&self) -> Result<Option<bool>, DecodeError> {
+        match self.int_parameter(parameter_type::INCLUDE_PROPERTIES)? {
+            Some(0) => Ok(Some(false)),
+            Some(1) => Ok(Some(true)),
+            Some(_) => Err(DecodeError::InvalidParameter),
+            None => Ok(None),
         }
-        self.0.iter().all(|parameter| {
-            MESSAGE_PARAMETER_SCOPES
-                .iter()
-                .find(|(parameter_type, _)| *parameter_type == parameter.key)
-                .is_none_or(|(_, message_types)| message_types.contains(&message_type))
-        })
+    }
+
+    pub fn set_include_properties(&mut self, include: bool) {
+        self.set_intvalue(parameter_type::INCLUDE_PROPERTIES, include.into());
+    }
+
+    /// Append one Range Filter parameter; `None` encodes the zero-Length form.
+    /// Filters may repeat, so this never replaces an existing one.
+    pub fn push_range_filter(
+        &mut self,
+        filter_type: u64,
+        filter: Option<&RangeFilter>,
+    ) -> Result<(), EncodeError> {
+        if !RANGE_FILTER_TYPES.contains(&filter_type) {
+            return Err(EncodeError::InvalidValue);
+        }
+        let value = match filter {
+            Some(filter) => filter.encode_value(filter_type)?,
+            None => Vec::new(),
+        };
+        self.0.push(KeyValuePair::new_bytes(filter_type, value));
+        Ok(())
+    }
+
+    /// Every Range Filter in the block as `(type, filter)`, in wire order.
+    ///
+    /// An error means REQUEST_ERROR with INVALID_FILTER (draft-20 §5.1.4): a
+    /// malformed value, a repeated (Type, SetID, Property Type), or more
+    /// Ranges than `max_ranges`, the MAX_FILTER_RANGES this endpoint granted.
+    /// With `max_ranges == 0` the peer may send no filter parameter at all.
+    pub fn range_filters(
+        &self,
+        max_ranges: u64,
+    ) -> Result<Vec<(u64, Option<RangeFilter>)>, DecodeError> {
+        let mut filters = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut total_ranges = 0u64;
+        for parameter in self
+            .0
+            .iter()
+            .filter(|parameter| RANGE_FILTER_TYPES.contains(&parameter.key))
+        {
+            if max_ranges == 0 {
+                return Err(DecodeError::InvalidFilterType);
+            }
+            let Value::BytesValue(value) = &parameter.value else {
+                return Err(DecodeError::InvalidFilterType);
+            };
+            let filter = RangeFilter::decode_value(parameter.key, value)
+                .map_err(|_| DecodeError::InvalidFilterType)?;
+            if let Some(filter) = &filter {
+                if !seen.insert((parameter.key, filter.set_id, filter.property_type)) {
+                    return Err(DecodeError::InvalidFilterType);
+                }
+                total_ranges += filter.ranges.len() as u64;
+                if total_ranges > max_ranges {
+                    return Err(DecodeError::InvalidFilterType);
+                }
+            }
+            filters.push((parameter.key, filter));
+        }
+        Ok(filters)
     }
 
     fn int_parameter(&self, key: u64) -> Result<Option<u64>, DecodeError> {
@@ -619,6 +854,255 @@ mod tests {
         let mut params = KeyValuePairs::default();
         params.set_intvalue(parameter_type::LOCATION_FILTER, 1);
         assert!(params.location_filter().is_err());
+    }
+
+    fn range(set_id: u8, property_type: Option<u64>, ranges: &[(u64, Option<u64>)]) -> RangeFilter {
+        RangeFilter {
+            set_id,
+            property_type,
+            ranges: ranges.to_vec(),
+        }
+    }
+
+    /// Golden vectors for Range Filter values (draft-20 §5.1.4), including the
+    /// spec's own example: ranges 3-5 and 10-15 encode as 3, 2, 5, 5.
+    #[test]
+    fn range_filter_golden_vectors() {
+        use parameter_type::*;
+        let cases: &[(u64, &[u8], RangeFilter)] = &[
+            (
+                SUBGROUP_FILTER,
+                &[0x00, 0x03, 0x02, 0x05, 0x05],
+                range(0, None, &[(3, Some(5)), (10, Some(15))]),
+            ),
+            // An omitted End leaves the last Range open-ended.
+            (OBJECTID_FILTER, &[0x07, 0x04], range(7, None, &[(4, None)])),
+            (
+                PRIORITY_FILTER,
+                &[0x01, 0x40, 0x3f],
+                range(1, None, &[(64, Some(127))]),
+            ),
+            // Property Type follows SetID.
+            (
+                OBJECT_PROPERTY_FILTER,
+                &[0x02, 0x08, 0x01, 0x00],
+                range(2, Some(8), &[(1, Some(1))]),
+            ),
+            (
+                TRACK_PROPERTY_FILTER,
+                &[0xff, 0x0a, 0x00, 0x0a, 0x05],
+                range(255, Some(10), &[(0, Some(10)), (15, None)]),
+            ),
+        ];
+        for (filter_type, bytes, filter) in cases {
+            assert_eq!(
+                RangeFilter::decode_value(*filter_type, bytes).unwrap(),
+                Some(filter.clone()),
+                "decode {filter_type:#x} {bytes:02x?}"
+            );
+            assert_eq!(
+                filter.encode_value(*filter_type).unwrap(),
+                bytes.to_vec(),
+                "encode {filter_type:#x} {filter:?}"
+            );
+        }
+        // Length 0 is no filter.
+        assert_eq!(
+            RangeFilter::decode_value(SUBGROUP_FILTER, &[]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn range_filter_rejects_malformed_values() {
+        use parameter_type::*;
+        let vi = |v: u64| {
+            let mut w = Vec::new();
+            v.encode(&mut w).unwrap();
+            w
+        };
+        let max = vi(u64::MAX);
+        let cases: &[(u64, Vec<u8>)] = &[
+            // Start + End delta overflows 2^64 - 1.
+            (
+                SUBGROUP_FILTER,
+                [vec![0x00], max.clone(), vec![0x01]].concat(),
+            ),
+            // The next Start delta overflows from the prior End.
+            (
+                OBJECTID_FILTER,
+                [vec![0x00], max.clone(), vec![0x00, 0x01]].concat(),
+            ),
+            // Publisher Priority is 8 bits: a Start, or an End, of 256.
+            (PRIORITY_FILTER, [vec![0x00], vi(256)].concat()),
+            (PRIORITY_FILTER, [vec![0x00, 0x00], vi(256)].concat()),
+            // Property Type must be even.
+            (OBJECT_PROPERTY_FILTER, vec![0x00, 0x09, 0x01]),
+            (TRACK_PROPERTY_FILTER, vec![0x00, 0x0b]),
+            // A truncated vi64 inside the Length.
+            (SUBGROUP_FILTER, vec![0x00, 0x80]),
+        ];
+        for (filter_type, bytes) in cases {
+            assert!(
+                RangeFilter::decode_value(*filter_type, bytes).is_err(),
+                "{filter_type:#x} {bytes:02x?} must be INVALID_FILTER"
+            );
+        }
+        // An open-ended Range anywhere but last is not encodable.
+        assert!(range(0, None, &[(1, None), (5, Some(6))])
+            .encode_value(SUBGROUP_FILTER)
+            .is_err());
+        // Property Type present exactly on the property filters.
+        assert!(range(0, Some(2), &[])
+            .encode_value(SUBGROUP_FILTER)
+            .is_err());
+        assert!(range(0, None, &[])
+            .encode_value(TRACK_PROPERTY_FILTER)
+            .is_err());
+    }
+
+    /// 0x26 and 0x28 are even but length-prefixed. Read as varints, the
+    /// OBJECTID_FILTER below would consume its Length as the value and parse the
+    /// SetID as the next parameter's Type Delta.
+    #[test]
+    fn even_range_filters_are_length_prefixed_in_the_block() {
+        let mut params = KeyValuePairs::default();
+        params
+            .push_range_filter(
+                parameter_type::OBJECTID_FILTER,
+                Some(&range(3, None, &[(4, Some(6))])),
+            )
+            .unwrap();
+        params.set_include_properties(false);
+        let mut buf = BytesMut::new();
+        params.encode_message_params(&mut buf).unwrap();
+        // count 2; 0x26 len 3 [03 04 02]; delta 0x0f -> 0x35, uint8 0.
+        assert_eq!(
+            buf.to_vec(),
+            vec![0x02, 0x26, 0x03, 0x03, 0x04, 0x02, 0x0f, 0x00]
+        );
+
+        let decoded = KeyValuePairs::decode_message_params(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded.include_properties().unwrap(), Some(false));
+        assert_eq!(
+            decoded.range_filters(16).unwrap(),
+            vec![(
+                parameter_type::OBJECTID_FILTER,
+                Some(range(3, None, &[(4, Some(6))]))
+            )]
+        );
+    }
+
+    #[test]
+    fn range_filters_enforce_limit_and_uniqueness() {
+        use parameter_type::*;
+        let mut params = KeyValuePairs::default();
+        params
+            .push_range_filter(SUBGROUP_FILTER, Some(&range(0, None, &[(1, Some(2))])))
+            .unwrap();
+        params
+            .push_range_filter(
+                SUBGROUP_FILTER,
+                Some(&range(1, None, &[(3, Some(4)), (9, None)])),
+            )
+            .unwrap();
+        // Same type, distinct SetIDs: allowed, three Ranges in total.
+        assert_eq!(params.range_filters(3).unwrap().len(), 2);
+        // MAX_FILTER_RANGES exceeded.
+        assert!(params.range_filters(2).is_err());
+        // Not granted at all: no filter parameter may be sent.
+        assert!(params.range_filters(0).is_err());
+        let mut empty = KeyValuePairs::default();
+        empty.push_range_filter(SUBGROUP_FILTER, None).unwrap();
+        assert!(empty.range_filters(0).is_err());
+        assert_eq!(
+            empty.range_filters(1).unwrap(),
+            vec![(SUBGROUP_FILTER, None)]
+        );
+
+        // A repeated (Type, SetID) is INVALID_FILTER.
+        params
+            .push_range_filter(SUBGROUP_FILTER, Some(&range(1, None, &[(7, Some(7))])))
+            .unwrap();
+        assert!(params.range_filters(16).is_err());
+
+        // For property filters the Property Type is part of the key.
+        let mut props = KeyValuePairs::default();
+        for property_type in [2, 4] {
+            props
+                .push_range_filter(
+                    OBJECT_PROPERTY_FILTER,
+                    Some(&range(0, Some(property_type), &[(1, None)])),
+                )
+                .unwrap();
+        }
+        assert_eq!(props.range_filters(16).unwrap().len(), 2);
+        props
+            .push_range_filter(
+                OBJECT_PROPERTY_FILTER,
+                Some(&range(0, Some(4), &[(5, None)])),
+            )
+            .unwrap();
+        assert!(props.range_filters(16).is_err());
+    }
+
+    #[test]
+    fn include_properties_outside_zero_or_one_is_a_protocol_violation() {
+        let mut params = KeyValuePairs::default();
+        params.set_include_properties(true);
+        assert_eq!(params.include_properties().unwrap(), Some(true));
+        assert!(params.parameters_allowed_on(wire_id::Subscribe));
+
+        params.set_intvalue(parameter_type::INCLUDE_PROPERTIES, 2);
+        assert!(params.include_properties().is_err());
+        assert!(!params.parameters_allowed_on(wire_id::Subscribe));
+    }
+
+    #[test]
+    fn filter_and_include_properties_scopes() {
+        use parameter_type::*;
+        let only = |key: u64| {
+            let mut params = KeyValuePairs::default();
+            if key == INCLUDE_PROPERTIES {
+                params.set_include_properties(true);
+            } else {
+                params.push_range_filter(key, None).unwrap();
+            }
+            params
+        };
+        for key in [
+            SUBGROUP_FILTER,
+            OBJECTID_FILTER,
+            PRIORITY_FILTER,
+            OBJECT_PROPERTY_FILTER,
+        ] {
+            for message in [
+                wire_id::Subscribe,
+                wire_id::Fetch,
+                wire_id::SubscribeTracks,
+                wire_id::RequestUpdate,
+            ] {
+                assert!(
+                    only(key).parameters_allowed_on(message),
+                    "{key:#x} on {message:#x}"
+                );
+            }
+            assert!(!only(key).parameters_allowed_on(wire_id::Publish));
+        }
+        // TRACK_PROPERTY_FILTER filters PUBLISHes, so only SUBSCRIBE_TRACKS (and
+        // its REQUEST_UPDATE) carries it.
+        assert!(only(TRACK_PROPERTY_FILTER).parameters_allowed_on(wire_id::SubscribeTracks));
+        assert!(only(TRACK_PROPERTY_FILTER).parameters_allowed_on(wire_id::RequestUpdate));
+        assert!(!only(TRACK_PROPERTY_FILTER).parameters_allowed_on(wire_id::Subscribe));
+        for message in [
+            wire_id::Subscribe,
+            wire_id::TrackStatus,
+            wire_id::Fetch,
+            wire_id::SubscribeTracks,
+        ] {
+            assert!(only(INCLUDE_PROPERTIES).parameters_allowed_on(message));
+        }
+        assert!(!only(INCLUDE_PROPERTIES).parameters_allowed_on(wire_id::Publish));
     }
 
     #[test]
