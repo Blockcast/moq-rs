@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
+mod fetched;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -21,6 +22,7 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
+pub use fetched::*;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
@@ -1282,9 +1284,13 @@ impl Session {
                                     // One-shot requests (TRACK_STATUS, REQUEST_UPDATE) get
                                     // exactly one reply, so REQUEST_OK ends them just as
                                     // REQUEST_ERROR does.
+                                    // FETCH_OK follows the FIN of the fetch data
+                                    // stream, so nothing else is sent after it.
                                     let is_terminal = matches!(
                                         response.message,
-                                        Message::RequestError(_) | Message::PublishDone(_)
+                                        Message::RequestError(_)
+                                            | Message::PublishDone(_)
+                                            | Message::FetchOk(_)
                                     ) || (bounded_response
                                         && matches!(response.message, Message::RequestOk(_)));
                                     if let Err(err) = Self::encode_bidi_response(

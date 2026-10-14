@@ -11,7 +11,7 @@ use moq_transport::{
     message::RequestErrorCode,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{
-        Publisher, ServeWithDeadlineError, SessionError, Subscribed, SubscribedNamespace,
+        Fetched, Publisher, ServeWithDeadlineError, SessionError, Subscribed, SubscribedNamespace,
         SubscribedTracks, TrackStatusRequested,
     },
 };
@@ -362,6 +362,7 @@ impl Producer {
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
+            let mut publisher_fetched = self.publisher.clone();
             let mut publisher_subscribed_namespace = self.publisher.clone();
             let mut publisher_subscribed_tracks = self.publisher.clone();
 
@@ -403,6 +404,17 @@ impl Producer {
                         // Serve the track_status request
                         if let Err(err) = this.serve_track_status(track_status_requested).await {
                             tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving track_status: {:?}, error: {}", info, err)
+                        }
+                    }.boxed())
+                },
+                Some(fetched) = publisher_fetched.fetched() => {
+                    let this = self.clone();
+                    tasks.push(async move {
+                        let namespace = fetched.msg.track_namespace.to_utf8_path();
+                        let track_name = fetched.msg.track_name.clone();
+                        tracing::info!(namespace = %namespace, track = %track_name, "serving fetch");
+                        if let Err(err) = this.serve_fetch(fetched).await {
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving fetch");
                         }
                     }.boxed())
                 },
@@ -1639,6 +1651,40 @@ impl Producer {
     /// more, rather than a failure worth warning about.
     fn is_expected_serve_shutdown_err(err: &ServeError) -> bool {
         matches!(err, ServeError::Cancel | ServeError::Done)
+    }
+
+    /// Serve a FETCH from the Objects a local track holds.
+    async fn serve_fetch(self, mut fetched: Fetched) -> Result<(), anyhow::Error> {
+        let full_name = FullTrackName {
+            namespace: fetched.msg.track_namespace.clone(),
+            name: fetched.msg.track_name.clone(),
+        };
+
+        // Authorize before the lookup, as for TRACK_STATUS: an answer would
+        // reveal whether the track exists.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::Fetch {
+                namespace: &full_name.namespace,
+                track: &full_name.name,
+            },
+            Some(fetched.msg.id),
+        )
+        .await
+        {
+            fetched.respond_error(reason.request_error_code(), "unauthorized");
+            return Err(anyhow::anyhow!("unauthorized fetch"));
+        }
+
+        // ponytail: local tracks only; an upstream FETCH for a remote track
+        // is a later step, so such a track reads as not found here.
+        if let Some(track) = self.locals.retrieve_track(self.context.scope(), &full_name) {
+            return Ok(fetched.serve(track).await?);
+        }
+
+        fetched.respond_error(RequestErrorCode::DoesNotExist as u64, "track not found");
+        Ok(())
     }
 
     /// Serve a track_status request.
@@ -2954,6 +3000,11 @@ mod tests {
                 AuthzOperation::SubscribeNamespace { prefix } => {
                     format!("subscribe_namespace {}", prefix.to_utf8_path())
                 }
+                AuthzOperation::Fetch { namespace, track } => format!(
+                    "fetch {} {}",
+                    namespace.to_utf8_path(),
+                    track.to_string_lossy()
+                ),
                 other => format!("other {}", other.label()),
             };
             let decision = (self.decide)(&detail);
@@ -3281,6 +3332,118 @@ mod tests {
             RequestErrorCode::Unauthorized as u64
         );
         assert_eq!(hook.seen(), vec!["track_status /status live"]);
+    }
+
+    fn fetch(id: u64, namespace: &TrackNamespace, name: &str) -> Message {
+        Message::Fetch(moq_transport::message::Fetch {
+            id,
+            track_namespace: namespace.clone(),
+            track_name: TrackName::from(name),
+            params: KeyValuePairs::default(),
+        })
+    }
+
+    /// FETCH is gated as Fetch(7), before the lookup, so a denial does not
+    /// reveal whether the track exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denied_fetch_is_unauthorized_even_for_a_live_track() {
+        let namespace = TrackNamespace::from_utf8_path("fetch");
+        let (_writer, reader) = Track::new(namespace.clone(), "live").produce();
+        let mut locals = Locals::new();
+        let _registration = locals.register_track(None, reader).await.expect("register");
+        let hook = RecordingHook::new(|_| deny());
+        let (transport, _subscriber) = spawn_authorized_session(
+            locals,
+            Arc::new(CountingCoordinator::default()),
+            hook.clone(),
+        )
+        .await;
+
+        let (message_type, payload) = send_request(&transport, fetch(0, &namespace, "live")).await;
+        assert_eq!(message_type, wire_id::RequestError);
+        assert_eq!(
+            response_error_code(payload),
+            RequestErrorCode::Unauthorized as u64
+        );
+        assert_eq!(hook.seen(), vec!["fetch /fetch live"]);
+    }
+
+    /// The relay answers FETCH from a local track it holds Objects for, with
+    /// FETCH_OK ending at Largest Object; an unknown track does not exist, and
+    /// a track with no Objects yet is an invalid range.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_is_served_from_a_local_track() {
+        use moq_transport::{coding::Location, serve::Subgroup};
+
+        let namespace = TrackNamespace::from_utf8_path("fetch");
+        let (writer, reader) = Track::new(namespace.clone(), "live").produce();
+        let (_empty_writer, empty) = Track::new(namespace.clone(), "empty").produce();
+        let mut locals = Locals::new();
+        let _live = locals.register_track(None, reader).await.expect("register");
+        let _empty = locals.register_track(None, empty).await.expect("register");
+        let mut subgroups = writer.subgroups().expect("subgroups");
+        let mut group = subgroups
+            .create(Subgroup {
+                group_id: 2,
+                subgroup_id: 0,
+                priority: 1,
+            })
+            .expect("subgroup");
+        group
+            .write(bytes::Bytes::from_static(b"x"))
+            .expect("object");
+        group
+            .write(bytes::Bytes::from_static(b"y"))
+            .expect("object");
+        let (transport, _subscriber) = spawn_authorized_session(
+            locals,
+            Arc::new(CountingCoordinator::default()),
+            RecordingHook::new(|_| allow()),
+        )
+        .await;
+
+        // FETCH_OK is the last message on the request stream, so it ends in
+        // a FIN and frees the request slot.
+        let (mut send, mut recv) = transport.open_bi().await.expect("open stream");
+        let mut frame = Vec::new();
+        fetch(0, &namespace, "live")
+            .encode(&mut frame)
+            .expect("encode FETCH");
+        send.write(&frame).await.expect("write FETCH");
+        let mut buffer = Vec::new();
+        let (message_type, payload) = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_bidi_response_frame(&mut recv, &mut buffer),
+        )
+        .await
+        .expect("FETCH_OK timed out");
+        assert_eq!(message_type, wire_id::FetchOk);
+        let mut rest = Vec::new();
+        let fin = tokio::time::timeout(Duration::from_secs(2), recv.read_buf(&mut rest))
+            .await
+            .expect("FIN timed out")
+            .expect("read after FETCH_OK");
+        assert!(
+            fin.is_none() && rest.is_empty(),
+            "nothing may follow FETCH_OK"
+        );
+        let mut payload = Cursor::new(payload);
+        assert!(!bool::decode(&mut payload).expect("End Of Track"));
+        assert_eq!(
+            Location::decode(&mut payload).expect("End Location"),
+            Location::new(2, 1)
+        );
+
+        for (id, name, code) in [
+            (2, "missing", RequestErrorCode::DoesNotExist),
+            (4, "empty", RequestErrorCode::InvalidRange),
+        ] {
+            let (message_type, payload) =
+                send_request(&transport, fetch(id, &namespace, name)).await;
+            assert_eq!(message_type, wire_id::RequestError, "{name}");
+            assert_eq!(response_error_code(payload), code as u64, "{name}");
+        }
+        drop(group);
     }
 
     /// SUBSCRIBE_TRACKS is gated as SubscribeNamespace(3) on its prefix, and a

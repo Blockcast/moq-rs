@@ -19,11 +19,11 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, ObjectForwarderRecv,
-    PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, Reader,
-    RequestId, Session, SessionError, Subscribed, SubscribedNamespace, SubscribedNamespaceInfo,
-    SubscribedNamespaceRecv, SubscribedTracks, SubscribedTracksInfo, SubscribedTracksRecv,
-    TrackStatusRequested, Writer,
+    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, Fetched,
+    ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
+    PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed, SubscribedNamespace,
+    SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks, SubscribedTracksInfo,
+    SubscribedTracksRecv, TrackStatusRequested, Writer,
 };
 use crate::message::RequestErrorCode;
 
@@ -104,6 +104,7 @@ pub struct Publisher {
 
     /// TRACK_STATUS requests for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_track_status_requested: Queue<TrackStatusRequested>,
+    unknown_fetched: Queue<Fetched>,
 
     /// Active inbound SUBSCRIBE_NAMESPACE prefixes, keyed by Request ID.
     subscribed_namespace_prefixes: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
@@ -218,6 +219,7 @@ impl Publisher {
             subscribeds: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
+            unknown_fetched: Default::default(),
             subscribed_namespace_prefixes: Default::default(),
             unknown_subscribed_namespace: Default::default(),
             subscribed_tracks_prefixes: Default::default(),
@@ -875,6 +877,11 @@ impl Publisher {
         self.unknown_track_status_requested.pop().await
     }
 
+    /// Returns the next FETCH for a namespace this session did not publish.
+    pub async fn fetched(&mut self) -> Option<Fetched> {
+        self.unknown_fetched.pop().await
+    }
+
     /// Returns the next inbound SUBSCRIBE_NAMESPACE request.
     pub async fn subscribed_namespace(&mut self) -> Option<SubscribedNamespace> {
         self.unknown_subscribed_namespace.pop().await
@@ -1035,10 +1042,7 @@ impl Publisher {
             // or our PUBLISH; the request ID says which.
             message::Subscriber::RequestError(msg) => self.recv_request_error(msg)?,
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
-            // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
-            message::Subscriber::Fetch(msg) => {
-                self.send_not_supported(msg.id, "fetch");
-            }
+            message::Subscriber::Fetch(msg) => self.recv_fetch(msg)?,
             // FETCH_CANCEL references an existing request; log and ignore.
             message::Subscriber::FetchCancel(msg) => {
                 tracing::debug!(
@@ -1274,6 +1278,36 @@ impl Publisher {
             )))?;
         }
 
+        Ok(())
+    }
+
+    fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
+        // Malformed values close the session (§5.1.2, §10.2.8).
+        msg.params.location_filter()?;
+        msg.params.group_order()?;
+        if msg
+            .params
+            .range_filters(message::LOCAL_MAX_FILTER_RANGES)
+            .is_err()
+        {
+            self.send_invalid_filter(msg.id, "fetch");
+            return Ok(());
+        }
+
+        // ponytail: a namespace this session published serves no FETCH yet;
+        // PublishNamespace hands out tracks, not the request queue a FETCH needs.
+        if self
+            .publish_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .contains_key(&msg.track_namespace)
+        {
+            self.send_not_supported(msg.id, "fetch");
+            return Ok(());
+        }
+
+        // A full queue drops the FETCH, which answers REQUEST_ERROR.
+        let _ = self.unknown_fetched.push(Fetched::new(self.clone(), msg));
         Ok(())
     }
 
@@ -1568,6 +1602,18 @@ mod tests {
         assert!(publisher.subscribeds.lock().unwrap().is_empty());
         let reply = futures::FutureExt::now_or_never(outgoing_recv.pop()).flatten();
         assert!(is_invalid_filter(reply, 0));
+
+        publisher
+            .recv_fetch(message::Fetch {
+                id: 4,
+                track_namespace: full_name.namespace.clone(),
+                track_name: full_name.name.clone(),
+                params: subgroup_filter_params(),
+            })
+            .unwrap();
+        let reply = futures::FutureExt::now_or_never(outgoing_recv.pop()).flatten();
+        assert!(is_invalid_filter(reply, 4));
+        assert!(futures::FutureExt::now_or_never(publisher.fetched()).is_none());
 
         let mut tracks = publisher
             .recv_subscribe_tracks(message::SubscribeTracks {

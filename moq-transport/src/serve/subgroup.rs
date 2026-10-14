@@ -467,6 +467,17 @@ impl SubgroupsReader {
         self.state.lock().largest_location
     }
 
+    /// The subgroups still open for writing. This is all the track content a
+    /// relay holds: a subgroup leaves the set when its upstream stream ends.
+    pub fn cached(&self) -> Vec<SubgroupReader> {
+        self.state
+            .lock()
+            .live_subgroups
+            .iter()
+            .map(|live| live.reader.clone())
+            .collect()
+    }
+
     /// Check if the subgroups writer has been closed or dropped.
     pub fn is_closed(&self) -> bool {
         let state = self.state.lock();
@@ -903,6 +914,11 @@ impl SubgroupReader {
             }
             .await; // Try again when the state changes
         }
+    }
+
+    /// The Objects received so far. An Object's payload may still be arriving.
+    pub fn cached_objects(&self) -> Vec<SubgroupObjectReader> {
+        self.state.lock().objects.clone()
     }
 
     pub fn pos(&self) -> usize {
