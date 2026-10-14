@@ -630,7 +630,7 @@ impl Publisher {
                     tokio::select! {
                         // Messages we write on our own request stream
                         // (PUBLISH_DONE). Draft-18 omits the Request ID here.
-                        outgoing = stream_rx.recv() => {
+                        outgoing = stream_rx.recv(), if !writer_closed => {
                             let Some(mut outgoing) = outgoing else { break Ok(()) };
                             let terminal = matches!(outgoing.message, Message::PublishDone(_));
                             if let Err(err) = Session::encode_bidi_response(&mut writer, &outgoing.message).await {
@@ -684,6 +684,10 @@ impl Publisher {
                                 Err(err) if err.is_stream_ended() => {
                                     tracing::debug!(request_id, error = %err, "PUBLISH response reader ended");
                                     reading = false;
+                                    if writer_closed {
+                                        abort.cancel_from_peer();
+                                        break Ok(());
+                                    }
                                 }
                                 // An undecodable frame is not a resynchronisation
                                 // point: draft-18 requires closing the session on an
@@ -691,8 +695,16 @@ impl Publisher {
                                 Err(err) => break Err(err),
                             }
                         }
-                        stopped = writer.closed() => {
+                        stopped = writer.closed(), if !writer_closed => {
                             match stopped {
+                                // A rejecting peer answers REQUEST_ERROR, FINs, and
+                                // stops reading. STOP_SENDING can be observed before
+                                // that response is read, so keep reading until the
+                                // peer's half ends; the response still wins.
+                                Ok(_) if reading => {
+                                    writer.reset(0);
+                                    writer_closed = true;
+                                }
                                 Ok(_) => {
                                     abort.cancel_from_peer();
                                     writer.reset(0);
