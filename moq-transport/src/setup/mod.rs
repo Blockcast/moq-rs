@@ -9,6 +9,7 @@
 
 mod auth_token;
 mod param_types;
+#[allow(clippy::module_inception)]
 mod setup;
 mod version;
 
