@@ -268,8 +268,10 @@ impl FetchStreamState {
         let (group_delta, object_delta) = match self.location {
             None => (Some(group_id), Some(object_id)),
             Some((prior_group, prior_object)) if prior_group == group_id => {
+                // Delta 0 would repeat the prior Location.
                 let delta = object_id
                     .checked_sub(prior_object)
+                    .filter(|&d| d != 0)
                     .ok_or(EncodeError::InvalidValue)?;
                 (None, (delta != 1).then_some(delta))
             }
@@ -335,9 +337,9 @@ impl FetchStreamState {
         object.payload_length.encode(w)?;
 
         self.location = Some((group_id, object_id));
-        if object.subgroup_id.is_some() {
-            self.subgroup_id = object.subgroup_id;
-        }
+        // After a datagram never send 0x01/0x02: a peer reading "prior
+        // Object's Subgroup ID" literally has none to resolve.
+        self.subgroup_id = object.subgroup_id;
         self.priority = Some(object.publisher_priority);
         Ok(())
     }
@@ -540,6 +542,20 @@ mod tests {
         let mut buf = BytesMut::new();
         state.encode(&obj(5, Some(0), 0, 1), &mut buf).unwrap();
         assert!(state.encode(&obj(4, Some(0), 0, 1), &mut buf).is_err());
-        assert!(state.encode(&obj(5, Some(0), 0, 1), &mut buf).is_ok());
+        assert!(state.encode(&obj(5, Some(0), 0, 1), &mut buf).is_err());
+        assert!(state.encode(&obj(5, Some(0), 1, 1), &mut buf).is_ok());
+    }
+
+    #[test]
+    fn encoder_sends_explicit_subgroup_after_datagram() {
+        let mut state = FetchStreamState::new(false);
+        let mut buf = BytesMut::new();
+        state.encode(&obj(1, Some(7), 0, 1), &mut buf).unwrap();
+        state.encode(&obj(1, None, 1, 1), &mut buf).unwrap();
+        let mark = buf.len();
+        state.encode(&obj(1, Some(7), 2, 1), &mut buf).unwrap();
+        // flags 0x03 (explicit Subgroup ID), then subgroup 7
+        assert_eq!(&buf[mark..mark + 2], &[0x03, 0x07]);
+        assert_eq!(decode_all(false, &buf).unwrap().len(), 3);
     }
 }
