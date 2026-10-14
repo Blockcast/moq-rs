@@ -491,10 +491,6 @@ impl Subscriber {
         Ok((session, subscriber))
     }
 
-    pub(super) fn close_session(&self, code: u32, reason: &str) {
-        self.webtransport.close(code, reason);
-    }
-
     /// Wait for the next inbound PUBLISH_NAMESPACE from the peer, if any.
     pub async fn published_namespace(&mut self) -> Option<PublishedNamespace> {
         self.published_namespace_queue.pop().await
@@ -768,6 +764,8 @@ impl Subscriber {
                         SubscribeStreamEvent::Cancel(cancel) => {
                             match cancel {
                                 Ok(code) => {
+                                    // Cancel (§3.3.3): RESET_STREAM our direction and
+                                    // STOP_SENDING the publisher's.
                                     request_writer.reset(code);
                                     response_reader.stop(code);
                                     writing = false;
@@ -3587,7 +3585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_accepted_subscribe_sends_unsubscribe_on_request_stream() {
+    async fn dropping_accepted_subscribe_cancels_the_request_stream() {
         let (client, server) = loopback_session_pair().await;
         let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
 
@@ -3612,11 +3610,11 @@ mod tests {
             .await
             .unwrap();
 
-            let message = Session::decode_bidi_response(&mut peer_reader, request_id)
-                .await
-                .unwrap();
+            // Draft-20 cancellation: the subscriber resets its request
+            // direction; no message is sent. A publisher then ends its own.
+            let request = Session::decode_bidi_response(&mut peer_reader, request_id).await;
             peer_writer.finish().unwrap();
-            message
+            request.map(|m| m.name()).map_err(|e| e.is_stream_error())
         });
 
         let opening = tokio::spawn(async move {
@@ -3632,13 +3630,15 @@ mod tests {
         let (subscriber, subscribe) = opening.await.unwrap();
         drop(subscribe.unwrap());
 
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), peer)
-                .await
-                .expect("peer did not receive UNSUBSCRIBE")
-                .unwrap(),
-            Message::Unsubscribe(message::Unsubscribe { id: 0 })
-        ));
+        let request = tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("peer did not observe the cancellation")
+            .unwrap();
+        assert_eq!(
+            request,
+            Err(true),
+            "request direction must be reset, not sent a frame"
+        );
         tokio::time::timeout(Duration::from_secs(2), pump)
             .await
             .expect("SUBSCRIBE response pump did not stop")
@@ -3674,12 +3674,12 @@ mod tests {
             .await
             .unwrap();
 
-            let message = Session::decode_bidi_response(&mut peer_reader, request_id)
-                .await
-                .unwrap();
-            let _ = peer_reader.done().await;
+            let request = Session::decode_bidi_response(&mut peer_reader, request_id).await;
             let response_stopped = peer_writer.closed().await.unwrap();
-            (message, response_stopped)
+            (
+                request.map(|m| m.name()).map_err(|e| e.is_stream_error()),
+                response_stopped,
+            )
         });
 
         let mut subscribe = subscriber
@@ -3696,11 +3696,12 @@ mod tests {
         .await
         .expect("bounded unsubscribe did not reset the request stream");
 
-        let (message, response_stopped) = peer.await.unwrap();
-        assert!(matches!(
-            message,
-            Message::Unsubscribe(message::Unsubscribe { id: 0 })
-        ));
+        let (request, response_stopped) = peer.await.unwrap();
+        assert_eq!(
+            request,
+            Err(true),
+            "request direction must be reset, not sent a frame"
+        );
         assert_eq!(
             response_stopped,
             Some(u8::try_from(super::super::CANCELLED_STREAM_CODE).unwrap())

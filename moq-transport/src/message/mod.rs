@@ -108,6 +108,10 @@ macro_rules! message_types {
                 <u64 as Decode>::decode_remaining(r, len)?;
                 let mut payload = r.copy_to_bytes(len);
 
+                if INTERNAL_ONLY.contains(&t) {
+                    return Err(DecodeError::InvalidMessage(t));
+                }
+
                 let msg = match t {
                     $($val => {
                         let msg = $name::decode(&mut payload)?;
@@ -132,7 +136,7 @@ macro_rules! message_types {
 
         impl Encode for Message {
             fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-                if !self.parameter_scopes_valid() {
+                if !self.parameter_scopes_valid() || INTERNAL_ONLY.contains(&self.id()) {
                     return Err(EncodeError::InvalidValue);
                 }
 
@@ -240,7 +244,17 @@ macro_rules! message_types {
     }
 }
 
-// Wire IDs per draft-ietf-moq-transport-16 Table 1.
+/// Types modelled internally that draft-20 Table 5 does not define. They are
+/// never encoded, and receiving one closes the session like any unknown type:
+/// cancellation and withdrawal use RESET_STREAM / STOP_SENDING (§3.3.3).
+const INTERNAL_ONLY: &[u64] = &[
+    wire_id::PublishNamespaceDone,
+    wire_id::Unsubscribe,
+    wire_id::PublishNamespaceCancel,
+    wire_id::FetchCancel,
+];
+
+// Wire IDs per draft-ietf-moq-transport-20 Table 5, plus INTERNAL_ONLY.
 message_types! {
     // NOTE: Setup messages live in a separate module (setup::Client/Server).
 
@@ -510,7 +524,9 @@ mod tests {
     #[test]
     fn draft20_retired_message_types_are_rejected() {
         // 0x1E was PUBLISH_OK through draft-18; 0x20/0x21 were CLIENT/SERVER_SETUP.
-        for retired in [0x1e_u8, 0x20, 0x21, 0x40, 0x41] {
+        // 0x09/0x0A/0x0C/0x17 were PUBLISH_NAMESPACE_DONE, UNSUBSCRIBE,
+        // PUBLISH_NAMESPACE_CANCEL and FETCH_CANCEL before draft-18.
+        for retired in [0x09_u8, 0x0a, 0x0c, 0x17, 0x1e, 0x20, 0x21, 0x40, 0x41] {
             let mut frame = bytes::Bytes::from(vec![retired, 0x00, 0x01, 0x00]);
             assert!(
                 matches!(

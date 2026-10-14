@@ -296,60 +296,32 @@ impl Subscribe {
         self.request_cancel = Some(request_cancel);
     }
 
-    /// End the subscription and wait until the peer terminates its request
-    /// stream. This provides an ordering barrier before opening another
-    /// SUBSCRIBE for the same track.
+    /// End the subscription by cancelling its request stream, and wait until
+    /// the stream's pump has stopped.
     pub async fn unsubscribe(mut self) {
         self.unsubscribe_before(SUBSCRIBE_TEARDOWN_TIMEOUT).await;
     }
 
     pub(super) async fn unsubscribe_before(&mut self, timeout: Duration) {
-        self.send_unsubscribe();
-        if let Some(mut request_done) = self.request_done.take() {
-            if tokio::time::timeout(timeout, &mut request_done)
-                .await
-                .is_err()
-            {
+        self.cancel_request();
+        if let Some(request_done) = self.request_done.take() {
+            if tokio::time::timeout(timeout, request_done).await.is_err() {
                 tracing::warn!(
                     request_id = self.info.id,
-                    "peer did not finish SUBSCRIBE request stream after UNSUBSCRIBE; resetting it"
+                    "SUBSCRIBE request stream did not stop after cancellation"
                 );
-                if let Some(cancel) = self.request_cancel.take() {
-                    let _ = cancel.send(super::CANCELLED_STREAM_CODE);
-                }
-                // RESET_STREAM is not ordered against a new QUIC stream. Retire
-                // this session before releasing a cache generation so a retry
-                // cannot overtake teardown on the same connection. This also
-                // interrupts every other subscription multiplexed on the peer;
-                // they reconnect through normal upstream routing.
-                tracing::warn!(
-                    request_id = self.info.id,
-                    "retiring upstream session after stuck SUBSCRIBE teardown; all multiplexed subscriptions will reconnect"
-                );
-                self.subscriber.close_session(
-                    super::CANCELLED_STREAM_CODE,
-                    "SUBSCRIBE request stream teardown timed out",
-                );
-                if tokio::time::timeout(timeout, &mut request_done)
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        request_id = self.info.id,
-                        "SUBSCRIBE request stream did not stop after reset"
-                    );
-                }
             }
         }
         self.subscriber.remove_subscribe(self.info.id);
     }
 
-    fn send_unsubscribe(&mut self) {
-        let stream = self.stream.take();
-        if self.state.lock().closed.is_ok() {
-            if let Some(stream) = &stream {
-                let _ = stream.try_send(message::Unsubscribe { id: self.info.id }.into());
-            }
+    /// Draft-20 has no UNSUBSCRIBE message: a subscription is cancelled by
+    /// RESET_STREAM on the request direction and STOP_SENDING on the response
+    /// direction (§3.3.3). A pump that already finished ignores this.
+    fn cancel_request(&mut self) {
+        self.stream.take();
+        if let Some(cancel) = self.request_cancel.take() {
+            let _ = cancel.send(super::CANCELLED_STREAM_CODE);
         }
     }
 
@@ -417,7 +389,7 @@ impl Subscribe {
 
 impl Drop for Subscribe {
     fn drop(&mut self) {
-        self.send_unsubscribe();
+        self.cancel_request();
         self.subscriber.remove_subscribe(self.info.id);
     }
 }

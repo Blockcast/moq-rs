@@ -1216,7 +1216,7 @@ impl Session {
         } else {
             None
         };
-        let _cleanup = req_id.map(|id| BidiRequestCleanup {
+        let cleanup = req_id.map(|id| BidiRequestCleanup {
             id,
             kind: request_kind,
             publisher: publisher.as_ref().cloned(),
@@ -1387,6 +1387,10 @@ impl Session {
             }
         }
 
+        // Release the request's state before the FIN: a requester that sees
+        // this stream end may immediately retry the same track.
+        drop(cleanup);
+
         // Explicitly finish the stream and yield for Quinn to flush.
         if !writer_closed {
             let _ = writer.finish();
@@ -1525,8 +1529,6 @@ impl Session {
                 m.stream_count.encode(&mut payload)?;
                 m.reason.encode(&mut payload)?;
             }
-            // id-only messages: payload is empty (id omitted on bidi).
-            Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {}
             // NAMESPACE / NAMESPACE_DONE never carried a Request ID, so their
             // payload is unchanged on a bidi stream.
             Message::Namespace(m) => {
@@ -1632,9 +1634,6 @@ impl Session {
                     track_extensions,
                 }))
             }
-            wire_id::PublishNamespaceDone => Ok(Message::PublishNamespaceDone(
-                message::PublishNamespaceDone { id: request_id },
-            )),
             wire_id::PublishDone => {
                 let status_code = u64::decode(&mut buf)?;
                 let stream_count = u64::decode(&mut buf)?;
@@ -1646,9 +1645,6 @@ impl Session {
                     reason,
                 }))
             }
-            wire_id::Unsubscribe => Ok(Message::Unsubscribe(message::Unsubscribe {
-                id: request_id,
-            })),
             // NAMESPACE / NAMESPACE_DONE have no Request ID field, so nothing
             // is injected — they decode exactly as they do on any other stream.
             wire_id::Namespace => {
