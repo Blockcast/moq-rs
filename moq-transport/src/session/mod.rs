@@ -1399,8 +1399,9 @@ impl Session {
     ///
     /// The whole life of a request is on one stream, so PUBLISH_DONE (ending an
     /// inbound PUBLISH) arrives here rather than on the control stream. Other
-    /// requests end by RESET_STREAM/STOP_SENDING (§3.3.3), not a message. Like every other message after the request, they omit
-    /// the Request ID, which is why the stream's known `request_id` is injected.
+    /// requests end by RESET_STREAM/STOP_SENDING (§3.3.3), not a message.
+    /// Follow-up messages omit the Request ID, which is why the stream's known
+    /// `request_id` is injected.
     ///
     /// Returns when the request ends: the requester reset the stream, or sent
     /// something terminal. A clean FIN of the requester's send half is not an

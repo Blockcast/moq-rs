@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
@@ -208,6 +208,42 @@ pub struct Producer {
     subscribe_tracks_session_child_permits: Arc<Semaphore>,
     /// Shared only by SUBSCRIBE_TRACKS requests on this transport session.
     subscribe_tracks_session_slot_permits: Arc<Semaphore>,
+    /// Full Track Names this session has an inbound SUBSCRIBE for, held or
+    /// established, counted because draft-20 allows several per track.
+    inbound_subscribes: Arc<Mutex<HashMap<FullTrackName, usize>>>,
+}
+
+/// Registers one inbound SUBSCRIBE in [`Producer::inbound_subscribes`] until
+/// dropped.
+struct InboundSubscribe {
+    names: Arc<Mutex<HashMap<FullTrackName, usize>>>,
+    full_name: FullTrackName,
+}
+
+impl InboundSubscribe {
+    fn new(names: &Arc<Mutex<HashMap<FullTrackName, usize>>>, full_name: FullTrackName) -> Self {
+        *names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(full_name.clone())
+            .or_default() += 1;
+        Self {
+            names: names.clone(),
+            full_name,
+        }
+    }
+}
+
+impl Drop for InboundSubscribe {
+    fn drop(&mut self) {
+        let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = names.get_mut(&self.full_name) {
+            *count -= 1;
+            if *count == 0 {
+                names.remove(&self.full_name);
+            }
+        }
+    }
 }
 
 /// Why the wait for upstream readiness ended without the subscription being
@@ -266,6 +302,7 @@ impl Producer {
             subscribe_tracks_session_slot_permits: Arc::new(Semaphore::new(
                 MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
             )),
+            inbound_subscribes: Default::default(),
         }
     }
 
@@ -468,6 +505,9 @@ impl Producer {
             namespace: namespace.clone(),
             name: track_name.clone(),
         };
+        // Registered before the hold starts waiting, so the publisher arrival
+        // that wakes it cannot also generate a SUBSCRIBE_TRACKS PUBLISH.
+        let _inbound = InboundSubscribe::new(&self.inbound_subscribes, full_name.clone());
 
         // Re-entered after a publisher appears. The lookup is repeated rather
         // than trusting the wake, because `Consumer::serve_track` emits
@@ -1452,6 +1492,21 @@ impl Producer {
             return Ok(());
         };
 
+        // Draft-20 section 9.5: a relay holding a downstream SUBSCRIBE for this
+        // track MUST answer that SUBSCRIBE and MUST NOT also forward the
+        // PUBLISH. An established SUBSCRIBE already delivers the track, so it
+        // suppresses the generated PUBLISH as well. The slot is dropped; a
+        // later change event for the track asks again.
+        if self
+            .inbound_subscribes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(full_name)
+        {
+            slots.remove(full_name);
+            return Ok(());
+        }
+
         // SUBSCRIBE_TRACKS grants discovery of a prefix, not delivery of
         // everything under it. This path pushes PUBLISH and then streams the
         // track's objects, so it needs the same authorization a SUBSCRIBE for
@@ -1525,10 +1580,6 @@ impl Producer {
             published = publish => published,
         } {
             Ok(published) => published,
-            Err(SessionError::Serve(ServeError::Duplicate)) => {
-                slots.remove(full_name);
-                return Ok(());
-            }
             Err(error) if !error.is_session_fatal() => {
                 tracing::warn!(
                     namespace = %full_name.namespace.to_utf8_path(),
@@ -2364,6 +2415,78 @@ mod tests {
             "resolved hold should release capacity for another rendezvous"
         );
         drop(first_subscription);
+    }
+
+    /// Draft-20 section 9.5: a relay holding a downstream SUBSCRIBE awaiting a
+    /// publisher MUST answer it and MUST NOT also forward the PUBLISH to that
+    /// subscriber, even when it has SUBSCRIBE_TRACKS covering the track.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_subscribe_suppresses_the_subscribe_tracks_publish() {
+        let locals = Locals::with_rendezvous_capacity(1);
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let (transport, subscriber, _slots) = spawn_relay_session_with_limits(
+            locals.clone(),
+            remotes,
+            coordinator.clone(),
+            MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        )
+        .await;
+
+        let mut holder = subscriber.clone();
+        let held =
+            tokio::spawn(async move { subscribe_result(&mut holder, "held", Some(10_000)).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while locals.available_rendezvous_holds() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SUBSCRIBE did not enter the rendezvous hold");
+
+        // The held SUBSCRIBE took the client's first Request ID, 0.
+        let (message_type, _) = send_request(
+            &transport,
+            Message::SubscribeTracks(SubscribeTracks {
+                id: 2,
+                track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("admission"),
+                params: KeyValuePairs::default(),
+            }),
+        )
+        .await;
+        assert_eq!(message_type, wire_id::RequestOk);
+
+        let namespace = TrackNamespace::from_utf8_path("admission");
+        let mut registering = locals.clone();
+        let (_held_writer, held_reader) = Track::new(namespace.clone(), "held").produce();
+        let _held_registration = registering
+            .register_track(None, held_reader)
+            .await
+            .expect("register held track");
+        let _subscription = tokio::time::timeout(Duration::from_secs(2), held)
+            .await
+            .expect("held SUBSCRIBE did not resolve")
+            .expect("join held SUBSCRIBE")
+            .expect("held SUBSCRIBE was rejected");
+
+        // Positive control: a sibling under the same prefix is still published,
+        // so an absent PUBLISH for "held" is the guard and not a dead fan-out.
+        let (_other_writer, other_reader) = Track::new(namespace, "other").produce();
+        let _other_registration = registering
+            .register_track(None, other_reader)
+            .await
+            .expect("register other track");
+
+        let mut publishes = subscriber.clone();
+        let mut names = Vec::new();
+        while let Ok(Some(published)) =
+            tokio::time::timeout(Duration::from_millis(500), publishes.publish_received()).await
+        {
+            names.push(published.name().clone());
+            std::mem::forget(published);
+        }
+        assert_eq!(names, vec![TrackName::from("other")]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3268,8 +3391,11 @@ mod tests {
         )
         .await
         .expect("response timed out");
-        // Keep the request stream open for the duration of the test.
+        // Keep the request stream open for the duration of the test. Both
+        // halves: dropping the receive half sends STOP_SENDING, which cancels
+        // the request.
         std::mem::forget(send);
+        std::mem::forget(recv);
         response
     }
 }
