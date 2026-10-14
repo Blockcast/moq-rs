@@ -720,7 +720,9 @@ impl Client {
         // TODO support connecting to both ALPNs at the same time
         config.alpn_protocols = vec![match url.scheme() {
             "https" => web_transport_quinn::ALPN.as_bytes().to_vec(),
-            "moqt" => moq_transport::setup::ALPN.to_vec(),
+            "moqt" => moq_transport::setup::DraftVersion::Draft18
+                .alpn_bytes()
+                .to_vec(),
             _ => anyhow::bail!("url scheme must be 'https' or 'moqt'"),
         }];
 
