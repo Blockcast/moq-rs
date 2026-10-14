@@ -53,6 +53,10 @@ impl PublishedEntry {
     }
 }
 
+/// How long a PUBLISH whose peer sent STOP_SENDING keeps reading for the
+/// peer's response before treating the request as cancelled.
+const PUBLISH_STOPPED_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 struct AbortPublishedOnDrop {
     publisher: Publisher,
     request_id: Option<u64>,
@@ -620,14 +624,38 @@ impl Publisher {
             .send(Box::pin(async move {
                 let mut abort = abort;
                 let mut reader = super::Reader::new(recv_stream);
+                // decode_bidi_response is not cancel-safe, so one long-lived
+                // future does all reading and hands complete frames over.
+                let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(1);
+                let read_responses = async move {
+                    loop {
+                        let response = Session::decode_bidi_response(&mut reader, request_id).await;
+                        let ended = response.is_err();
+                        if response_tx.send(response).await.is_err() || ended {
+                            break;
+                        }
+                    }
+                };
+                tokio::pin!(read_responses);
+                let mut read_responses_done = false;
                 // The peer may finish its half as soon as it has replied
                 // PUBLISH_OK. That does not end the request, so reading stops
                 // while the write half stays open for PUBLISH_DONE.
                 let mut reading = true;
                 let mut writer_closed = false;
+                // Set when STOP_SENDING arrives before the peer's half ended.
+                let mut stopped_deadline: Option<tokio::time::Instant> = None;
 
                 let result = loop {
                     tokio::select! {
+                        () = &mut read_responses, if !read_responses_done => {
+                            read_responses_done = true;
+                        }
+                        _ = tokio::time::sleep_until(stopped_deadline.unwrap_or_else(tokio::time::Instant::now)), if stopped_deadline.is_some() => {
+                            tracing::debug!(request_id, "peer stopped reading PUBLISH but kept its half open");
+                            abort.cancel_from_peer();
+                            break Ok(());
+                        }
                         // Messages we write on our own request stream
                         // (PUBLISH_DONE). Draft-18 omits the Request ID here.
                         outgoing = stream_rx.recv(), if !writer_closed => {
@@ -659,11 +687,14 @@ impl Publisher {
                             }
                             outgoing.complete(Ok(()));
                         }
-                        // Not cancellation-safe: a frame half-read when the
-                        // write branch wins is lost. Safe only because that
-                        // branch always breaks out of the loop.
-                        response = Session::decode_bidi_response(&mut reader, request_id), if reading => {
+                        Some(response) = response_rx.recv(), if reading => {
                             match response {
+                                // Only a subscription's publisher may send it (§10.10).
+                                Ok(Message::PublishStateNotify(_)) => {
+                                    break Err(SessionError::ProtocolViolation(
+                                        "PUBLISH_STATE_NOTIFY from the subscriber of a PUBLISH".to_string(),
+                                    ));
+                                }
                                 Ok(msg) => match TryInto::<message::Subscriber>::try_into(msg) {
                                     Ok(sub_msg) => {
                                         if let Err(err) = this.recv_message(sub_msg) {
@@ -704,6 +735,9 @@ impl Publisher {
                                 Ok(_) if reading => {
                                     writer.reset(0);
                                     writer_closed = true;
+                                    stopped_deadline = Some(
+                                        tokio::time::Instant::now() + PUBLISH_STOPPED_DRAIN_TIMEOUT,
+                                    );
                                 }
                                 Ok(_) => {
                                     abort.cancel_from_peer();
@@ -1910,6 +1944,83 @@ mod tests {
             .contains_name(&full_track_name("test", "track")));
         drop(subgroup);
         drop(subgroups);
+    }
+
+    /// Opens an outbound PUBLISH against a loopback peer. Returns the peer's
+    /// halves of the request stream, the publisher's pump, and the PUBLISH.
+    async fn open_outbound_publish() -> (
+        Writer,
+        Reader,
+        tokio::task::JoinHandle<Result<(), crate::session::SessionError>>,
+        crate::session::Published,
+        web_transport::Session,
+    ) {
+        let (publisher_session, peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let request_peer = peer_session.clone();
+        let request = tokio::spawn(async move {
+            let (send_stream, recv_stream) = request_peer.accept_bi().await.unwrap();
+            let mut reader = Reader::new(recv_stream);
+            let Message::Publish(_) = reader.decode().await.unwrap() else {
+                panic!("expected PUBLISH request");
+            };
+            (Writer::new(send_stream), reader)
+        });
+        let (_subgroups, reader) = subgroup_track();
+        let published = publisher
+            .publish(reader, KeyValuePairs::default())
+            .await
+            .unwrap();
+        let driver = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        let (writer, reader) = request.await.unwrap();
+        (writer, reader, driver, published, peer_session)
+    }
+
+    /// PUBLISH_STATE_NOTIFY is only sent by a subscription's publisher, so one
+    /// arriving from the subscriber of our PUBLISH closes the session (§10.10).
+    #[tokio::test]
+    async fn publish_state_notify_from_publish_subscriber_is_a_protocol_violation() {
+        let (mut writer, _reader, driver, _published, _peer) = open_outbound_publish().await;
+        Session::encode_bidi_response(
+            &mut writer,
+            &Message::PublishStateNotify(message::PublishStateNotify::default()),
+        )
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(crate::session::SessionError::ProtocolViolation(_))
+        ));
+    }
+
+    /// A peer that sends STOP_SENDING but never ends its own half cancels the
+    /// PUBLISH once the drain timeout passes, rather than pinning it forever.
+    #[tokio::test]
+    async fn publish_stopped_without_response_is_cancelled_after_drain_timeout() {
+        let (_writer, mut reader, driver, mut published, _peer) = open_outbound_publish().await;
+        reader.stop(0);
+
+        let result = tokio::time::timeout(
+            super::PUBLISH_STOPPED_DRAIN_TIMEOUT + std::time::Duration::from_secs(2),
+            published.ok(),
+        )
+        .await
+        .expect("PUBLISH stayed pending after STOP_SENDING");
+        assert!(matches!(result, Err(serve::ServeError::Cancel)));
+        driver.await.unwrap().unwrap();
     }
 
     #[tokio::test]
