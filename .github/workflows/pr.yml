@@ -6,7 +6,7 @@ name: pr
 
 on:
   pull_request:
-    branches: ["main"]
+    branches: ["main", "cf-draft-18-dev"]
 
 env:
   CARGO_TERM_COLOR: always

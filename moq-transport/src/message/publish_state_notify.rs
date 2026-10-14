@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Cloudflare Inc.
+// SPDX-FileCopyrightText: 2026 Cloudflare Inc. and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
