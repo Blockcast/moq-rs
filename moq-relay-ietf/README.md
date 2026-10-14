@@ -68,7 +68,6 @@ So an edit that fails validation does not take effect, and it shuts every scope 
 |---|---|
 | enforced | its `ttl_secs` (default 300 s) |
 | no policy | 300 s (fixed) |
-| policy present but unusable (e.g. a key the CAT library rejects) | 30 s |
 
 Restart the relay to apply a change immediately. A restart with a broken file fails at startup. Existing sessions keep the policy they were admitted with.
 
