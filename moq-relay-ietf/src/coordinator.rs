@@ -256,9 +256,15 @@ pub struct ScopeAuthConfig {
 
     /// How long the relay may reuse this configuration before re-fetching it.
     ///
-    /// Bounds the propagation delay of a key rotation or revocation. A zero
-    /// TTL is replaced with [`DEFAULT_SCOPE_AUTH_TTL`] rather than causing a
-    /// coordinator round-trip on every connection.
+    /// Bounds the propagation delay of a key rotation or revocation while the
+    /// coordinator is reachable. By default, failed refreshes reuse the last
+    /// fetched policy for at most 12 effective TTLs from the last successful
+    /// fetch. After that, new sessions are refused until a refresh succeeds.
+    /// A coordinator can turn reuse off with
+    /// [`Coordinator::reuse_scope_config_on_error`]; a failed refresh then
+    /// refuses new sessions as soon as the cached entry expires.
+    /// A zero TTL is replaced with [`DEFAULT_SCOPE_AUTH_TTL`] rather than
+    /// causing a coordinator round-trip on every connection.
     pub ttl: Duration,
 }
 
@@ -769,22 +775,60 @@ pub trait Coordinator: Send + Sync {
     /// Get configuration for a resolved scope.
     ///
     /// Called after [`resolve_scope()`] to retrieve operational parameters
-    /// for the scope, such as origin fallback URLs and lingering subscriber
-    /// settings.
+    /// for the scope, such as origin fallback URLs, lingering subscriber
+    /// settings, and the token authorization policy.
     ///
     /// # Arguments
     ///
     /// * `scope` - The resolved scope identity from [`resolve_scope()`],
     ///   or `None` for unscoped sessions.
     ///
+    /// # Authorization
+    ///
+    /// [`ScopeConfig::auth`] carries the scope's token authorization policy,
+    /// including the public keys used to verify AUTHORIZATION TOKEN signatures.
+    /// Returning `None` (the default) leaves token authorization disabled for
+    /// the scope; returning `Some` enables it and makes the relay fail closed
+    /// on anything it cannot positively authorize.
+    ///
+    /// The relay caches the returned configuration per scope for
+    /// [`ScopeAuthConfig::ttl`], so this method is not normally called per
+    /// connection. The cache holds at most 1024 scopes; while it is full of
+    /// unexpired entries, a scope that does not fit is fetched on every
+    /// connection and has no cached policy to reuse during an outage.
+    /// Key rotation takes effect for new sessions within one TTL while the
+    /// coordinator is reachable. By default, failed refreshes reuse an enforced
+    /// policy for at most 12 effective TTLs from the last successful fetch, then
+    /// refuse new sessions until a refresh succeeds. Scopes without a policy
+    /// have no reuse limit; a scope never fetched is denied. Failed refreshes
+    /// retry after a short interval, including after the cap. A coordinator can
+    /// turn reuse off with [`Self::reuse_scope_config_on_error`]; every failed
+    /// fetch then refuses new sessions, leaving expired entries for the next
+    /// lookup to refresh.
+    /// Sessions already established keep the keys they were admitted with.
+    ///
     /// # Default Implementation
     ///
     /// Returns default configuration (no origin fallback, lingering subscribe
-    /// disabled).
+    /// disabled, token authorization disabled).
     ///
     /// [`resolve_scope()`]: Coordinator::resolve_scope
     async fn get_scope_config(&self, _scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
         Ok(ScopeConfig::default())
+    }
+
+    /// Whether to reuse cached scope configuration after a failed refresh.
+    ///
+    /// Defaults to `true`: a remote coordinator outage would otherwise refuse
+    /// new sessions on every scope once its cached configuration expires.
+    /// Turn this off when a failed lookup most likely means a bad local
+    /// configuration. Reusing the previous state, possibly no policy, would
+    /// hide that mistake. With reuse off, a failed fetch refuses new sessions
+    /// even if the scope previously had no policy.
+    ///
+    /// The relay reads this setting once when constructing its scope authorizer.
+    fn reuse_scope_config_on_error(&self) -> bool {
+        true
     }
 
     // ========================================================================
