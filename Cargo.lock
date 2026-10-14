@@ -1781,6 +1781,7 @@ dependencies = [
  "clap",
  "moq-native-ietf",
  "moq-transport",
+ "rand 0.8.5",
  "tokio",
  "tracing",
  "tracing-subscriber",

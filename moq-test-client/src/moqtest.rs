@@ -51,11 +51,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use tokio::time::sleep;
 
-use moq_transport::coding::{KeyValuePairs, TrackNamespace, TupleField};
+use moq_transport::coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix, TupleField};
 use moq_transport::data::{ExtensionHeaders, ObjectStatus};
-use moq_transport::message::PublishDoneCode;
-use moq_transport::serve::{Datagram, Subgroup, Track, TrackReader, TrackReaderMode, TrackWriter};
-use moq_transport::session::{PublishDoneInfo, Session, Subscribe};
+use moq_transport::message::{GroupOrder, PublishDoneCode};
+use moq_transport::serve::{
+    Datagram, ServeError, Subgroup, Track, TrackReader, TrackReaderMode, TrackWriter,
+};
+use moq_transport::session::{
+    PublishDoneInfo, PublishNamespace, Publisher, Session, Subscribe, Subscribed,
+};
+use tokio::task::JoinSet;
 
 use crate::scenarios::{is_normal_subscription_end, TestConnectionIds};
 use crate::Args;
@@ -261,6 +266,35 @@ impl MoqTestParams {
             ns.add(TupleField::from_utf8(&field));
         }
         ns
+    }
+
+    /// Build the track namespace for this tuple re-homed below `prefix`:
+    /// the prefix fields followed by the 16 tuple fields.
+    pub fn to_namespace_under(&self, prefix: &TrackNamespace) -> TrackNamespace {
+        let mut ns = prefix.clone();
+        for field in self.to_namespace_fields() {
+            ns.add(TupleField::from_utf8(&field));
+        }
+        ns
+    }
+
+    /// Parse the tuple from a namespace re-homed below `prefix`. Fails if
+    /// `namespace` does not start with `prefix`, or if the remaining fields
+    /// are not a valid UTF-8 moq-test tuple.
+    pub fn from_namespace_under(
+        prefix: &TrackNamespacePrefix,
+        namespace: &TrackNamespace,
+    ) -> Result<Self> {
+        let tuple = namespace
+            .strip_prefix(prefix)
+            .ok_or_else(|| anyhow!("namespace {namespace} is not under {prefix}"))?;
+        let fields = tuple
+            .fields
+            .iter()
+            .map(|field| String::from_utf8(field.value.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .context("moq-test tuple field is not UTF-8")?;
+        Self::from_namespace_fields(&fields)
     }
 
     fn validate(&self) -> Result<()> {
@@ -544,6 +578,31 @@ impl Prng {
     }
 }
 
+/// First field of every data-plane routing prefix. Relays that limit
+/// anonymous publication to test namespaces commonly allow this root.
+pub const ROUTING_ROOT: &str = "moq-test";
+
+/// Track Name used by the data-plane scenarios. moq-test content does not
+/// depend on the Track Name; run isolation comes from the routing prefix.
+pub const DATA_PLANE_TRACK_NAME: &str = "track";
+
+/// A run identifier: 128 bits of entropy as lowercase hexadecimal, as the
+/// interop runner's data-plane conventions require.
+pub fn run_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+/// The data-plane routing prefix `("moq-test", <test_id>, <run_id>)`. The
+/// publisher publishes it with PUBLISH_NAMESPACE and serves moq-test tuples
+/// below it.
+pub fn routing_prefix(test_id: &str, run_id: &str) -> TrackNamespace {
+    let mut ns = TrackNamespace::new();
+    for field in [ROUTING_ROOT, test_id, run_id] {
+        ns.add(TupleField::from_utf8(field));
+    }
+    ns
+}
+
 /// A per-run unique track name. Any unique name is valid for the same
 /// tuple-derived content, so a fresh name per run acts as a cache buster:
 /// the relay cannot serve stale objects from an earlier run.
@@ -768,6 +827,19 @@ impl Report {
     }
 }
 
+/// How the verifier treats the Stream Count in the downstream PUBLISH_DONE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCountRule {
+    /// The count must equal the streams the generator opens. Holds for the
+    /// self-publishing `moq-test-*` scenarios, where moq-rs relays pass the
+    /// upstream count through.
+    Exact,
+    /// Any count is accepted. A relay may report its own count after legal
+    /// representation changes, or the unknown-count sentinel, so the object
+    /// set alone decides the result (interop-runner data-plane conventions).
+    Any,
+}
+
 /// The expected object set derived from the tuple, checked off as objects
 /// arrive. Any deviation is recorded as a failure string immediately.
 struct Scoreboard {
@@ -955,7 +1027,16 @@ impl Scoreboard {
         self.check_subgroup(group, object, subgroup);
     }
 
-    fn finish(mut self, publish_done: Option<&PublishDoneInfo>, forward_zero: bool) -> Report {
+    fn finish(self, publish_done: Option<&PublishDoneInfo>, forward_zero: bool) -> Report {
+        self.finish_with(publish_done, forward_zero, StreamCountRule::Exact)
+    }
+
+    fn finish_with(
+        mut self,
+        publish_done: Option<&PublishDoneInfo>,
+        forward_zero: bool,
+        stream_count: StreamCountRule,
+    ) -> Report {
         let mut report = Report {
             data_objects_expected: if forward_zero {
                 0
@@ -1013,7 +1094,7 @@ impl Scoreboard {
                 } else {
                     self.params.expected_stream_count()
                 };
-                if done.stream_count != expected_streams {
+                if stream_count == StreamCountRule::Exact && done.stream_count != expected_streams {
                     report.failures.push(format!(
                         "PUBLISH_DONE stream count {} != expected {expected_streams}",
                         done.stream_count
@@ -1038,6 +1119,7 @@ pub async fn verify(
     track: TrackReader,
     subscribe: Subscribe,
     forward_zero: bool,
+    stream_count: StreamCountRule,
 ) -> Result<Report> {
     let mut scoreboard = Scoreboard::new(params.clone());
 
@@ -1159,7 +1241,7 @@ pub async fn verify(
         Ok(()) => {}
     }
 
-    let mut report = scoreboard.finish(subscribe.publish_done().as_ref(), false);
+    let mut report = scoreboard.finish_with(subscribe.publish_done().as_ref(), false, stream_count);
     report.streams_received = streams_received;
     Ok(report)
 }
@@ -1200,18 +1282,6 @@ fn base() -> MoqTestParams {
 /// [`scenario`]) and by the all-scenarios unit test.
 static SCENARIOS: LazyLock<Vec<(&'static str, Scenario)>> = LazyLock::new(|| {
     vec![
-        (
-            "moq-test-subgroup-per-group",
-            Scenario {
-                params: MoqTestParams {
-                    last_group: 2,
-                    last_object: 4,
-                    objects_per_group: 5,
-                    ..base()
-                },
-                forward_zero: false,
-            },
-        ),
         (
             "moq-test-subgroup-per-group-eog",
             Scenario {
@@ -1421,7 +1491,14 @@ pub async fn run(args: &Args, scenario: &Scenario) -> Result<(TestConnectionIds,
                 .await
                 .context("SUBSCRIBE failed")?;
             let _ = setup_tx.send(());
-            verify(params, sub_reader, subscribe, forward_zero).await
+            verify(
+                params,
+                sub_reader,
+                subscribe,
+                forward_zero,
+                StreamCountRule::Exact,
+            )
+            .await
         };
         tokio::select! {
             res = work => res,
@@ -1500,6 +1577,281 @@ pub async fn run(args: &Args, scenario: &Scenario) -> Result<(TestConnectionIds,
         .context("subscriber verification failed")?;
 
     Ok((cids, report))
+}
+
+/// An interop-runner data-plane scenario
+/// (`moq-interop-runner/docs/tests/data-plane/`): a canonical moq-test tuple
+/// run with the publisher-first choreography below a run-unique routing
+/// prefix.
+pub struct DataPlaneScenario {
+    /// Stable test identifier; also the second routing-prefix field.
+    pub id: &'static str,
+    /// Specification revision implemented, reported in TAP diagnostics.
+    pub spec_revision: u32,
+    pub params: MoqTestParams,
+}
+
+/// The data-plane scenarios, keyed by test identifier.
+static DATA_PLANE_SCENARIOS: LazyLock<Vec<DataPlaneScenario>> = LazyLock::new(|| {
+    vec![DataPlaneScenario {
+        id: "data-subgroup-basic",
+        spec_revision: 2,
+        // moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0
+        params: MoqTestParams {
+            last_group: 2,
+            last_object: 4,
+            objects_per_group: 5,
+            ..base()
+        },
+    }]
+});
+
+/// Look up a data-plane scenario by identifier, validating its tuple first.
+pub fn data_plane_scenario(id: &str) -> Result<Option<&'static DataPlaneScenario>> {
+    let Some(scenario) = DATA_PLANE_SCENARIOS.iter().find(|s| s.id == id) else {
+        return Ok(None);
+    };
+    scenario
+        .params
+        .validate()
+        .with_context(|| format!("built-in scenario {id} is invalid"))?;
+    Ok(Some(scenario))
+}
+
+/// Deadline for each SETUP and namespace/subscription phase (data-plane
+/// conventions). Object delivery and draining share the outer
+/// `TEST_TIMEOUT` (10s).
+const PHASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound a setup phase by [`PHASE_TIMEOUT`], naming it on expiry.
+async fn phase<T>(what: &str, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(PHASE_TIMEOUT, fut)
+        .await
+        .map_err(|_| anyhow!("{what} timed out after {}s", PHASE_TIMEOUT.as_secs()))?
+}
+
+/// Run a data-plane scenario with the publisher-first choreography.
+///
+/// The publisher publishes only the routing prefix and acts as a moq-test
+/// publisher rooted there: it derives the object set from whatever tuple
+/// follows the prefix in each upstream SUBSCRIBE. The subscriber subscribes
+/// to the full re-homed namespace (prefix + tuple), so the relay has to route
+/// by Namespace Prefix Matching. The subscriber verifies against the tuple it
+/// requested; a publisher that derived a different set fails the scoreboard.
+pub async fn run_data_plane(
+    args: &Args,
+    scenario: &DataPlaneScenario,
+) -> Result<(TestConnectionIds, Report)> {
+    let mut cids = TestConnectionIds::default();
+    let prefix = routing_prefix(scenario.id, &run_id());
+    let namespace = scenario.params.to_namespace_under(&prefix);
+    tracing::info!(prefix = %prefix, namespace = %namespace, "data-plane run");
+
+    // 1. Publisher: SETUP, PUBLISH_NAMESPACE for the routing prefix, and
+    //    REQUEST_OK before the subscriber starts.
+    let (pub_session, pub_cid, pub_transport) =
+        phase("publisher connect", async { connect(args).await }).await?;
+    cids.add(pub_cid);
+    let (pub_session, mut publisher, _pub_subscriber) = phase("publisher SETUP", async {
+        Session::connect(pub_session, None, pub_transport)
+            .await
+            .map_err(Into::into)
+    })
+    .await?;
+
+    let publish_ns = publisher
+        .publish_namespace_start(prefix.clone())
+        .await
+        .context("failed to send PUBLISH_NAMESPACE")?;
+
+    // The publisher session runs for the rest of the test; it reads the
+    // REQUEST_OK and every upstream SUBSCRIBE.
+    let pub_session = tokio::spawn(async move { pub_session.run().await });
+    let pub_session = AbortOnDrop(pub_session);
+
+    phase("PUBLISH_NAMESPACE", async {
+        publish_ns
+            .ok()
+            .await
+            .context("PUBLISH_NAMESPACE was rejected")
+    })
+    .await?;
+    tracing::info!("PUBLISH_NAMESPACE accepted");
+
+    let publisher_log = PublisherLog::default();
+    let _serve = AbortOnDrop(tokio::spawn(serve_moq_test_prefix(
+        publisher,
+        publish_ns,
+        prefix.fields.clone(),
+        publisher_log.clone(),
+    )));
+
+    // 2. Subscriber: SETUP and SUBSCRIBE for the re-homed namespace, with
+    //    GROUP_ORDER Ascending and no other optional parameters.
+    let (sub_session, sub_cid, sub_transport) =
+        phase("subscriber connect", async { connect(args).await }).await?;
+    cids.add(sub_cid);
+    let (sub_session, _sub_publisher, mut subscriber) = phase("subscriber SETUP", async {
+        Session::connect(sub_session, None, sub_transport)
+            .await
+            .map_err(Into::into)
+    })
+    .await?;
+
+    let (sub_writer, sub_reader) = Track::new(namespace, DATA_PLANE_TRACK_NAME).produce();
+    let mut sub_params = KeyValuePairs::default();
+    sub_params.set_group_order(GroupOrder::Ascending);
+
+    let params = scenario.params.clone();
+    let subscribe_and_verify = async move {
+        let subscribe = phase("SUBSCRIBE", async {
+            subscriber
+                .subscribe_open_with_params(sub_writer, sub_params)
+                .await
+                .context("SUBSCRIBE failed")
+        })
+        .await?;
+        tracing::info!("downstream SUBSCRIBE_OK received");
+        verify(params, sub_reader, subscribe, false, StreamCountRule::Any).await
+    };
+
+    let report = tokio::select! {
+        res = subscribe_and_verify => res?,
+        res = sub_session.run() => {
+            res.context("subscriber session error")?;
+            bail!("subscriber session ended before verification completed");
+        }
+    };
+
+    // Publisher-side observations explain subscriber-side failures (a
+    // SUBSCRIBE that arrived with the wrong namespace, or a serve error), so
+    // they lead the report.
+    drop(pub_session);
+    let mut report = report;
+    let log = publisher_log.take();
+    if log.served == 0 {
+        report
+            .failures
+            .push("publisher never received an upstream SUBSCRIBE".to_string());
+    }
+    report.failures.splice(0..0, log.failures);
+
+    Ok((cids, report))
+}
+
+/// Serve upstream SUBSCRIBEs for moq-test tuples below `prefix`.
+///
+/// A SUBSCRIBE whose namespace is exactly the prefix queues on the
+/// PUBLISH_NAMESPACE handle; longer namespaces under it arrive on the
+/// publisher's general queue. Both go to [`serve_moq_test_subscribe`]. Any
+/// other namespace is rejected with DOES_NOT_EXIST.
+async fn serve_moq_test_prefix(
+    mut publisher: Publisher,
+    publish_ns: PublishNamespace,
+    prefix_fields: Vec<TupleField>,
+    log: PublisherLog,
+) -> Result<()> {
+    let prefix = TrackNamespacePrefix {
+        fields: prefix_fields,
+    };
+    let mut tasks = JoinSet::new();
+    loop {
+        let subscribed = tokio::select! {
+            res = publish_ns.subscribed() => match res {
+                Ok(Some(subscribed)) => subscribed,
+                Ok(None) => return Ok(()),
+                Err(err) => bail!("PUBLISH_NAMESPACE closed: {err}"),
+            },
+            subscribed = publisher.subscribed() => match subscribed {
+                Some(subscribed) => subscribed,
+                None => return Ok(()),
+            },
+            Some(res) = tasks.join_next() => {
+                if let Err(err) = res {
+                    log.fail(format!("publisher serve task failed: {err}"));
+                }
+                continue;
+            }
+        };
+
+        let namespace = subscribed.info.track_namespace.clone();
+        match MoqTestParams::from_namespace_under(&prefix, &namespace) {
+            Ok(params) => {
+                tracing::info!(namespace = %namespace, "serving moq-test SUBSCRIBE");
+                log.served();
+                let log = log.clone();
+                tasks.spawn(async move {
+                    if let Err(err) = serve_moq_test_subscribe(subscribed, params).await {
+                        log.fail(format!("publisher failed serving SUBSCRIBE: {err:#}"));
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!(namespace = %namespace, error = %err, "rejecting SUBSCRIBE");
+                log.fail(format!(
+                    "publisher rejected upstream SUBSCRIBE for {namespace}: {err:#}"
+                ));
+                let _ = subscribed.close(ServeError::not_found_ctx(format!("{err:#}")));
+            }
+        }
+    }
+}
+
+/// What the data-plane publisher observed, shared with the test driver.
+#[derive(Clone, Default)]
+struct PublisherLog(std::sync::Arc<std::sync::Mutex<PublisherLogState>>);
+
+#[derive(Default)]
+struct PublisherLogState {
+    served: u64,
+    failures: Vec<String>,
+}
+
+impl PublisherLog {
+    /// Lock the log, recovering from poisoning. Each update is a single
+    /// counter increment or push, so the state is consistent even if a
+    /// holder panicked; dropping updates instead would make the report claim
+    /// no upstream SUBSCRIBE arrived.
+    fn lock(&self) -> std::sync::MutexGuard<'_, PublisherLogState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn served(&self) {
+        self.lock().served += 1;
+    }
+
+    fn fail(&self, failure: String) {
+        self.lock().failures.push(failure);
+    }
+
+    fn take(&self) -> PublisherLogState {
+        std::mem::take(&mut *self.lock())
+    }
+}
+
+/// Generate the tuple's object set into a fresh track and serve it on
+/// `subscribed`; serving ends with PUBLISH_DONE (TRACK_ENDED and the exact
+/// Stream Count the generator opened).
+async fn serve_moq_test_subscribe(subscribed: Subscribed, params: MoqTestParams) -> Result<()> {
+    let (writer, reader) = Track::new(
+        subscribed.info.track_namespace.clone(),
+        subscribed.info.track_name.clone(),
+    )
+    .produce();
+    // Generation and serving run concurrently (see `run`): datagram mode
+    // would otherwise lose everything written before `serve` starts.
+    let generate = async { generate(&params, writer).await };
+    let serve = async {
+        subscribed
+            .serve(reader)
+            .await
+            .context("failed serving SUBSCRIBE")
+    };
+    let (gen_result, serve_result) = tokio::join!(generate, serve);
+    gen_result?;
+    serve_result
 }
 
 #[cfg(test)]
@@ -2065,6 +2417,111 @@ mod tests {
     }
 
     #[test]
+    fn data_subgroup_basic_tuple_matches_spec() {
+        // The canonical tuple from moq-interop-runner
+        // docs/tests/data-plane/data-subgroup-basic.md, revision 2.
+        let scenario = data_plane_scenario("data-subgroup-basic").unwrap().unwrap();
+        assert_eq!(scenario.spec_revision, 2);
+        assert_eq!(
+            scenario.params.to_namespace_fields().join("/"),
+            "moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0"
+        );
+        assert_eq!(scenario.params.expected_data_objects(), 15);
+        assert_eq!(scenario.params.expected_stream_count(), 3);
+    }
+
+    #[test]
+    fn rehomed_namespace_round_trips_below_routing_prefix() {
+        let scenario = data_plane_scenario("data-subgroup-basic").unwrap().unwrap();
+        let id = run_id();
+        assert_eq!(id.len(), 32);
+        assert!(id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+
+        let prefix = routing_prefix(scenario.id, &id);
+        let namespace = scenario.params.to_namespace_under(&prefix);
+        assert_eq!(namespace.fields.len(), 3 + NUM_TUPLE_FIELDS);
+        assert!(namespace.fields.len() <= TrackNamespace::MAX_FIELDS);
+        let fields: Vec<String> = namespace
+            .fields
+            .iter()
+            .map(|field| String::from_utf8(field.value.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            fields.join("/"),
+            format!(
+                "moq-test/data-subgroup-basic/{id}/moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0"
+            )
+        );
+
+        let prefix = TrackNamespacePrefix {
+            fields: prefix.fields,
+        };
+        let parsed = MoqTestParams::from_namespace_under(&prefix, &namespace).unwrap();
+        assert_eq!(parsed, scenario.params);
+    }
+
+    #[test]
+    fn rehomed_namespace_rejects_foreign_prefix_and_bad_tuple() {
+        let scenario = data_plane_scenario("data-subgroup-basic").unwrap().unwrap();
+        let ours = TrackNamespacePrefix {
+            fields: routing_prefix(scenario.id, "aaaa").fields,
+        };
+
+        // Another run's prefix: must not be served by this publisher.
+        let theirs = scenario
+            .params
+            .to_namespace_under(&routing_prefix(scenario.id, "bbbb"));
+        assert!(MoqTestParams::from_namespace_under(&ours, &theirs).is_err());
+
+        // The bare prefix carries no tuple.
+        let bare = routing_prefix(scenario.id, "aaaa");
+        assert!(MoqTestParams::from_namespace_under(&ours, &bare).is_err());
+
+        // A tuple with the wrong protocol tag.
+        let mut wrong = routing_prefix(scenario.id, "aaaa");
+        for field in scenario.params.to_namespace_fields().iter().skip(1) {
+            wrong.add(TupleField::from_utf8(field));
+        }
+        wrong.add(TupleField::from_utf8("0"));
+        assert!(MoqTestParams::from_namespace_under(&ours, &wrong).is_err());
+    }
+
+    #[test]
+    fn scoreboard_any_stream_count_accepts_relay_count() {
+        let mut sb = full_scoreboard();
+        sb.record_data(0, 0, Some(0), b"tttt", &ExtensionHeaders::new());
+        sb.record_data(0, 1, Some(0), b"tt", &ExtensionHeaders::new());
+        sb.record_eog(ObjectStatus::EndOfGroup, 0, 2, Some(0));
+        // Unknown-count sentinel 2^62 - 1 from a relay.
+        let report = sb.finish_with(
+            Some(&done(PublishDoneCode::TrackEnded as u64, (1 << 62) - 1)),
+            false,
+            StreamCountRule::Any,
+        );
+        assert!(report.passed(), "failures: {:?}", report.failures);
+    }
+
+    #[test]
+    fn publisher_log_survives_a_poisoned_lock() {
+        let log = PublisherLog::default();
+        log.served();
+        let poisoner = log.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().unwrap();
+            panic!("poison the publisher log");
+        })
+        .join();
+        assert!(log.0.is_poisoned());
+
+        log.fail("after poisoning".to_string());
+        let state = log.take();
+        assert_eq!(state.served, 1);
+        assert_eq!(state.failures, vec!["after poisoning".to_string()]);
+    }
+
+    #[test]
     fn all_builtin_scenarios_are_valid() {
         // An invalid built-in entry is a programmer error; fail here rather
         // than at lookup (which surfaces it as an ordinary error, not a
@@ -2077,6 +2534,16 @@ mod tests {
         assert!(
             invalid.is_empty(),
             "invalid built-in scenarios: {invalid:?}"
+        );
+
+        let invalid: Vec<&str> = DATA_PLANE_SCENARIOS
+            .iter()
+            .filter(|s| s.params.validate().is_err())
+            .map(|s| s.id)
+            .collect();
+        assert!(
+            invalid.is_empty(),
+            "invalid data-plane scenarios: {invalid:?}"
         );
     }
 }

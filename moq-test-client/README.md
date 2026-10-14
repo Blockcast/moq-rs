@@ -53,6 +53,18 @@ moq-test-client --relay https://localhost:4443 --tls-disable-verify
 | `publish-track-only` | Publisher sends direct PUBLISH, receives PUBLISH_OK, then sends PUBLISH_DONE |
 | `publish-track-subscribe` | Publisher sends direct PUBLISH, subscriber subscribes to the exact track |
 | `rendezvous-timeout` | Subscribe with RENDEZVOUS_TIMEOUT and expect REQUEST_ERROR TIMEOUT |
+| `data-subgroup-basic` | Publish a `moq-test/data-subgroup-basic/<run-id>` prefix, subscribe to a moq-test tuple below it, verify 15 objects over 3 subgroup streams |
+
+The `data-*` tests implement the moq-interop-runner data-plane specifications.
+The publisher sends PUBLISH_NAMESPACE for a run-unique routing prefix
+`("moq-test", <test-id>, <run-id>)` and acts as a moq-test
+(draft-afrind-moq-test) publisher rooted there: it generates the object set
+described by whatever 16-field `moq-test-00` tuple follows the prefix in an
+upstream SUBSCRIBE. The subscriber subscribes to the prefix plus the scenario's
+canonical tuple, so the relay must route by Namespace Prefix Matching.
+
+The `moq-test-*` tests use the same generator and scoreboard verifier with a
+subscribe-first, direct-PUBLISH choreography.
 
 ## Running with moq-relay
 
@@ -107,6 +119,7 @@ The test cases implemented here correspond to the specifications in [moq-interop
 | `publish-track-only` | MoQT §9.13-9.15 |
 | `publish-track-subscribe` | MoQT §5.1, §9.9-9.15 |
 | `rendezvous-timeout` | MoQT §10.2.6, §10.6 |
+| `data-subgroup-basic` | MoQT §9.5, §10.7-10.11, §11; [data-subgroup-basic.md](https://github.com/englishm/moq-interop-runner/blob/main/docs/tests/data-plane/data-subgroup-basic.md) revision 2 |
 
 Protocol references are to [draft-ietf-moq-transport-18](https://www.ietf.org/archive/id/draft-ietf-moq-transport-18.html).
 

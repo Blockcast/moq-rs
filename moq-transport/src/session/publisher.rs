@@ -258,26 +258,8 @@ impl Publisher {
     /// responses from the same stream. Requires `Session::run` to be driven
     /// concurrently, since `run` polls the bidi response reader.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        // Phase 1: allocate under lock, release before any await.
-        let (publish_ns, wire_msg, request_id, cancel) = {
-            let mut namespaces = self
-                .publish_namespaces
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-
-            if namespaces.contains_key(&tracks.namespace) {
-                return Err(ServeError::Duplicate.into());
-            }
-
-            let request_id = self.request_id.allocate()?;
-            let (send, recv, cancel) = PublishNamespace::new(request_id, tracks.namespace.clone());
-            namespaces.insert(tracks.namespace.clone(), recv);
-            let wire_msg = send.wire_message();
-            (send, wire_msg, request_id, cancel)
-        };
-        // Lock released here.
-
-        self.open_publish_namespace_stream(request_id, wire_msg, cancel)
+        let publish_ns = self
+            .publish_namespace_start(tracks.namespace.clone())
             .await?;
 
         let mut subscribe_tasks = FuturesUnordered::new();
@@ -328,6 +310,50 @@ impl Publisher {
                 else => return Ok(()),
             }
         }
+    }
+
+    /// Send PUBLISH_NAMESPACE and return the request handle without serving
+    /// it.
+    ///
+    /// [`Self::publish_namespace`] blocks for the life of the publication and
+    /// never reports REQUEST_OK. This returns as soon as the request is sent,
+    /// so a caller can await [`PublishNamespace::ok`] before acting on the
+    /// acceptance.
+    ///
+    /// SUBSCRIBE and TRACK_STATUS requests whose Track Namespace equals
+    /// `namespace` queue on the handle ([`PublishNamespace::subscribed`],
+    /// [`PublishNamespace::track_status_requested`]) and the caller must
+    /// serve them. Requests for longer namespaces under it arrive through
+    /// [`Self::subscribed`] instead. Dropping the handle cancels the
+    /// publication. `Session::run` must be driven concurrently, since it
+    /// polls the response stream.
+    pub async fn publish_namespace_start(
+        &mut self,
+        namespace: TrackNamespace,
+    ) -> Result<PublishNamespace, SessionError> {
+        // Phase 1: allocate under lock, release before any await.
+        let (publish_ns, wire_msg, request_id, cancel) = {
+            let mut namespaces = self
+                .publish_namespaces
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+
+            if namespaces.contains_key(&namespace) {
+                return Err(ServeError::Duplicate.into());
+            }
+
+            let request_id = self.request_id.allocate()?;
+            let (send, recv, cancel) = PublishNamespace::new(request_id, namespace.clone());
+            namespaces.insert(namespace, recv);
+            let wire_msg = send.wire_message();
+            (send, wire_msg, request_id, cancel)
+        };
+        // Lock released here.
+
+        self.open_publish_namespace_stream(request_id, wire_msg, cancel)
+            .await?;
+
+        Ok(publish_ns)
     }
 
     /// Open a PUBLISH_NAMESPACE request stream and cancel both halves when the
