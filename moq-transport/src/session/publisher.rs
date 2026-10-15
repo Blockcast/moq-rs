@@ -13,13 +13,13 @@ use crate::{
     coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
     mlog,
-    serve::{FullTrackName, ServeError, TrackReader, TracksReader},
+    serve::{ServeError, TrackReader, TracksReader},
 };
 
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, NameRegistry,
+    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, Fetched,
     ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
     PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed, SubscribedNamespace,
     SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks, SubscribedTracksInfo,
@@ -52,6 +52,10 @@ impl PublishedEntry {
         Ok(())
     }
 }
+
+/// How long a PUBLISH whose peer sent STOP_SENDING keeps reading for the
+/// peer's response before treating the request as cancelled.
+const PUBLISH_STOPPED_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct AbortPublishedOnDrop {
     publisher: Publisher,
@@ -91,22 +95,16 @@ pub struct Publisher {
     /// Active outbound PUBLISH requests, keyed by request id.
     publisheds: Arc<Mutex<HashMap<u64, PublishedEntry>>>,
 
-    /// Active outbound PUBLISHes keyed by Full Track Name, for the §5.1
-    /// same-role duplicate-subscription check.
-    published_names: Arc<Mutex<NameRegistry>>,
-
     /// When a Subscribe is received and we have a matching publish_namespace entry, the
     /// subscription is routed to that PublishNamespaceRecv.  Otherwise it goes here.
     subscribeds: Arc<Mutex<HashMap<u64, ObjectForwarderRecv>>>,
-
-    /// Active inbound SUBSCRIBEs keyed by Full Track Name.
-    subscribed_names: Arc<Mutex<NameRegistry>>,
 
     /// Subscriptions for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_subscribed: Queue<Subscribed>,
 
     /// TRACK_STATUS requests for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_track_status_requested: Queue<TrackStatusRequested>,
+    unknown_fetched: Queue<Fetched>,
 
     /// Active inbound SUBSCRIBE_NAMESPACE prefixes, keyed by Request ID.
     subscribed_namespace_prefixes: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
@@ -218,11 +216,10 @@ impl Publisher {
             webtransport,
             publish_namespaces: Default::default(),
             publisheds: Default::default(),
-            published_names: Default::default(),
             subscribeds: Default::default(),
-            subscribed_names: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
+            unknown_fetched: Default::default(),
             subscribed_namespace_prefixes: Default::default(),
             unknown_subscribed_namespace: Default::default(),
             subscribed_tracks_prefixes: Default::default(),
@@ -501,11 +498,6 @@ impl Publisher {
         track: TrackReader,
         mut params: KeyValuePairs,
     ) -> Result<Published, SessionError> {
-        let full_name = FullTrackName {
-            namespace: track.namespace.clone(),
-            name: track.name.clone(),
-        };
-
         if let Some(largest) = track.largest_location() {
             params
                 .set_largest_object(largest)
@@ -518,29 +510,9 @@ impl Publisher {
             .unwrap_or(true);
         let largest_location = params.largest_object().map_err(SessionError::Decode)?;
 
-        // §5.1: this endpoint can have at most one publisher-role subscription
-        // per track. Inbound SUBSCRIBE and outbound PUBLISH both make us the
-        // publisher, so the duplicate check spans both maps and stays atomic
-        // with the name reservation.
-        let request_id = {
-            let subscribed_names = self
-                .subscribed_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            let mut published_names = self
-                .published_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_name(&full_name)
-                || published_names.contains_name(&full_name)
-            {
-                return Err(SessionError::Serve(ServeError::Duplicate));
-            }
-
-            let request_id = self.request_id.allocate()?;
-            published_names.insert(full_name, request_id);
-            request_id
-        };
+        // §5.1: an endpoint MAY hold several subscriptions to one track, so a
+        // PUBLISH needs no name reservation.
+        let request_id = self.request_id.allocate()?;
 
         // The request ID doubles as the Track Alias, matching SUBSCRIBE serving.
         let track_alias = request_id;
@@ -565,10 +537,7 @@ impl Publisher {
                     PublishedEntry::new(PublishedRecv::new(recv_state)),
                 );
             }
-            Err(_) => {
-                self.drop_published_name(request_id);
-                return Err(SessionError::Internal);
-            }
+            Err(_) => return Err(SessionError::Internal),
         }
 
         let msg = message::Publish {
@@ -620,17 +589,41 @@ impl Publisher {
             .send(Box::pin(async move {
                 let mut abort = abort;
                 let mut reader = super::Reader::new(recv_stream);
+                // decode_bidi_response is not cancel-safe, so one long-lived
+                // future does all reading and hands complete frames over.
+                let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(1);
+                let read_responses = async move {
+                    loop {
+                        let response = Session::decode_bidi_response(&mut reader, request_id).await;
+                        let ended = response.is_err();
+                        if response_tx.send(response).await.is_err() || ended {
+                            break;
+                        }
+                    }
+                };
+                tokio::pin!(read_responses);
+                let mut read_responses_done = false;
                 // The peer may finish its half as soon as it has replied
                 // PUBLISH_OK. That does not end the request, so reading stops
                 // while the write half stays open for PUBLISH_DONE.
                 let mut reading = true;
                 let mut writer_closed = false;
+                // Set when STOP_SENDING arrives before the peer's half ended.
+                let mut stopped_deadline: Option<tokio::time::Instant> = None;
 
                 let result = loop {
                     tokio::select! {
+                        () = &mut read_responses, if !read_responses_done => {
+                            read_responses_done = true;
+                        }
+                        _ = tokio::time::sleep_until(stopped_deadline.unwrap_or_else(tokio::time::Instant::now)), if stopped_deadline.is_some() => {
+                            tracing::debug!(request_id, "peer stopped reading PUBLISH but kept its half open");
+                            abort.cancel_from_peer();
+                            break Ok(());
+                        }
                         // Messages we write on our own request stream
                         // (PUBLISH_DONE). Draft-18 omits the Request ID here.
-                        outgoing = stream_rx.recv() => {
+                        outgoing = stream_rx.recv(), if !writer_closed => {
                             let Some(mut outgoing) = outgoing else { break Ok(()) };
                             let terminal = matches!(outgoing.message, Message::PublishDone(_));
                             if let Err(err) = Session::encode_bidi_response(&mut writer, &outgoing.message).await {
@@ -659,11 +652,14 @@ impl Publisher {
                             }
                             outgoing.complete(Ok(()));
                         }
-                        // Not cancellation-safe: a frame half-read when the
-                        // write branch wins is lost. Safe only because that
-                        // branch always breaks out of the loop.
-                        response = Session::decode_bidi_response(&mut reader, request_id), if reading => {
+                        Some(response) = response_rx.recv(), if reading => {
                             match response {
+                                // Only a subscription's publisher may send it (§10.10).
+                                Ok(Message::PublishStateNotify(_)) => {
+                                    break Err(SessionError::ProtocolViolation(
+                                        "PUBLISH_STATE_NOTIFY from the subscriber of a PUBLISH".to_string(),
+                                    ));
+                                }
                                 Ok(msg) => match TryInto::<message::Subscriber>::try_into(msg) {
                                     Ok(sub_msg) => {
                                         if let Err(err) = this.recv_message(sub_msg) {
@@ -684,6 +680,10 @@ impl Publisher {
                                 Err(err) if err.is_stream_ended() => {
                                     tracing::debug!(request_id, error = %err, "PUBLISH response reader ended");
                                     reading = false;
+                                    if writer_closed {
+                                        abort.cancel_from_peer();
+                                        break Ok(());
+                                    }
                                 }
                                 // An undecodable frame is not a resynchronisation
                                 // point: draft-18 requires closing the session on an
@@ -691,8 +691,19 @@ impl Publisher {
                                 Err(err) => break Err(err),
                             }
                         }
-                        stopped = writer.closed() => {
+                        stopped = writer.closed(), if !writer_closed => {
                             match stopped {
+                                // A rejecting peer answers REQUEST_ERROR, FINs, and
+                                // stops reading. STOP_SENDING can be observed before
+                                // that response is read, so keep reading until the
+                                // peer's half ends; the response still wins.
+                                Ok(_) if reading => {
+                                    writer.reset(0);
+                                    writer_closed = true;
+                                    stopped_deadline = Some(
+                                        tokio::time::Instant::now() + PUBLISH_STOPPED_DRAIN_TIMEOUT,
+                                    );
+                                }
                                 Ok(_) => {
                                     abort.cancel_from_peer();
                                     writer.reset(0);
@@ -810,14 +821,7 @@ impl Publisher {
     }
 
     fn remove_published(&self, id: u64) -> Option<PublishedEntry> {
-        self.drop_published_name(id);
         self.publisheds.lock().ok()?.remove(&id)
-    }
-
-    fn drop_published_name(&self, id: u64) {
-        if let Ok(mut names) = self.published_names.lock() {
-            names.remove_by_request_id(id);
-        }
     }
 
     pub async fn serve_subscribe(
@@ -871,6 +875,11 @@ impl Publisher {
     /// Returns the next TRACK_STATUS request that did not match any active PUBLISH_NAMESPACE.
     pub async fn track_status_requested(&mut self) -> Option<TrackStatusRequested> {
         self.unknown_track_status_requested.pop().await
+    }
+
+    /// Returns the next FETCH for a namespace this session did not publish.
+    pub async fn fetched(&mut self) -> Option<Fetched> {
+        self.unknown_fetched.pop().await
     }
 
     /// Returns the next inbound SUBSCRIBE_NAMESPACE request.
@@ -937,6 +946,17 @@ impl Publisher {
         msg: message::SubscribeTracks,
     ) -> Result<SubscribedTracksRecv, SessionError> {
         let forward = msg.params.forward()?.unwrap_or(true);
+        if msg
+            .params
+            .range_filters(message::LOCAL_MAX_FILTER_RANGES)
+            .is_err()
+        {
+            return Ok(SubscribedTracksRecv::rejected(
+                msg.id,
+                RequestErrorCode::InvalidFilter as u64,
+                "invalid filter",
+            ));
+        }
         {
             let mut prefixes = self
                 .subscribed_tracks_prefixes
@@ -1022,10 +1042,7 @@ impl Publisher {
             // or our PUBLISH; the request ID says which.
             message::Subscriber::RequestError(msg) => self.recv_request_error(msg)?,
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
-            // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
-            message::Subscriber::Fetch(msg) => {
-                self.send_not_supported(msg.id, "fetch");
-            }
+            message::Subscriber::Fetch(msg) => self.recv_fetch(msg)?,
             // FETCH_CANCEL references an existing request; log and ignore.
             message::Subscriber::FetchCancel(msg) => {
                 tracing::debug!(
@@ -1049,23 +1066,6 @@ impl Publisher {
                     "PUBLISH_NAMESPACE_CANCEL is not part of draft-18".to_string(),
                 ));
             }
-            // Draft-18 removed the dedicated PUBLISH_OK type in favour of
-            // REQUEST_OK, so we never send it. Accepting it on receive keeps
-            // draft-16 peers working and costs nothing, since the payload is the
-            // same shape. Retiring the type belongs with the other draft-16
-            // leftovers still decoded here.
-            message::Subscriber::PublishOk(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "PUBLISH accepted with the draft-16 PUBLISH_OK type"
-                );
-                let msg = message::RequestOk {
-                    id: msg.id,
-                    params: msg.params,
-                };
-                self.recv_publish_ok(&msg)?;
-            }
         }
 
         Ok(())
@@ -1088,6 +1088,19 @@ impl Publisher {
                 error_code: RequestErrorCode::NotSupported as u64,
                 retry_interval: 0,
                 reason: crate::coding::ReasonPhrase("not supported".to_string()),
+            },
+        );
+    }
+
+    /// Send REQUEST_ERROR INVALID_FILTER (draft-20 §5.1.4).
+    fn send_invalid_filter(&mut self, request_id: u64, request_kind: &str) {
+        self.send_request_error(
+            request_kind,
+            message::RequestError {
+                id: request_id,
+                error_code: RequestErrorCode::InvalidFilter as u64,
+                retry_interval: 0,
+                reason: crate::coding::ReasonPhrase("invalid filter".to_string()),
             },
         );
     }
@@ -1215,10 +1228,7 @@ impl Publisher {
 
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
-        let full_name = FullTrackName {
-            namespace: msg.track_namespace.clone(),
-            name: msg.track_name.clone(),
-        };
+        let request_id = msg.id;
 
         let subscribed = {
             let mut subscribeds = self
@@ -1226,56 +1236,28 @@ impl Publisher {
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
 
+            // §10.1: a reused Request ID closes the session. A second SUBSCRIBE
+            // for the same track under a new ID is a separate subscription
+            // (§5.1), so there is no name check.
             if subscribeds.contains_key(&msg.id) {
-                let id = msg.id;
-                drop(subscribeds);
-                // Draft-16 §5.1: duplicate SUBSCRIBE for the same request ID
-                // MUST be rejected with DUPLICATE_SUBSCRIPTION, not a session close.
-                self.send_request_error(
-                    "subscribe",
-                    message::RequestError {
-                        id,
-                        error_code: RequestErrorCode::DuplicateSubscription as u64,
-                        retry_interval: 0,
-                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
-                    },
-                );
-                return Ok(());
+                return Err(SessionError::InvalidRequestId);
             }
 
-            let mut subscribed_names = self
-                .subscribed_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            let published_names = self
-                .published_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_name(&full_name)
-                || published_names.contains_name(&full_name)
+            if msg
+                .params
+                .range_filters(message::LOCAL_MAX_FILTER_RANGES)
+                .is_err()
             {
-                let id = msg.id;
-                drop(published_names);
-                drop(subscribed_names);
-                drop(subscribeds);
-                self.send_request_error(
-                    "subscribe",
-                    message::RequestError {
-                        id,
-                        error_code: RequestErrorCode::DuplicateSubscription as u64,
-                        retry_interval: 0,
-                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
-                    },
-                );
-                return Ok(());
+                None
+            } else {
+                let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
+                subscribeds.insert(send.info.id, recv);
+                Some(send)
             }
-            drop(published_names);
-
-            let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
-            subscribed_names.insert(full_name, send.info.id);
-            subscribeds.insert(send.info.id, recv);
-
-            send
+        };
+        let Some(subscribed) = subscribed else {
+            self.send_invalid_filter(request_id, "subscribe");
+            return Ok(());
         };
 
         // Route to an active PUBLISH_NAMESPACE if present.
@@ -1296,6 +1278,36 @@ impl Publisher {
             )))?;
         }
 
+        Ok(())
+    }
+
+    fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
+        // Malformed values close the session (§5.1.2, §10.2.8).
+        msg.params.location_filter()?;
+        msg.params.group_order()?;
+        if msg
+            .params
+            .range_filters(message::LOCAL_MAX_FILTER_RANGES)
+            .is_err()
+        {
+            self.send_invalid_filter(msg.id, "fetch");
+            return Ok(());
+        }
+
+        // ponytail: a namespace this session published serves no FETCH yet;
+        // PublishNamespace hands out tracks, not the request queue a FETCH needs.
+        if self
+            .publish_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .contains_key(&msg.track_namespace)
+        {
+            self.send_not_supported(msg.id, "fetch");
+            return Ok(());
+        }
+
+        // A full queue drops the FETCH, which answers REQUEST_ERROR.
+        let _ = self.unknown_fetched.push(Fetched::new(self.clone(), msg));
         Ok(())
     }
 
@@ -1395,7 +1407,6 @@ impl Publisher {
                 let _ = subscribed.recv_unsubscribe();
             }
         }
-        let _ = Self::drop_subscribed_name(&self.subscribed_names, id);
     }
 
     fn remove_subscribe(&mut self, id: u64) -> Result<(), SessionError> {
@@ -1403,18 +1414,6 @@ impl Publisher {
             .lock()
             .map_err(|_| SessionError::Internal)?
             .remove(&id);
-        Self::drop_subscribed_name(&self.subscribed_names, id)
-    }
-
-    fn drop_subscribed_name(
-        subscribed_names: &Arc<Mutex<NameRegistry>>,
-        id: u64,
-    ) -> Result<(), SessionError> {
-        subscribed_names
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .remove_by_request_id(id);
-
         Ok(())
     }
 
@@ -1455,24 +1454,23 @@ impl Publisher {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-    };
+    use std::collections::HashMap;
 
     use crate::{
         coding::{KeyValuePairs, ReasonPhrase, TrackName, TrackNamespace, TrackNamespacePrefix},
         data,
         message::{self, Message},
         serve::{self, FullTrackName, ServeError, Tracks},
-        session::{test_support::loopback_session_pair, Reader, RequestId, Session, Writer},
+        session::{
+            test_support::loopback_session_pair, Reader, RequestId, Session, SessionError, Writer,
+        },
         watch::Queue,
     };
     use bytes::Bytes;
 
     use super::{
-        split_published_state, AbortPublishedOnDrop, NameRegistry, PublishNamespace,
-        PublishedEntry, PublishedRecv, Publisher,
+        split_published_state, AbortPublishedOnDrop, PublishNamespace, PublishedEntry,
+        PublishedRecv, Publisher,
     };
 
     fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
@@ -1509,7 +1507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_rejects_name_reserved_by_outbound_publish() {
+    async fn subscribe_accepts_a_second_subscription_to_the_same_track() {
         let (publisher_session, _peer_session) = loopback_session_pair().await;
         let (outgoing, mut outgoing_recv) = Queue::default().split();
         let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1521,54 +1519,123 @@ mod tests {
             bidi_task_tx,
         );
         let full_name = full_track_name("room/123", "video");
-        publisher
-            .published_names
-            .lock()
-            .unwrap()
-            .insert(full_name.clone(), 1);
+        // §5.1: concurrent subscriptions to one track are allowed, each under
+        // its own Request ID. This is what lets a replacement SUBSCRIBE race
+        // the cancellation of the one it replaces.
+        for id in [0, 2] {
+            publisher
+                .recv_subscribe(message::Subscribe {
+                    id,
+                    track_namespace: full_name.namespace.clone(),
+                    track_name: full_name.name.clone(),
+                    params: KeyValuePairs::default(),
+                })
+                .unwrap();
+        }
+        assert_eq!(publisher.subscribeds.lock().unwrap().len(), 2);
+        assert!(
+            futures::FutureExt::now_or_never(outgoing_recv.pop()).is_none(),
+            "no REQUEST_ERROR"
+        );
 
-        publisher
-            .recv_subscribe(message::Subscribe {
+        // §10.1: reusing a Request ID is a session error, not a REQUEST_ERROR.
+        assert!(matches!(
+            publisher.recv_subscribe(message::Subscribe {
                 id: 2,
                 track_namespace: full_name.namespace,
                 track_name: full_name.name,
                 params: KeyValuePairs::default(),
+            }),
+            Err(SessionError::InvalidRequestId)
+        ));
+    }
+
+    fn subgroup_filter_params() -> KeyValuePairs {
+        let mut params = KeyValuePairs::default();
+        params
+            .push_range_filter(
+                message::parameter_type::SUBGROUP_FILTER,
+                Some(&message::RangeFilter {
+                    set_id: 0,
+                    property_type: None,
+                    ranges: vec![(0, Some(1))],
+                }),
+            )
+            .unwrap();
+        params
+    }
+
+    fn is_invalid_filter(msg: Option<Message>, id: u64) -> bool {
+        matches!(
+            msg,
+            Some(Message::RequestError(err))
+                if err.id == id
+                    && err.error_code == message::RequestErrorCode::InvalidFilter as u64
+        )
+    }
+
+    /// This endpoint grants MAX_FILTER_RANGES 0, so a peer may send no Range
+    /// Filter; one that does gets REQUEST_ERROR INVALID_FILTER (draft-20
+    /// §10.3.1.6), not a subscription that silently ignores the filter.
+    #[tokio::test]
+    async fn range_filters_beyond_the_granted_limit_are_invalid_filter() {
+        let (publisher_session, _peer_session) = loopback_session_pair().await;
+        let (outgoing, mut outgoing_recv) = Queue::default().split();
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let full_name = full_track_name("room/123", "video");
+
+        publisher
+            .recv_subscribe(message::Subscribe {
+                id: 0,
+                track_namespace: full_name.namespace.clone(),
+                track_name: full_name.name.clone(),
+                params: subgroup_filter_params(),
             })
             .unwrap();
+        assert!(publisher.subscribeds.lock().unwrap().is_empty());
+        let reply = futures::FutureExt::now_or_never(outgoing_recv.pop()).flatten();
+        assert!(is_invalid_filter(reply, 0));
 
-        let Some(Message::RequestError(error)) = outgoing_recv.pop().await else {
-            panic!("expected REQUEST_ERROR");
-        };
-        assert_eq!(error.id, 2);
-        assert_eq!(
-            error.error_code,
-            message::RequestErrorCode::DuplicateSubscription as u64
-        );
+        publisher
+            .recv_fetch(message::Fetch {
+                id: 4,
+                track_namespace: full_name.namespace.clone(),
+                track_name: full_name.name.clone(),
+                params: subgroup_filter_params(),
+            })
+            .unwrap();
+        let reply = futures::FutureExt::now_or_never(outgoing_recv.pop()).flatten();
+        assert!(is_invalid_filter(reply, 4));
+        assert!(futures::FutureExt::now_or_never(publisher.fetched()).is_none());
+
+        let mut tracks = publisher
+            .recv_subscribe_tracks(message::SubscribeTracks {
+                id: 2,
+                track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("room"),
+                params: subgroup_filter_params(),
+            })
+            .unwrap();
+        assert!(is_invalid_filter(tracks.try_take_message(), 2));
+        // A rejected request reserves no prefix and reaches no application.
+        assert!(publisher
+            .subscribed_tracks_prefixes
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(futures::FutureExt::now_or_never(publisher.subscribed_tracks()).is_none());
     }
 
     fn subgroup_track() -> (serve::SubgroupsWriter, serve::TrackReader) {
         let (writer, reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
         (writer.subgroups().unwrap(), reader)
-    }
-
-    #[test]
-    fn drop_subscribed_name_removes_only_matching_request_id() {
-        let subscribed_names = Arc::new(Mutex::new(NameRegistry::default()));
-        let unsubscribed_track = full_track_name("bb1", "video.m4s");
-        let active_track = full_track_name("bb1", "audio.m4s");
-
-        {
-            let mut names = subscribed_names.lock().unwrap();
-            names.insert(unsubscribed_track.clone(), 6);
-            names.insert(active_track.clone(), 8);
-        }
-
-        Publisher::drop_subscribed_name(&subscribed_names, 6).unwrap();
-
-        let names = subscribed_names.lock().unwrap();
-        assert!(!names.contains_name(&unsubscribed_track));
-        assert_eq!(names.get_by_name(&active_track), Some(8));
     }
 
     #[test]
@@ -1605,12 +1672,6 @@ mod tests {
             bidi_task_tx,
         );
         let request_id = 0;
-        let track = full_track_name("test", "track");
-        publisher
-            .published_names
-            .lock()
-            .unwrap()
-            .insert(track.clone(), request_id);
         let (_state, recv_state) = split_published_state(true);
         publisher.publisheds.lock().unwrap().insert(
             request_id,
@@ -1622,11 +1683,6 @@ mod tests {
             request_id: Some(request_id),
         });
 
-        assert!(!publisher
-            .published_names
-            .lock()
-            .unwrap()
-            .contains_name(&track));
         assert!(!publisher
             .publisheds
             .lock()
@@ -1908,13 +1964,86 @@ mod tests {
         let mut request_reader = request.await.unwrap();
         assert!(request_reader.done().await.unwrap());
         request_driver.await.unwrap().unwrap();
-        assert!(!publisher
-            .published_names
-            .lock()
-            .unwrap()
-            .contains_name(&full_track_name("test", "track")));
+        assert!(publisher.publisheds.lock().unwrap().is_empty());
         drop(subgroup);
         drop(subgroups);
+    }
+
+    /// Opens an outbound PUBLISH against a loopback peer. Returns the peer's
+    /// halves of the request stream, the publisher's pump, and the PUBLISH.
+    async fn open_outbound_publish() -> (
+        Writer,
+        Reader,
+        tokio::task::JoinHandle<Result<(), crate::session::SessionError>>,
+        crate::session::Published,
+        web_transport::Session,
+    ) {
+        let (publisher_session, peer_session) = loopback_session_pair().await;
+        let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+        let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            outgoing,
+            publisher_session,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let request_peer = peer_session.clone();
+        let request = tokio::spawn(async move {
+            let (send_stream, recv_stream) = request_peer.accept_bi().await.unwrap();
+            let mut reader = Reader::new(recv_stream);
+            let Message::Publish(_) = reader.decode().await.unwrap() else {
+                panic!("expected PUBLISH request");
+            };
+            (Writer::new(send_stream), reader)
+        });
+        let (_subgroups, reader) = subgroup_track();
+        let published = publisher
+            .publish(reader, KeyValuePairs::default())
+            .await
+            .unwrap();
+        let driver = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        let (writer, reader) = request.await.unwrap();
+        (writer, reader, driver, published, peer_session)
+    }
+
+    /// PUBLISH_STATE_NOTIFY is only sent by a subscription's publisher, so one
+    /// arriving from the subscriber of our PUBLISH closes the session (§10.10).
+    #[tokio::test]
+    async fn publish_state_notify_from_publish_subscriber_is_a_protocol_violation() {
+        let (mut writer, _reader, driver, _published, _peer) = open_outbound_publish().await;
+        Session::encode_bidi_response(
+            &mut writer,
+            &Message::PublishStateNotify(message::PublishStateNotify::default()),
+        )
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(crate::session::SessionError::ProtocolViolation(_))
+        ));
+    }
+
+    /// A peer that sends STOP_SENDING but never ends its own half cancels the
+    /// PUBLISH once the drain timeout passes, rather than pinning it forever.
+    #[tokio::test]
+    async fn publish_stopped_without_response_is_cancelled_after_drain_timeout() {
+        let (_writer, mut reader, driver, mut published, _peer) = open_outbound_publish().await;
+        reader.stop(0);
+
+        let result = tokio::time::timeout(
+            super::PUBLISH_STOPPED_DRAIN_TIMEOUT + std::time::Duration::from_secs(2),
+            published.ok(),
+        )
+        .await
+        .expect("PUBLISH stayed pending after STOP_SENDING");
+        assert!(matches!(result, Err(serve::ServeError::Cancel)));
+        driver.await.unwrap().unwrap();
     }
 
     #[tokio::test]

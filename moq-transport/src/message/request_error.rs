@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! REQUEST_ERROR message (draft-ietf-moq-transport-18 §10.6).
+//! REQUEST_ERROR message (draft-ietf-moq-transport-20 §10.6).
 //!
 //! Sent in response to any request (SUBSCRIBE, FETCH, PUBLISH,
 //! SUBSCRIBE_NAMESPACE, PUBLISH_NAMESPACE, TRACK_STATUS, REQUEST_UPDATE).
@@ -9,7 +9,7 @@
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, ReasonPhrase};
 
-/// REQUEST_ERROR codes from the draft-18 §15.10.2 IANA registry.
+/// REQUEST_ERROR codes from the draft-20 §15.11.2 IANA registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub enum RequestErrorCode {
@@ -24,11 +24,9 @@ pub enum RequestErrorCode {
     DoesNotExist = 0x10,
     InvalidRange = 0x11,
     MalformedTrack = 0x12,
-    DuplicateSubscription = 0x19,
     Uninterested = 0x20,
     PrefixOverlap = 0x30,
     NamespaceTooLarge = 0x31,
-    InvalidJoiningRequestId = 0x32,
     /// Required by §2.5.1 when a peer does not understand a Mandatory Track
     /// Property (types 0x4000-0x7FFF) carried by PUBLISH, SUBSCRIBE_OK or
     /// FETCH_OK.
@@ -38,6 +36,8 @@ pub enum RequestErrorCode {
     /// Recognise it on receive; do not send it until the structure is
     /// implemented.
     Redirect = 0x34,
+    ConflictingFilters = 0x35,
+    InvalidFilter = 0x36,
 }
 
 impl From<RequestErrorCode> for u64 {
@@ -141,13 +141,13 @@ mod tests {
         assert_eq!(RequestErrorCode::DoesNotExist as u64, 0x10);
         assert_eq!(RequestErrorCode::InvalidRange as u64, 0x11);
         assert_eq!(RequestErrorCode::MalformedTrack as u64, 0x12);
-        assert_eq!(RequestErrorCode::DuplicateSubscription as u64, 0x19);
         assert_eq!(RequestErrorCode::Uninterested as u64, 0x20);
         assert_eq!(RequestErrorCode::PrefixOverlap as u64, 0x30);
         assert_eq!(RequestErrorCode::NamespaceTooLarge as u64, 0x31);
-        assert_eq!(RequestErrorCode::InvalidJoiningRequestId as u64, 0x32);
         assert_eq!(RequestErrorCode::UnsupportedExtension as u64, 0x33);
         assert_eq!(RequestErrorCode::Redirect as u64, 0x34);
+        assert_eq!(RequestErrorCode::ConflictingFilters as u64, 0x35);
+        assert_eq!(RequestErrorCode::InvalidFilter as u64, 0x36);
     }
 
     #[test]
@@ -185,25 +185,23 @@ mod tests {
         assert!(decoded.is_fatal());
     }
 
+    /// Draft-20 retired DUPLICATE_SUBSCRIPTION (0x19) and
+    /// INVALID_JOINING_REQUEST_ID (0x32). A peer may still send them; they
+    /// decode as opaque codes.
     #[test]
-    fn duplicate_subscription_rejection() {
-        // Verify DUPLICATE_SUBSCRIPTION can be encoded and decoded.
-        let mut buf = bytes::BytesMut::new();
-        let msg = RequestError::new(
-            4,
-            RequestErrorCode::DuplicateSubscription,
-            0,
-            "duplicate subscription",
-        );
-        msg.encode(&mut buf).unwrap();
-        let decoded = RequestError::decode(&mut buf).unwrap();
-        assert_eq!(decoded.id, 4);
-        assert_eq!(
-            decoded.error_code,
-            RequestErrorCode::DuplicateSubscription as u64
-        );
-        assert_eq!(decoded.retry_interval, 0);
-        assert!(decoded.is_fatal());
+    fn retired_codes_decode_as_opaque() {
+        for code in [0x19, 0x32] {
+            let mut buf = bytes::BytesMut::new();
+            RequestError {
+                id: 4,
+                error_code: code,
+                retry_interval: 0,
+                reason: ReasonPhrase(String::new()),
+            }
+            .encode(&mut buf)
+            .unwrap();
+            assert_eq!(RequestError::decode(&mut buf).unwrap().error_code, code);
+        }
     }
 
     #[test]

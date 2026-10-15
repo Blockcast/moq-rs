@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
@@ -11,7 +11,7 @@ use moq_transport::{
     message::RequestErrorCode,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{
-        Publisher, ServeWithDeadlineError, SessionError, Subscribed, SubscribedNamespace,
+        Fetched, Publisher, ServeWithDeadlineError, SessionError, Subscribed, SubscribedNamespace,
         SubscribedTracks, TrackStatusRequested,
     },
 };
@@ -51,9 +51,9 @@ struct SubscribeTracksSlot {
     desired: Option<TrackReader>,
     active: Option<TrackReader>,
     /// draft-18 section 6.1 forbids a later PUBLISH for this track after
-    /// PUBLISH_BLOCKED. The parent SUBSCRIBE_TRACKS owns this tombstone until
+    /// PUBLISH_SKIPPED. The parent SUBSCRIBE_TRACKS owns this tombstone until
     /// it is cancelled, which drops its slot map and releases the permit.
-    publish_blocked_tombstone: bool,
+    publish_skipped_tombstone: bool,
     _session_slot_permit: OwnedSemaphorePermit,
 }
 
@@ -66,7 +66,7 @@ enum SubscribeTracksSlotAction {
 
 impl SubscribeTracksSlot {
     fn set_desired(&mut self, track: TrackReader) -> bool {
-        if self.publish_blocked_tombstone
+        if self.publish_skipped_tombstone
             || self
                 .active
                 .as_ref()
@@ -93,7 +93,7 @@ impl SubscribeTracksSlot {
         {
             self.desired = None;
         }
-        if self.active.is_some() || self.publish_blocked_tombstone {
+        if self.active.is_some() || self.publish_skipped_tombstone {
             SubscribeTracksSlotAction::None
         } else if self.desired.is_some() {
             SubscribeTracksSlotAction::Publish
@@ -110,7 +110,7 @@ impl SubscribeTracksSlot {
         {
             self.desired = None;
         }
-        self.active.is_none() && self.desired.is_none() && !self.publish_blocked_tombstone
+        self.active.is_none() && self.desired.is_none() && !self.publish_skipped_tombstone
     }
 }
 
@@ -208,6 +208,42 @@ pub struct Producer {
     subscribe_tracks_session_child_permits: Arc<Semaphore>,
     /// Shared only by SUBSCRIBE_TRACKS requests on this transport session.
     subscribe_tracks_session_slot_permits: Arc<Semaphore>,
+    /// Full Track Names this session has an inbound SUBSCRIBE for, held or
+    /// established, counted because draft-20 allows several per track.
+    inbound_subscribes: Arc<Mutex<HashMap<FullTrackName, usize>>>,
+}
+
+/// Registers one inbound SUBSCRIBE in [`Producer::inbound_subscribes`] until
+/// dropped.
+struct InboundSubscribe {
+    names: Arc<Mutex<HashMap<FullTrackName, usize>>>,
+    full_name: FullTrackName,
+}
+
+impl InboundSubscribe {
+    fn new(names: &Arc<Mutex<HashMap<FullTrackName, usize>>>, full_name: FullTrackName) -> Self {
+        *names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(full_name.clone())
+            .or_default() += 1;
+        Self {
+            names: names.clone(),
+            full_name,
+        }
+    }
+}
+
+impl Drop for InboundSubscribe {
+    fn drop(&mut self) {
+        let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = names.get_mut(&self.full_name) {
+            *count -= 1;
+            if *count == 0 {
+                names.remove(&self.full_name);
+            }
+        }
+    }
 }
 
 /// Why the wait for upstream readiness ended without the subscription being
@@ -266,6 +302,7 @@ impl Producer {
             subscribe_tracks_session_slot_permits: Arc::new(Semaphore::new(
                 MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
             )),
+            inbound_subscribes: Default::default(),
         }
     }
 
@@ -325,6 +362,7 @@ impl Producer {
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
+            let mut publisher_fetched = self.publisher.clone();
             let mut publisher_subscribed_namespace = self.publisher.clone();
             let mut publisher_subscribed_tracks = self.publisher.clone();
 
@@ -366,6 +404,17 @@ impl Producer {
                         // Serve the track_status request
                         if let Err(err) = this.serve_track_status(track_status_requested).await {
                             tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving track_status: {:?}, error: {}", info, err)
+                        }
+                    }.boxed())
+                },
+                Some(fetched) = publisher_fetched.fetched() => {
+                    let this = self.clone();
+                    tasks.push(async move {
+                        let namespace = fetched.msg.track_namespace.to_utf8_path();
+                        let track_name = fetched.msg.track_name.clone();
+                        tracing::info!(namespace = %namespace, track = %track_name, "serving fetch");
+                        if let Err(err) = this.serve_fetch(fetched).await {
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving fetch");
                         }
                     }.boxed())
                 },
@@ -468,6 +517,9 @@ impl Producer {
             namespace: namespace.clone(),
             name: track_name.clone(),
         };
+        // Registered before the hold starts waiting, so the publisher arrival
+        // that wakes it cannot also generate a SUBSCRIBE_TRACKS PUBLISH.
+        let _inbound = InboundSubscribe::new(&self.inbound_subscribes, full_name.clone());
 
         // Re-entered after a publisher appears. The lookup is repeated rather
         // than trusting the wake, because `Consumer::serve_track` emits
@@ -908,11 +960,8 @@ impl Producer {
     /// serving the same scope. The recheck interval covers that by ending the wait
     /// periodically for the caller to ask the coordinator again.
     ///
-    /// Waking the subscriber promptly matters beyond tidiness. A held
-    /// subscription keeps its entry in the publisher's per-session name map, and
-    /// a second SUBSCRIBE for the same track on that session is rejected with
-    /// DUPLICATE_SUBSCRIPTION, so a subscriber that gave up and retried would be
-    /// turned away by its own abandoned hold.
+    /// Waking the subscriber promptly matters beyond tidiness: an abandoned
+    /// hold keeps its subscription state until the wait ends.
     async fn await_rendezvous(
         subscribed: &Subscribed,
         scope: Option<&str>,
@@ -1241,7 +1290,7 @@ impl Producer {
                 SubscribeTracksSlot {
                     desired: Some(track),
                     active: None,
-                    publish_blocked_tombstone: false,
+                    publish_skipped_tombstone: false,
                     _session_slot_permit: permit,
                 },
             );
@@ -1318,7 +1367,7 @@ impl Producer {
                                 slots.insert(full_name.clone(), SubscribeTracksSlot {
                                     desired: Some(track),
                                     active: None,
-                                    publish_blocked_tombstone: false,
+                                    publish_skipped_tombstone: false,
                                     _session_slot_permit: permit,
                                 });
                             }
@@ -1390,7 +1439,7 @@ impl Producer {
             .map(|track| (full_name_for_track(&track), track))
             .collect();
         for (full_name, slot) in slots.iter_mut() {
-            if slot.publish_blocked_tombstone {
+            if slot.publish_skipped_tombstone {
                 continue;
             }
             slot.desired = current.get(full_name).cloned();
@@ -1415,7 +1464,7 @@ impl Producer {
                 SubscribeTracksSlot {
                     desired: Some(track),
                     active: None,
-                    publish_blocked_tombstone: false,
+                    publish_skipped_tombstone: false,
                     _session_slot_permit: permit,
                 },
             );
@@ -1423,7 +1472,7 @@ impl Producer {
         let pending: Vec<_> = slots
             .iter()
             .filter(|(_, slot)| {
-                slot.desired.is_some() && slot.active.is_none() && !slot.publish_blocked_tombstone
+                slot.desired.is_some() && slot.active.is_none() && !slot.publish_skipped_tombstone
             })
             .map(|(full_name, _)| full_name.clone())
             .collect();
@@ -1432,7 +1481,7 @@ impl Producer {
                 .await?;
         }
         slots.retain(|_, slot| {
-            slot.desired.is_some() || slot.active.is_some() || slot.publish_blocked_tombstone
+            slot.desired.is_some() || slot.active.is_some() || slot.publish_skipped_tombstone
         });
         Ok(())
     }
@@ -1448,12 +1497,27 @@ impl Producer {
         let Some(slot) = slots.get(full_name) else {
             return Ok(());
         };
-        if slot.active.is_some() || slot.publish_blocked_tombstone {
+        if slot.active.is_some() || slot.publish_skipped_tombstone {
             return Ok(());
         }
         let Some(track) = slot.desired.clone() else {
             return Ok(());
         };
+
+        // Draft-20 section 9.5: a relay holding a downstream SUBSCRIBE for this
+        // track MUST answer that SUBSCRIBE and MUST NOT also forward the
+        // PUBLISH. An established SUBSCRIBE already delivers the track, so it
+        // suppresses the generated PUBLISH as well. The slot is dropped; a
+        // later change event for the track asks again.
+        if self
+            .inbound_subscribes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(full_name)
+        {
+            slots.remove(full_name);
+            return Ok(());
+        }
 
         // SUBSCRIBE_TRACKS grants discovery of a prefix, not delivery of
         // everything under it. This path pushes PUBLISH and then streams the
@@ -1494,12 +1558,12 @@ impl Producer {
         {
             Ok(permit) => permit,
             Err(_) => {
-                request.publish_blocked(&full_name.namespace, &full_name.name)?;
+                request.publish_skipped(&full_name.namespace, &full_name.name)?;
                 if let Some(slot) = slots.get_mut(full_name) {
                     // This terminal marker is retained only until this parent
                     // SUBSCRIBE_TRACKS ends; draft-18 section 6.1 forbids a
                     // later generated PUBLISH for the same track.
-                    slot.publish_blocked_tombstone = true;
+                    slot.publish_skipped_tombstone = true;
                     slot.desired = None;
                 }
                 return Ok(());
@@ -1528,10 +1592,6 @@ impl Producer {
             published = publish => published,
         } {
             Ok(published) => published,
-            Err(SessionError::Serve(ServeError::Duplicate)) => {
-                slots.remove(full_name);
-                return Ok(());
-            }
             Err(error) if !error.is_session_fatal() => {
                 tracing::warn!(
                     namespace = %full_name.namespace.to_utf8_path(),
@@ -1591,6 +1651,40 @@ impl Producer {
     /// more, rather than a failure worth warning about.
     fn is_expected_serve_shutdown_err(err: &ServeError) -> bool {
         matches!(err, ServeError::Cancel | ServeError::Done)
+    }
+
+    /// Serve a FETCH from the Objects a local track holds.
+    async fn serve_fetch(self, mut fetched: Fetched) -> Result<(), anyhow::Error> {
+        let full_name = FullTrackName {
+            namespace: fetched.msg.track_namespace.clone(),
+            name: fetched.msg.track_name.clone(),
+        };
+
+        // Authorize before the lookup, as for TRACK_STATUS: an answer would
+        // reveal whether the track exists.
+        if let Err(reason) = authorize(
+            self.auth.as_ref(),
+            &self.context,
+            AuthzOperation::Fetch {
+                namespace: &full_name.namespace,
+                track: &full_name.name,
+            },
+            Some(fetched.msg.id),
+        )
+        .await
+        {
+            fetched.respond_error(reason.request_error_code(), "unauthorized");
+            return Err(anyhow::anyhow!("unauthorized fetch"));
+        }
+
+        // ponytail: local tracks only; an upstream FETCH for a remote track
+        // is a later step, so such a track reads as not found here.
+        if let Some(track) = self.locals.retrieve_track(self.context.scope(), &full_name) {
+            return Ok(fetched.serve(track).await?);
+        }
+
+        fetched.respond_error(RequestErrorCode::DoesNotExist as u64, "track not found");
+        Ok(())
     }
 
     /// Serve a track_status request.
@@ -1753,9 +1847,10 @@ mod tests {
             Decode, DecodeError, Encode, KeyValuePairs, TrackName, TrackNamespace,
             TrackNamespacePrefix,
         },
-        message::{wire_id, Message, PublishBlocked, RequestErrorCode, SubscribeTracks},
+        data::FetchItem,
+        message::{wire_id, Message, PublishSkipped, RequestErrorCode, SubscribeTracks},
         serve::{ServeError, Track},
-        session::{Session as TransportSession, SessionError, Subscriber, Transport},
+        session::{FetchError, Session as TransportSession, SessionError, Subscriber, Transport},
     };
     use tokio::sync::Semaphore;
 
@@ -2083,7 +2178,7 @@ mod tests {
             SubscribeTracksSlot {
                 desired: None,
                 active: None,
-                publish_blocked_tombstone: true,
+                publish_skipped_tombstone: true,
                 _session_slot_permit: permit,
             },
         )]);
@@ -2148,10 +2243,10 @@ mod tests {
             read_bidi_response_frame(&mut response_recv, &mut response_buffer),
         )
         .await
-        .expect("PUBLISH_BLOCKED timed out");
-        assert_eq!(message_type, wire_id::PublishBlocked);
-        let blocked = PublishBlocked::decode(&mut Cursor::new(payload))
-            .expect("decode PUBLISH_BLOCKED payload");
+        .expect("PUBLISH_SKIPPED timed out");
+        assert_eq!(message_type, wire_id::PublishSkipped);
+        let blocked = PublishSkipped::decode(&mut Cursor::new(payload))
+            .expect("decode PUBLISH_SKIPPED payload");
         assert_eq!(blocked.track_name, TrackName::from("blocked"));
         assert_eq!(slot_permits.available_permits(), 1);
 
@@ -2198,10 +2293,10 @@ mod tests {
             read_bidi_response_frame(&mut response_recv, &mut response_buffer),
         )
         .await
-        .expect("resynced PUBLISH_BLOCKED timed out");
-        assert_eq!(message_type, wire_id::PublishBlocked);
-        let blocked = PublishBlocked::decode(&mut Cursor::new(payload))
-            .expect("decode resynced PUBLISH_BLOCKED payload");
+        .expect("resynced PUBLISH_SKIPPED timed out");
+        assert_eq!(message_type, wire_id::PublishSkipped);
+        let blocked = PublishSkipped::decode(&mut Cursor::new(payload))
+            .expect("decode resynced PUBLISH_SKIPPED payload");
         assert_eq!(blocked.track_name, TrackName::from("resynced"));
         assert_eq!(slot_permits.available_permits(), 0);
 
@@ -2226,7 +2321,7 @@ mod tests {
         let mut slot = SubscribeTracksSlot {
             desired: Some(first.clone()),
             active: Some(first.clone()),
-            publish_blocked_tombstone: false,
+            publish_skipped_tombstone: false,
             _session_slot_permit: permits.try_acquire_owned().expect("acquire slot permit"),
         };
 
@@ -2253,7 +2348,7 @@ mod tests {
         let mut slot = SubscribeTracksSlot {
             desired: Some(replacement.clone()),
             active: Some(first.clone()),
-            publish_blocked_tombstone: false,
+            publish_skipped_tombstone: false,
             _session_slot_permit: permits.try_acquire_owned().expect("acquire slot permit"),
         };
 
@@ -2367,6 +2462,78 @@ mod tests {
             "resolved hold should release capacity for another rendezvous"
         );
         drop(first_subscription);
+    }
+
+    /// Draft-20 section 9.5: a relay holding a downstream SUBSCRIBE awaiting a
+    /// publisher MUST answer it and MUST NOT also forward the PUBLISH to that
+    /// subscriber, even when it has SUBSCRIBE_TRACKS covering the track.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_subscribe_suppresses_the_subscribe_tracks_publish() {
+        let locals = Locals::with_rendezvous_capacity(1);
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let (transport, subscriber, _slots) = spawn_relay_session_with_limits(
+            locals.clone(),
+            remotes,
+            coordinator.clone(),
+            MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        )
+        .await;
+
+        let mut holder = subscriber.clone();
+        let held =
+            tokio::spawn(async move { subscribe_result(&mut holder, "held", Some(10_000)).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while locals.available_rendezvous_holds() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SUBSCRIBE did not enter the rendezvous hold");
+
+        // The held SUBSCRIBE took the client's first Request ID, 0.
+        let (message_type, _) = send_request(
+            &transport,
+            Message::SubscribeTracks(SubscribeTracks {
+                id: 2,
+                track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("admission"),
+                params: KeyValuePairs::default(),
+            }),
+        )
+        .await;
+        assert_eq!(message_type, wire_id::RequestOk);
+
+        let namespace = TrackNamespace::from_utf8_path("admission");
+        let mut registering = locals.clone();
+        let (_held_writer, held_reader) = Track::new(namespace.clone(), "held").produce();
+        let _held_registration = registering
+            .register_track(None, held_reader)
+            .await
+            .expect("register held track");
+        let _subscription = tokio::time::timeout(Duration::from_secs(2), held)
+            .await
+            .expect("held SUBSCRIBE did not resolve")
+            .expect("join held SUBSCRIBE")
+            .expect("held SUBSCRIBE was rejected");
+
+        // Positive control: a sibling under the same prefix is still published,
+        // so an absent PUBLISH for "held" is the guard and not a dead fan-out.
+        let (_other_writer, other_reader) = Track::new(namespace, "other").produce();
+        let _other_registration = registering
+            .register_track(None, other_reader)
+            .await
+            .expect("register other track");
+
+        let mut publishes = subscriber.clone();
+        let mut names = Vec::new();
+        while let Ok(Some(published)) =
+            tokio::time::timeout(Duration::from_millis(500), publishes.publish_received()).await
+        {
+            names.push(published.name().clone());
+            std::mem::forget(published);
+        }
+        assert_eq!(names, vec![TrackName::from("other")]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2834,6 +3001,11 @@ mod tests {
                 AuthzOperation::SubscribeNamespace { prefix } => {
                     format!("subscribe_namespace {}", prefix.to_utf8_path())
                 }
+                AuthzOperation::Fetch { namespace, track } => format!(
+                    "fetch {} {}",
+                    namespace.to_utf8_path(),
+                    track.to_string_lossy()
+                ),
                 other => format!("other {}", other.label()),
             };
             let decision = (self.decide)(&detail);
@@ -3163,6 +3335,345 @@ mod tests {
         assert_eq!(hook.seen(), vec!["track_status /status live"]);
     }
 
+    fn fetch(id: u64, namespace: &TrackNamespace, name: &str) -> Message {
+        Message::Fetch(moq_transport::message::Fetch {
+            id,
+            track_namespace: namespace.clone(),
+            track_name: TrackName::from(name),
+            params: KeyValuePairs::default(),
+        })
+    }
+
+    /// FETCH is gated as Fetch(7), before the lookup, so a denial does not
+    /// reveal whether the track exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denied_fetch_is_unauthorized_even_for_a_live_track() {
+        let namespace = TrackNamespace::from_utf8_path("fetch");
+        let (_writer, reader) = Track::new(namespace.clone(), "live").produce();
+        let mut locals = Locals::new();
+        let _registration = locals.register_track(None, reader).await.expect("register");
+        let hook = RecordingHook::new(|_| deny());
+        let (transport, _subscriber) = spawn_authorized_session(
+            locals,
+            Arc::new(CountingCoordinator::default()),
+            hook.clone(),
+        )
+        .await;
+
+        let (message_type, payload) = send_request(&transport, fetch(0, &namespace, "live")).await;
+        assert_eq!(message_type, wire_id::RequestError);
+        assert_eq!(
+            response_error_code(payload),
+            RequestErrorCode::Unauthorized as u64
+        );
+        assert_eq!(hook.seen(), vec!["fetch /fetch live"]);
+    }
+
+    /// The relay answers FETCH from a local track it holds Objects for, with
+    /// FETCH_OK ending at Largest Object; an unknown track does not exist, and
+    /// a track with no Objects yet is an invalid range.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_is_served_from_a_local_track() {
+        use moq_transport::{coding::Location, serve::Subgroup};
+
+        let namespace = TrackNamespace::from_utf8_path("fetch");
+        let (writer, reader) = Track::new(namespace.clone(), "live").produce();
+        let (_empty_writer, empty) = Track::new(namespace.clone(), "empty").produce();
+        let mut locals = Locals::new();
+        let _live = locals.register_track(None, reader).await.expect("register");
+        let _empty = locals.register_track(None, empty).await.expect("register");
+        let mut subgroups = writer.subgroups().expect("subgroups");
+        let mut group = subgroups
+            .create(Subgroup {
+                group_id: 2,
+                subgroup_id: 0,
+                priority: 1,
+            })
+            .expect("subgroup");
+        group
+            .write(bytes::Bytes::from_static(b"x"))
+            .expect("object");
+        group
+            .write(bytes::Bytes::from_static(b"y"))
+            .expect("object");
+        let (_transport, mut subscriber) = spawn_authorized_session(
+            locals,
+            Arc::new(CountingCoordinator::default()),
+            RecordingHook::new(|_| allow()),
+        )
+        .await;
+
+        let mut fetch = subscriber
+            .fetch(namespace.clone(), "live", KeyValuePairs::default())
+            .await
+            .expect("send FETCH");
+        let mut objects = Vec::new();
+        while let Some((item, payload)) = tokio::time::timeout(Duration::from_secs(2), fetch.next())
+            .await
+            .expect("FETCH stream timed out")
+            .expect("FETCH stream")
+        {
+            if let FetchItem::Object(object) = item {
+                objects.push((object.group_id, object.object_id, payload));
+            }
+        }
+        assert_eq!(
+            objects,
+            vec![
+                (2, 0, bytes::Bytes::from_static(b"x")),
+                (2, 1, bytes::Bytes::from_static(b"y")),
+            ]
+        );
+        let ok = tokio::time::timeout(Duration::from_secs(2), fetch.ok())
+            .await
+            .expect("FETCH_OK timed out")
+            .expect("FETCH_OK");
+        assert!(!ok.end_of_track);
+        assert_eq!(ok.end_location, Location::new(2, 1));
+
+        for (name, code) in [
+            ("missing", RequestErrorCode::DoesNotExist),
+            ("empty", RequestErrorCode::InvalidRange),
+        ] {
+            let mut fetch = subscriber
+                .fetch(namespace.clone(), name, KeyValuePairs::default())
+                .await
+                .expect("send FETCH");
+            match tokio::time::timeout(Duration::from_secs(2), fetch.ok())
+                .await
+                .expect("response timed out")
+            {
+                Err(FetchError::Rejected { code: got, .. }) => {
+                    assert_eq!(got, code as u64, "{name}")
+                }
+                other => panic!("{name}: expected REQUEST_ERROR, got {other:?}"),
+            }
+        }
+        drop(group);
+    }
+
+    /// An MMTP packet: the 12-byte header (V=0, C=0, X=0) then `body`.
+    fn mmtp_packet(fec_type: u8, packet_type: u8, sequence: u32, body: &[u8]) -> bytes::Bytes {
+        let mut packet = vec![fec_type << 3, packet_type, 0x00, 0x01, 0, 0, 0, 0];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(body);
+        bytes::Bytes::from(packet)
+    }
+
+    /// MMTP and AL-FEC objects cross a real relay hop unmodified: an origin
+    /// session publishes, a relay-side subscriber feeds the `Locals` cache, and
+    /// the relay's `Producer` serves that cache to a downstream subscriber. The
+    /// ingress is wired by hand (`subscribe_open` + `Locals::register_track`),
+    /// not through `Consumer`/`RemoteManager`, so this covers the cache and
+    /// egress serving, not the relay's own ingest wiring. The relay knows nothing of
+    /// MMTP or of FEC Source Info (draft-ramadan-moq-fec §5.3), so it must pass
+    /// payloads, Group/Subgroup/Object IDs and every Property, unknown odd
+    /// ones included, through unchanged (§5.4). Source objects carry the SS_ID
+    /// both as Property 0x11 and as the packet's Source FEC Payload ID
+    /// trailer; repair objects sit in a group numbered by SS_Start (§7.5).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mmtp_and_al_fec_objects_cross_the_relay_unmodified() {
+        use moq_transport::{
+            data::ExtensionHeaders,
+            serve::{Subgroup, TrackReaderMode},
+        };
+
+        type Object = (u64, u64, u64, ExtensionHeaders, bytes::Bytes);
+
+        let namespace = TrackNamespace::from_utf8_path("mmt");
+        let ss_start: u32 = 256;
+        let mut expected: HashMap<&str, Vec<Object>> = HashMap::new();
+        for (index, ss_id) in [ss_start, ss_start + 1].into_iter().enumerate() {
+            let mut properties = ExtensionHeaders::new();
+            properties.set_bytesvalue(0x11, ss_id.to_be_bytes().to_vec());
+            properties.set_bytesvalue(0x3ff, vec![0xaa, 0xbb, 0xcc]);
+            let mut body = format!("mfu-{index}").into_bytes();
+            body.extend_from_slice(&ss_id.to_be_bytes());
+            let payload = mmtp_packet(1, 0x00, ss_id, &body);
+            expected
+                .entry("video")
+                .or_default()
+                .push((0, 0, index as u64, properties, payload));
+        }
+        for rs_id in 0u32..2 {
+            let mut body = ss_start.to_be_bytes().to_vec();
+            body.extend_from_slice(&2u32.to_be_bytes()[1..]); // RSB_length
+            body.extend_from_slice(&rs_id.to_be_bytes()[1..]); // RS_ID
+            body.extend_from_slice(&2u32.to_be_bytes()[1..]); // SSB_length
+            body.extend_from_slice(&[rs_id as u8; 8]); // one symbol, T = 8
+            let payload = mmtp_packet(2, 0x03, rs_id, &body);
+            expected.entry("video/repair").or_default().push((
+                ss_start as u64,
+                0,
+                rs_id as u64,
+                ExtensionHeaders::new(),
+                payload,
+            ));
+        }
+        let track_name = |name: &str| -> (TrackNamespace, &'static str) {
+            match name {
+                "video" => (namespace.clone(), "video"),
+                _ => (TrackNamespace::from_utf8_path("mmt/video"), "repair"),
+            }
+        };
+
+        // Origin <-> relay ingress.
+        let (origin_transport, ingress_transport) = loopback_webtransport_pair().await;
+        let (origin, ingress) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                TransportSession::accept(origin_transport, None, Transport::WebTransport),
+                TransportSession::connect(ingress_transport, None, Transport::WebTransport),
+            )
+        })
+        .await
+        .expect("origin setup timed out");
+        let (origin, origin_publisher, _) = origin.expect("accept origin session");
+        let (ingress, _, ingress_subscriber) = ingress.expect("connect ingress session");
+        tokio::spawn(async move { origin.run().await });
+        tokio::spawn(async move { ingress.run().await });
+
+        let mut origin_writers = HashMap::new();
+        let mut origin_readers = HashMap::new();
+        for name in ["video", "video/repair"] {
+            let (ns, track) = track_name(name);
+            let (writer, reader) = Track::new(ns, track).produce();
+            origin_writers.insert(name, writer);
+            origin_readers.insert(name, reader);
+        }
+        let mut origin_publisher = origin_publisher.expect("origin publisher");
+        tokio::spawn(async move {
+            while let Some(subscribed) = origin_publisher.subscribed().await {
+                let full = format!(
+                    "{}/{}",
+                    subscribed.track_namespace.to_utf8_path(),
+                    subscribed.track_name
+                );
+                let name = if full.ends_with("/repair") {
+                    "video/repair"
+                } else {
+                    "video"
+                };
+                let reader = origin_readers[name].clone();
+                tokio::spawn(async move { subscribed.serve(reader).await });
+            }
+        });
+
+        // Relay ingress subscribes upstream and registers the cache locally.
+        let mut ingress_subscriber = ingress_subscriber;
+        let mut locals = Locals::new();
+        let mut registrations = Vec::new();
+        let mut ingress_readers = HashMap::new();
+        let mut upstream = Vec::new();
+        for name in ["video", "video/repair"] {
+            let (ns, track) = track_name(name);
+            let (writer, reader) = Track::new(ns, track).produce();
+            ingress_readers.insert(name, reader.clone());
+            registrations.push(locals.register_track(None, reader).await.expect("register"));
+            upstream.push(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ingress_subscriber.subscribe_open(writer),
+                )
+                .await
+                .expect("upstream SUBSCRIBE timed out")
+                .expect("upstream SUBSCRIBE"),
+            );
+        }
+
+        // Downstream subscriber on the relay.
+        let (_transport, mut downstream) = spawn_authorized_session(
+            locals,
+            Arc::new(CountingCoordinator::default()),
+            RecordingHook::new(|_| allow()),
+        )
+        .await;
+        let mut readers = HashMap::new();
+        let mut downstream_subscriptions = Vec::new();
+        for name in ["video", "video/repair"] {
+            let (ns, track) = track_name(name);
+            let (writer, reader) = Track::new(ns, track).produce();
+            downstream_subscriptions.push(
+                tokio::time::timeout(Duration::from_secs(5), downstream.subscribe_open(writer))
+                    .await
+                    .expect("downstream SUBSCRIBE timed out")
+                    .expect("downstream SUBSCRIBE"),
+            );
+            readers.insert(name, reader);
+        }
+
+        // Publish at the origin.
+        let mut subgroup_writers = Vec::new();
+        for name in ["video", "video/repair"] {
+            let objects = &expected[name];
+            let mut subgroups = origin_writers
+                .remove(name)
+                .expect("origin writer")
+                .subgroups()
+                .expect("subgroups");
+            let mut subgroup = subgroups
+                .create(Subgroup {
+                    group_id: objects[0].0,
+                    subgroup_id: objects[0].1,
+                    priority: 1,
+                })
+                .expect("subgroup");
+            for (_, _, object_id, properties, payload) in objects {
+                subgroup
+                    .create_with_id(*object_id, payload.len(), Some(properties.clone()))
+                    .expect("object")
+                    .write(payload.clone())
+                    .expect("payload");
+            }
+            subgroup_writers.push((subgroups, subgroup));
+        }
+
+        // Read the ingress cache first, then downstream, so a failure says
+        // which hop changed the objects: both hops share SubscribedSerializer.
+        for (hop, readers) in [
+            ("ingress", &mut ingress_readers),
+            ("downstream", &mut readers),
+        ] {
+            for name in ["video", "video/repair"] {
+                let reader = readers.remove(name).expect("reader");
+                let mode = tokio::time::timeout(Duration::from_secs(5), reader.mode())
+                    .await
+                    .expect("mode timed out")
+                    .expect("mode");
+                let TrackReaderMode::Subgroups(mut subgroups) = mode else {
+                    panic!("{hop} {name}: expected subgroup delivery");
+                };
+                let mut subgroup = tokio::time::timeout(Duration::from_secs(5), subgroups.next())
+                    .await
+                    .expect("subgroup timed out")
+                    .expect("subgroup")
+                    .expect("subgroup present");
+                let mut got = Vec::new();
+                while got.len() < expected[name].len() {
+                    let mut object = tokio::time::timeout(Duration::from_secs(5), subgroup.next())
+                        .await
+                        .expect("object timed out")
+                        .expect("object")
+                        .expect("object present");
+                    let payload = object.read_all().await.expect("payload");
+                    got.push((
+                        subgroup.group_id,
+                        subgroup.subgroup_id,
+                        object.object_id,
+                        object.extension_headers.clone(),
+                        payload,
+                    ));
+                }
+                assert_eq!(got, expected[name], "{hop} {name}");
+            }
+        }
+        drop((
+            subgroup_writers,
+            upstream,
+            downstream_subscriptions,
+            registrations,
+        ));
+    }
+
     /// SUBSCRIBE_TRACKS is gated as SubscribeNamespace(3) on its prefix, and a
     /// denial is answered with UNAUTHORIZED before any snapshot is taken.
     #[tokio::test(flavor = "multi_thread")]
@@ -3271,8 +3782,11 @@ mod tests {
         )
         .await
         .expect("response timed out");
-        // Keep the request stream open for the duration of the test.
+        // Keep the request stream open for the duration of the test. Both
+        // halves: dropping the receive half sends STOP_SENDING, which cancels
+        // the request.
         std::mem::forget(send);
+        std::mem::forget(recv);
         response
     }
 }

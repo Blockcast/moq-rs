@@ -13,8 +13,8 @@ use url::Url;
 use crate::auth::{decode_setup_tokens, ScopeAuthorizer, SessionAuth, SESSION_ERROR_UNAUTHORIZED};
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
-    metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
-    RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
+    metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Drain, Locals,
+    Producer, RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
     DEFAULT_CACHE_IDLE_TIMEOUT,
 };
 
@@ -250,6 +250,37 @@ pub struct Relay {
     /// Per-scope authorization policy, resolved from the coordinator and
     /// cached. Shared by every accepted connection.
     authorizer: Arc<ScopeAuthorizer>,
+
+    /// Live sessions, for an operator drain.
+    drain: Drain,
+
+    /// Which transports accepted connections may use.
+    transports: Transports,
+}
+
+/// Transports the relay accepts connections on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transports {
+    pub web_transport: bool,
+    pub raw_quic: bool,
+}
+
+impl Default for Transports {
+    fn default() -> Self {
+        Self {
+            web_transport: true,
+            raw_quic: true,
+        }
+    }
+}
+
+impl Transports {
+    fn allows(&self, transport: moq_transport::session::Transport) -> bool {
+        match transport {
+            moq_transport::session::Transport::WebTransport => self.web_transport,
+            moq_transport::session::Transport::RawQuic => self.raw_quic,
+        }
+    }
 }
 
 impl Relay {
@@ -323,7 +354,21 @@ impl Relay {
             upstream_namespaces,
             upstream_namespaces_runner,
             authorizer,
+            drain: Drain::default(),
+            transports: Transports::default(),
         })
+    }
+
+    /// Handle for draining every session this relay accepts.
+    pub fn drain(&self) -> Drain {
+        self.drain.clone()
+    }
+
+    /// Accept only the given transports; others are closed after the QUIC
+    /// handshake, before any MoQT state is created.
+    pub fn with_transports(mut self, transports: Transports) -> Self {
+        self.transports = transports;
+        self
     }
 
     /// Run the relay server.
@@ -335,6 +380,8 @@ impl Relay {
             upstream_namespaces,
             upstream_namespaces_runner,
             authorizer,
+            drain,
+            transports,
         } = self;
 
         let RelayConfig {
@@ -528,6 +575,7 @@ impl Relay {
                         let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
                         let authorizer = authorizer.clone();
+                        let drain = drain.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -537,6 +585,14 @@ impl Relay {
                             // Clone the raw connection so we can close it with a proper
                             // error code if scope resolution fails after the MoQ handshake.
                             let raw_conn = conn.clone();
+
+                            if !transports.allows(transport) {
+                                tracing::debug!(?transport, "transport not enabled, closing");
+                                raw_conn.close(0x0, "transport not enabled");
+                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "transport_disabled").increment(1);
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                return Ok(());
+                            }
 
                             // Create the MoQ session over the connection (setup handshake etc)
                             let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(conn, mlog_path, transport, session_config).await {
@@ -552,6 +608,7 @@ impl Relay {
 
                             // Create our MoQ relay session
                             let moq_session = session;
+                            let _drain_guard = drain.register(moq_session.go_away_sender(), raw_conn.clone());
 
                             // Resolve the connection path to a scope (identity + permissions).
                             // This translates the raw transport-level path into an application-level

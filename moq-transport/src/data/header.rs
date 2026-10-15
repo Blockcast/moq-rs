@@ -498,4 +498,25 @@ mod tests {
         assert!(!sh.header_type.is_fetch());
         assert!(sh.header_type.has_subgroup_id());
     }
+
+    /// Draft-20 Type Flags are a vi64, and non-minimal encodings are valid, so a
+    /// two-byte 0x14 is the same header type; 128 and above stay invalid however encoded.
+    #[test]
+    fn accepts_non_minimal_draft_20_type_flags() {
+        let mut buf = Bytes::from_static(&[0x80, 0x14]);
+        assert_eq!(
+            StreamHeaderType::decode(&mut buf).unwrap(),
+            StreamHeaderType::SubgroupId
+        );
+        let mut buf = Bytes::from_static(&[0xc0, 0x00, 0x05]);
+        assert_eq!(
+            StreamHeaderType::decode(&mut buf).unwrap(),
+            StreamHeaderType::Fetch
+        );
+        let mut buf = Bytes::from_static(&[0x80, 0x80]);
+        assert!(matches!(
+            StreamHeaderType::decode(&mut buf),
+            Err(DecodeError::InvalidHeaderType)
+        ));
+    }
 }

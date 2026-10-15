@@ -623,6 +623,8 @@ impl TrackSubscription {
 /// are allowed.
 ///
 /// [`resolve_scope()`]: Coordinator::resolve_scope
+// async_trait expands each method into a #[must_use] boxed future.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Coordinator: Send + Sync {
     /// Resolve a connection path to scope information.

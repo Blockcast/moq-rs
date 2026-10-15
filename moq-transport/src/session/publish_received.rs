@@ -216,7 +216,6 @@ impl Drop for PublishReceived {
 
         let error_code = match &err {
             ServeError::Cancel | ServeError::Done => RequestErrorCode::Uninterested as u64,
-            ServeError::Duplicate => RequestErrorCode::DuplicateSubscription as u64,
             ServeError::NotFound | ServeError::NotFoundWithId(_, _) => {
                 RequestErrorCode::DoesNotExist as u64
             }

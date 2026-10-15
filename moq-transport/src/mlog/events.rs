@@ -547,6 +547,7 @@ pub fn go_away_parsed(time: f64, stream_id: u64, msg: &message::GoAway) -> Event
         "goaway",
         json!({
                     "new_session_uri": &msg.uri.0,
+                    "timeout": msg.timeout,
         }),
     )
 }
@@ -560,6 +561,7 @@ pub fn go_away_created(time: f64, stream_id: u64, msg: &message::GoAway) -> Even
         "goaway",
         json!({
                     "new_session_uri": &msg.uri.0,
+                    "timeout": msg.timeout,
         }),
     )
 }

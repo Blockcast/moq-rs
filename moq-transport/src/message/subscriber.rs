@@ -65,5 +65,4 @@ subscriber_msgs! {
     SubscribeTracks,
     // Responses/control for publisher-initiated requests.
     PublishNamespaceCancel,
-    PublishOk,
 }

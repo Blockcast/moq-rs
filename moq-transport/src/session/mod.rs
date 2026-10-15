@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
-mod name_registry;
+mod fetch;
+mod fetched;
+mod go_away;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -22,7 +24,9 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
-pub(crate) use name_registry::NameRegistry;
+pub use fetch::{Fetch, FetchError};
+pub use fetched::*;
+pub use go_away::GoAwaySender;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
@@ -136,7 +140,6 @@ enum BidiRequestKind {
 #[derive(Clone, Copy)]
 enum FollowupEnd {
     PublishDone,
-    OtherTerminal,
     Cancelled,
 }
 
@@ -277,6 +280,15 @@ pub struct Session {
     /// (draft-18 §10.3.1.4), which the relay's authorization hook decodes.
     /// Empty for sessions created via `connect()`.
     setup_params: KeyValuePairs,
+
+    /// Sends this session's GOAWAY; see [`Session::go_away_sender`].
+    go_away: GoAwaySender,
+
+    /// The GOAWAY the peer sent on the control stream, once it arrives.
+    go_away_received: tokio::sync::watch::Sender<Option<message::GoAway>>,
+
+    /// Whether this endpoint accepted the session (a server, for GOAWAY rules).
+    server: bool,
 }
 
 impl Session {
@@ -398,6 +410,19 @@ impl Session {
         &self.setup_params
     }
 
+    /// A handle that sends this session's control-stream GOAWAY.
+    pub fn go_away_sender(&self) -> GoAwaySender {
+        self.go_away.clone()
+    }
+
+    /// Resolves to the GOAWAY the peer sent on the control stream.
+    ///
+    /// Holds `None` until one arrives. The session does not migrate on its
+    /// own; the application reads the New Session URI from here.
+    pub fn go_away_received(&self) -> tokio::sync::watch::Receiver<Option<message::GoAway>> {
+        self.go_away_received.subscribe()
+    }
+
     /// Log a control message with structured fields for observability.
     /// Uses target "moq_transport::control" so it can be filtered independently.
     fn log_control_message(msg: &Message, direction: &str) {
@@ -511,11 +536,11 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::PublishBlocked(m) => {
+            Message::PublishSkipped(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     direction,
-                    msg_type = "PUBLISH_BLOCKED",
+                    msg_type = "PUBLISH_SKIPPED",
                     namespace_suffix = %m.track_namespace_suffix,
                     track_name = %m.track_name,
                     "MoQT control message"
@@ -527,7 +552,8 @@ impl Session {
                     direction,
                     msg_type = "FETCH",
                     request_id = m.id,
-                    fetch_type = ?m.fetch_type,
+                    namespace = %m.track_namespace,
+                    track_name = %m.track_name,
                     "MoQT control message"
                 );
             }
@@ -562,12 +588,12 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::PublishOk(m) => {
+            Message::PublishStateNotify(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     direction,
-                    msg_type = "PUBLISH_OK",
-                    request_id = m.id,
+                    msg_type = "PUBLISH_STATE_NOTIFY",
+                    params = m.params.0.len(),
                     "MoQT control message"
                 );
             }
@@ -636,8 +662,10 @@ impl Session {
         connection_path: Option<String>,
         setup_params: KeyValuePairs,
         request_id: RequestId,
+        server: bool,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
+        let go_away = GoAwaySender::new(outgoing.0.clone(), server);
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
@@ -680,6 +708,9 @@ impl Session {
             bidi_task_rx,
             bidi_response_map,
             setup_params,
+            go_away,
+            go_away_received: tokio::sync::watch::Sender::new(None),
+            server,
         };
 
         (session, publisher, subscriber)
@@ -791,6 +822,7 @@ impl Session {
             // peer's, so there is nothing to retain.
             KeyValuePairs::default(),
             request_id,
+            false,
         );
         // Both roles are always constructed for a client session; propagate
         // rather than panic if that ever stops holding (RFC-022).
@@ -897,6 +929,7 @@ impl Session {
             connection_path,
             client.params,
             request_id,
+            true,
         ))
     }
 
@@ -909,7 +942,7 @@ impl Session {
         let mut reader_tasks: FuturesUnordered<BidiReaderFuture> = FuturesUnordered::new();
 
         let result = tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
+            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.go_away_received, self.server) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
             res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
@@ -1215,7 +1248,7 @@ impl Session {
         } else {
             None
         };
-        let _cleanup = req_id.map(|id| BidiRequestCleanup {
+        let cleanup = req_id.map(|id| BidiRequestCleanup {
             id,
             kind: request_kind,
             publisher: publisher.as_ref().cloned(),
@@ -1259,8 +1292,13 @@ impl Session {
         if dispatch_result.is_ok() {
             if let Some(id) = req_id {
                 if let Some(ref mut rx) = rx {
-                    let follow_ups =
-                        Self::read_request_follow_ups(&mut reader, id, publisher, subscriber);
+                    let follow_ups = Self::read_request_follow_ups(
+                        &mut reader,
+                        id,
+                        request_kind,
+                        publisher,
+                        subscriber,
+                    );
                     tokio::pin!(follow_ups);
 
                     // Keep a selected response write indivisible with respect
@@ -1279,12 +1317,13 @@ impl Session {
                                     // One-shot requests (TRACK_STATUS, REQUEST_UPDATE) get
                                     // exactly one reply, so REQUEST_OK ends them just as
                                     // REQUEST_ERROR does.
+                                    // FETCH_OK follows the FIN of the fetch data
+                                    // stream, so nothing else is sent after it.
                                     let is_terminal = matches!(
                                         response.message,
                                         Message::RequestError(_)
                                             | Message::PublishDone(_)
-                                            | Message::PublishNamespaceDone(_)
-                                            | Message::Unsubscribe(_)
+                                            | Message::FetchOk(_)
                                     ) || (bounded_response
                                         && matches!(response.message, Message::RequestOk(_)));
                                     if let Err(err) = Self::encode_bidi_response(
@@ -1333,7 +1372,7 @@ impl Session {
                                             }
                                             deferred_publish_done = true;
                                         }
-                                        Ok(FollowupEnd::PublishDone | FollowupEnd::OtherTerminal | FollowupEnd::Cancelled) => {
+                                        Ok(FollowupEnd::PublishDone | FollowupEnd::Cancelled) => {
                                             return Ok(false);
                                         }
                                         Err(err) => return Err(err),
@@ -1381,6 +1420,10 @@ impl Session {
             }
         }
 
+        // Release the request's state before the FIN: a requester that sees
+        // this stream end may immediately retry the same track.
+        drop(cleanup);
+
         // Explicitly finish the stream and yield for Quinn to flush.
         if !writer_closed {
             let _ = writer.finish();
@@ -1393,11 +1436,11 @@ impl Session {
     /// Read messages the requester sends after its opening request on the same
     /// bidi stream, and dispatch them like any other inbound control message.
     ///
-    /// Draft-18 puts the whole life of a request on one stream, so terminal
-    /// follow-ups such as PUBLISH_DONE (ending an inbound PUBLISH) and
-    /// UNSUBSCRIBE (ending an inbound SUBSCRIBE) arrive here rather than on the
-    /// control stream. Like every other message after the request, they omit
-    /// the Request ID, which is why the stream's known `request_id` is injected.
+    /// The whole life of a request is on one stream, so PUBLISH_DONE (ending an
+    /// inbound PUBLISH) arrives here rather than on the control stream. Other
+    /// requests end by RESET_STREAM/STOP_SENDING (§3.3.3), not a message.
+    /// Follow-up messages omit the Request ID, which is why the stream's known
+    /// `request_id` is injected.
     ///
     /// Returns when the request ends: the requester reset the stream, or sent
     /// something terminal. A clean FIN of the requester's send half is not an
@@ -1410,6 +1453,7 @@ impl Session {
     async fn read_request_follow_ups(
         reader: &mut Reader,
         request_id: u64,
+        request_kind: BidiRequestKind,
         publisher: &mut Option<Publisher>,
         subscriber: &mut Option<Subscriber>,
     ) -> Result<FollowupEnd, SessionError> {
@@ -1439,11 +1483,18 @@ impl Session {
 
             let terminal = match &msg {
                 Message::PublishDone(_) => Some(FollowupEnd::PublishDone),
-                Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {
-                    Some(FollowupEnd::OtherTerminal)
-                }
                 _ => None,
             };
+
+            // PUBLISH_STATE_NOTIFY follows an inbound PUBLISH from its
+            // publisher; on any other request it falls through to
+            // recv_message, which closes the session.
+            if let (BidiRequestKind::Publish, Message::PublishStateNotify(notify), Some(s)) =
+                (request_kind, &msg, subscriber.as_ref())
+            {
+                s.recv_publish_state_notify(notify);
+                continue;
+            }
 
             let dispatched = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => subscriber
@@ -1508,8 +1559,6 @@ impl Session {
                 m.stream_count.encode(&mut payload)?;
                 m.reason.encode(&mut payload)?;
             }
-            // id-only messages: payload is empty (id omitted on bidi).
-            Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {}
             // NAMESPACE / NAMESPACE_DONE never carried a Request ID, so their
             // payload is unchanged on a bidi stream.
             Message::Namespace(m) => {
@@ -1518,11 +1567,11 @@ impl Session {
             Message::NamespaceDone(m) => {
                 m.track_namespace_suffix.encode(&mut payload)?;
             }
-            Message::PublishBlocked(m) => {
+            Message::PublishSkipped(m) => {
                 m.track_namespace_suffix.encode(&mut payload)?;
                 m.track_name.encode(&mut payload)?;
             }
-            Message::PublishOk(m) => {
+            Message::PublishStateNotify(m) => {
                 m.params.encode_message_params(&mut payload)?;
             }
             Message::FetchOk(m) => {
@@ -1615,9 +1664,6 @@ impl Session {
                     track_extensions,
                 }))
             }
-            wire_id::PublishNamespaceDone => Ok(Message::PublishNamespaceDone(
-                message::PublishNamespaceDone { id: request_id },
-            )),
             wire_id::PublishDone => {
                 let status_code = u64::decode(&mut buf)?;
                 let stream_count = u64::decode(&mut buf)?;
@@ -1629,9 +1675,6 @@ impl Session {
                     reason,
                 }))
             }
-            wire_id::Unsubscribe => Ok(Message::Unsubscribe(message::Unsubscribe {
-                id: request_id,
-            })),
             // NAMESPACE / NAMESPACE_DONE have no Request ID field, so nothing
             // is injected — they decode exactly as they do on any other stream.
             wire_id::Namespace => {
@@ -1646,18 +1689,17 @@ impl Session {
                     track_namespace_suffix,
                 }))
             }
-            wire_id::PublishBlocked => {
+            wire_id::PublishSkipped => {
                 let track_namespace_suffix = crate::coding::TrackNamespacePrefix::decode(&mut buf)?;
                 let track_name = crate::coding::TrackName::decode(&mut buf)?;
-                Ok(Message::PublishBlocked(message::PublishBlocked {
+                Ok(Message::PublishSkipped(message::PublishSkipped {
                     track_namespace_suffix,
                     track_name,
                 }))
             }
-            wire_id::PublishOk => {
+            wire_id::PublishStateNotify => {
                 let params = crate::coding::KeyValuePairs::decode_message_params(&mut buf)?;
-                Ok(Message::PublishOk(message::PublishOk {
-                    id: request_id,
+                Ok(Message::PublishStateNotify(message::PublishStateNotify {
                     params,
                 }))
             }
@@ -1703,7 +1745,8 @@ impl Session {
         mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
-        _outgoing: Queue<Message>,
+        go_away_received: tokio::sync::watch::Sender<Option<message::GoAway>>,
+        server: bool,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
@@ -1780,13 +1823,19 @@ impl Session {
                             "received multiple GOAWAY messages".to_string(),
                         ));
                     }
+                    // §10.4: a client cannot tell a server where to reconnect.
+                    if server && !m.uri.0.is_empty() {
+                        return Err(SessionError::ProtocolViolation(
+                            "client GOAWAY carried a New Session URI".to_string(),
+                        ));
+                    }
                     goaway_received = true;
                     tracing::info!(
                         target: "moq_transport::control",
                         new_uri = %m.uri.0,
                         "received GOAWAY"
                     );
-                    // TODO(itzmanish): trigger session migration.
+                    go_away_received.send_replace(Some(m.clone()));
                 }
                 other => {
                     tracing::warn!(msg_type = other.name(), "received unhandled message type");
@@ -1908,7 +1957,7 @@ pub(crate) mod test_support {
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], key)
             .expect("configure raw QUIC server certificate");
-        server_crypto.alpn_protocols = vec![b"moqt-18".to_vec()];
+        server_crypto.alpn_protocols = vec![b"moqt-20".to_vec()];
         let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .expect("configure raw QUIC server crypto");
         let server = quinn::Endpoint::server(
@@ -1923,7 +1972,7 @@ pub(crate) mod test_support {
         let mut client_crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        client_crypto.alpn_protocols = vec![b"moqt-18".to_vec()];
+        client_crypto.alpn_protocols = vec![b"moqt-20".to_vec()];
         let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .expect("configure raw QUIC client crypto");
         let mut client =
@@ -2448,12 +2497,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(responses.lock().unwrap().is_empty());
-        assert!(
-            !subscriber.has_subscriber_name(&crate::serve::FullTrackName {
-                namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
-                name: "track".into(),
-            })
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2521,12 +2564,6 @@ mod tests {
         ));
         assert!(response_reader.done().await.unwrap());
         handler.await.unwrap().unwrap();
-        assert!(
-            !subscriber.has_subscriber_name(&crate::serve::FullTrackName {
-                namespace: crate::coding::TrackNamespace::from_utf8_path("test"),
-                name: "track".into(),
-            })
-        );
     }
 
     // ========================================================================
@@ -2703,8 +2740,8 @@ mod tests {
     }
 
     #[test]
-    fn encode_bidi_publish_blocked_matches_plain_message_encoding() {
-        let msg = Message::PublishBlocked(message::PublishBlocked {
+    fn encode_bidi_publish_skipped_matches_plain_message_encoding() {
+        let msg = Message::PublishSkipped(message::PublishSkipped {
             track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
                 "participant=5",
             ),
@@ -2717,11 +2754,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_bidi_publish_blocked() {
+    async fn decode_bidi_publish_skipped() {
         let (requester, responder) = test_support::loopback_session_pair().await;
         let (_request_send, response_recv) = requester.open_bi().await.unwrap();
         let (response_send, _request_recv) = responder.accept_bi().await.unwrap();
-        let msg = Message::PublishBlocked(message::PublishBlocked {
+        let msg = Message::PublishSkipped(message::PublishSkipped {
             track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
                 "participant=5",
             ),
@@ -2731,12 +2768,12 @@ mod tests {
             .await
             .unwrap();
 
-        let Message::PublishBlocked(blocked) =
+        let Message::PublishSkipped(blocked) =
             Session::decode_bidi_response(&mut Reader::new(response_recv), 42)
                 .await
                 .unwrap()
         else {
-            panic!("expected PUBLISH_BLOCKED");
+            panic!("expected PUBLISH_SKIPPED");
         };
         assert_eq!(
             blocked.track_namespace_suffix,
@@ -2774,6 +2811,7 @@ mod tests {
         .is_none());
         assert!(Message::GoAway(message::GoAway {
             uri: crate::coding::SessionUri(String::new()),
+            timeout: 0,
         })
         .response_target_id()
         .is_none());
@@ -2797,17 +2835,16 @@ mod tests {
     }
 
     #[test]
-    fn encode_bidi_publish_ok_omits_request_id() {
-        use message::wire_id;
-        let msg = Message::PublishOk(message::PublishOk {
-            id: 55,
-            params: crate::coding::KeyValuePairs::default(),
-        });
+    fn encode_bidi_publish_state_notify() {
+        let mut params = crate::coding::KeyValuePairs::default();
+        params
+            .set_largest_object(crate::coding::Location::new(7, 2))
+            .unwrap();
+        let msg = Message::PublishStateNotify(message::PublishStateNotify { params });
         let bytes = encode_bidi_response_bytes(&msg);
-        assert_eq!(bytes[0], wire_id::PublishOk as u8);
-        assert!(
-            !bytes.contains(&55),
-            "Request ID must not appear in bidi encoding"
+        assert_eq!(
+            bytes.to_vec(),
+            vec![0x22, 0x00, 0x04, 0x01, 0x09, 0x07, 0x02]
         );
     }
 
@@ -3095,5 +3132,105 @@ mod tests {
         server_run.abort();
         assert!(server_run.await.unwrap_err().is_cancelled());
         drop(client_session);
+    }
+
+    async fn server_go_away_reaches_client(transport: Transport) {
+        let (client_transport, server_transport) = match transport {
+            Transport::WebTransport => test_support::loopback_session_pair().await,
+            Transport::RawQuic => test_support::loopback_raw_session_pair().await,
+        };
+        let (client, server) = tokio::join!(
+            Session::connect(client_transport, None, transport),
+            Session::accept(server_transport, None, transport),
+        );
+        let (client_session, _client_publisher, _client_subscriber) = client.unwrap();
+        let (server_session, _server_publisher, _server_subscriber) = server.unwrap();
+
+        let mut received = client_session.go_away_received();
+        let server_go_away = server_session.go_away_sender();
+        let client_go_away = client_session.go_away_sender();
+        let client_run = tokio::spawn(client_session.run());
+        let server_run = tokio::spawn(server_session.run());
+
+        let uri = "https://relay-b.example.net:4443/live";
+        assert!(server_go_away.send(uri, 250).unwrap());
+        // §10.4: one GOAWAY per control stream; the second is not sent.
+        assert!(!server_go_away.send(uri, 250).unwrap());
+
+        let go_away = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            received.wait_for(Option::is_some),
+        )
+        .await
+        .expect("GOAWAY timed out")
+        .unwrap()
+        .clone()
+        .unwrap();
+        assert_eq!(go_away.uri.0, uri);
+        assert_eq!(go_away.timeout, 250);
+
+        // A client may only send an empty New Session URI.
+        assert!(matches!(
+            client_go_away.send("https://elsewhere.example/", 0),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+        assert!(
+            !client_run.is_finished(),
+            "one GOAWAY must not close the session"
+        );
+
+        client_run.abort();
+        server_run.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_go_away_reaches_webtransport_client() {
+        server_go_away_reaches_client(Transport::WebTransport).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_go_away_reaches_raw_quic_client() {
+        server_go_away_reaches_client(Transport::RawQuic).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_rejects_client_go_away_with_new_session_uri() {
+        let (client_transport, server_transport) = test_support::loopback_raw_session_pair().await;
+        // Hand-built client: the real GoAwaySender refuses to send this.
+        let client = async move {
+            let mut control = Writer::new(client_transport.open_uni().await.unwrap());
+            control
+                .encode(&setup::Setup {
+                    params: KeyValuePairs::default(),
+                })
+                .await
+                .unwrap();
+            let _server_control = client_transport.accept_uni().await.unwrap();
+            control
+                .encode(&Message::GoAway(message::GoAway {
+                    uri: crate::coding::SessionUri("https://elsewhere.example/".to_string()),
+                    timeout: 0,
+                }))
+                .await
+                .unwrap();
+            client_transport.closed().await
+        };
+        let server = async move {
+            let (session, _publisher, _subscriber) =
+                Session::accept(server_transport, None, Transport::RawQuic)
+                    .await
+                    .unwrap();
+            session.run().await
+        };
+        let (run_result, _closed) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .expect("server did not reject the client GOAWAY");
+        assert!(
+            matches!(run_result, Err(SessionError::ProtocolViolation(_))),
+            "{run_result:?}"
+        );
     }
 }

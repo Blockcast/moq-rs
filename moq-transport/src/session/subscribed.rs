@@ -79,7 +79,7 @@ impl StreamCount {
     fn opened(&self) {
         let _ = self
             .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 count.checked_add(1)
             });
     }
@@ -630,13 +630,12 @@ impl Subscribed {
             // did not wait, TIMEOUT when it held the subscription and no publisher
             // arrived before the subscriber's RENDEZVOUS_TIMEOUT elapsed.
             ServeError::Timeout => RequestErrorCode::Timeout as u64,
-            ServeError::Duplicate => RequestErrorCode::DuplicateSubscription as u64,
             ServeError::Cancel | ServeError::Done => RequestErrorCode::Uninterested as u64,
             ServeError::Mode
             | ServeError::Size
             | ServeError::NotImplemented(_)
             | ServeError::NotImplementedWithId(_, _) => RequestErrorCode::NotSupported as u64,
-            ServeError::Internal(_) | ServeError::InternalWithId(_, _) => {
+            ServeError::Duplicate | ServeError::Internal(_) | ServeError::InternalWithId(_, _) => {
                 RequestErrorCode::InternalError as u64
             }
         }
@@ -1309,6 +1308,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let receive = async move {
@@ -1450,6 +1450,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
 
@@ -1584,6 +1585,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
 
@@ -1658,6 +1660,7 @@ mod tests {
                         forward: true,
                         start_location: None,
                         end_group_id: None,
+                        end_object_id: None,
                     },
                 )
                 .await
@@ -1758,6 +1761,7 @@ mod tests {
                         forward: true,
                         start_location: None,
                         end_group_id: None,
+                        end_object_id: None,
                     },
                 )
                 .await
@@ -1894,11 +1898,7 @@ mod tests {
             .insert(0, response_tx);
         let mut params = KeyValuePairs::default();
         params
-            .set_subscription_filter(&message::SubscriptionFilter {
-                filter_type: message::FilterType::NextGroupStart,
-                start_location: None,
-                end_group_id: None,
-            })
+            .set_location_filter(&message::LocationFilter::RelativeGroup(0))
             .unwrap();
         let (subscribed, _recv) = Subscribed::new(
             publisher,
@@ -1992,6 +1992,7 @@ mod tests {
                         forward: true,
                         start_location: None,
                         end_group_id: None,
+                        end_object_id: None,
                     },
                 )
                 .await,
@@ -2042,6 +2043,7 @@ mod tests {
                         forward: true,
                         start_location: None,
                         end_group_id: None,
+                        end_object_id: None,
                     },
                 )
                 .await,
@@ -2093,6 +2095,7 @@ mod tests {
             forward: true,
             start_location: Some(Location::new(0, 5)),
             end_group_id: None,
+            end_object_id: None,
         };
 
         let receive = async move {
@@ -2176,6 +2179,7 @@ mod tests {
                 forward: true,
                 start_location,
                 end_group_id: None,
+                end_object_id: None,
             };
             let receive = async move {
                 let stream = peer_session.accept_uni().await.unwrap();
@@ -2300,6 +2304,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
 
@@ -2355,6 +2360,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let receive = async move {
@@ -2443,6 +2449,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let receive = async move {
@@ -2521,6 +2528,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let receive = async move {
@@ -2922,6 +2930,7 @@ mod tests {
             forward: true,
             start_location: None,
             end_group_id: None,
+            end_object_id: None,
         }
     }
 
@@ -2976,6 +2985,7 @@ mod tests {
                 forward: false,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         )
         .await;
@@ -3275,9 +3285,10 @@ mod tests {
             Subscribed::request_error_code(&ServeError::NotFound),
             RequestErrorCode::DoesNotExist as u64
         );
+        // Draft-20 has no DUPLICATE_SUBSCRIPTION; a local duplicate is internal.
         assert_eq!(
             Subscribed::request_error_code(&ServeError::Duplicate),
-            RequestErrorCode::DuplicateSubscription as u64
+            RequestErrorCode::InternalError as u64
         );
         // A rendezvous hold that expired is TIMEOUT, not DOES_NOT_EXIST.
         assert_eq!(

@@ -590,4 +590,122 @@ mod tests {
             EncodeError::InvalidValue
         ));
     }
+
+    /// The first draft-20 §11.6 example: one subgroup, Type Flags 0x14.
+    #[test]
+    fn decodes_draft_20_example_subgroup_with_explicit_id_and_priority() {
+        let wire: &[u8] = &[
+            0x14, 0x02, 0x00, 0x00, 0x00, // header: alias 2, group 0, subgroup 0, priority 0
+            0x00, 0x04, b'a', b'b', b'c', b'd', // Object ID 0
+            0x00, 0x04, b'e', b'f', b'g', b'h', // Object ID 1
+        ];
+        let mut r = Bytes::from_static(wire);
+        let header = StreamHeader::decode(&mut r)
+            .unwrap()
+            .subgroup_header
+            .unwrap();
+        assert_eq!(header.track_alias, 2);
+        assert_eq!(header.group_id, 0);
+        assert_eq!(header.subgroup_id, Some(0));
+        assert_eq!(header.publisher_priority, 0);
+
+        let mut previous = None;
+        for (expected_id, payload) in [(0, b"abcd"), (1, b"efgh")] {
+            let object = SubgroupObject::decode(&mut r).unwrap();
+            let id = decode_object_id_delta(&mut previous, object.object_id_delta).unwrap();
+            assert_eq!(id, expected_id);
+            assert_eq!(r.split_to(object.payload_length).as_ref(), payload);
+        }
+        assert!(r.is_empty());
+
+        let mut encoded = BytesMut::new();
+        header.encode(&mut encoded).unwrap();
+        assert_eq!(&encoded[..], &wire[..5]);
+    }
+
+    /// The second draft-20 §11.6 example: Type Flags 0x35 (properties, explicit
+    /// Subgroup ID, default priority). The draft's printed lengths (Properties
+    /// Length 33, a 21-byte value) do not match its 14-byte "traceID:123456",
+    /// so the lengths here are derived from the printed values. 33 is the
+    /// pre-vi64 arithmetic with absolute types (1 + 8 + 2 + 1 + 21); do not
+    /// "fix" this vector toward the printed lengths.
+    #[test]
+    fn decodes_draft_20_example_subgroup_with_properties() {
+        let wire: &[u8] = &[
+            0x35, 0x02, 0x00, 0x00, // header: alias 2, group 0, subgroup 0; no priority
+            0x00, 0x16, // Object ID 0, Properties Length 22
+            0x04, 0xf0, 0x82, 0x57, 0xdc, 0xd3, // Type 4 = 2186796243
+            0x49, 0x0e, b't', b'r', b'a', b'c', b'e', b'I', b'D', b':', b'1', b'2', b'3', b'4',
+            b'5', b'6', // Type 77, 14 bytes
+            0x04, b'a', b'b', b'c', b'd', 0x00, 0x00, 0x04, b'e', b'f', b'g',
+            b'h', // Object ID 1, no properties
+        ];
+        let mut r = Bytes::from_static(wire);
+        let header = StreamHeader::decode(&mut r)
+            .unwrap()
+            .subgroup_header
+            .unwrap();
+        assert_eq!(header.header_type.value(), 0x35);
+        assert_eq!(header.subgroup_id, Some(0));
+        assert_eq!(header.publisher_priority, DEFAULT_PUBLISHER_PRIORITY);
+
+        let first = SubgroupObjectExt::decode(&mut r).unwrap();
+        assert_eq!(first.object_id_delta, 0);
+        assert_eq!(
+            first.extension_headers.get(4).map(|kvp| &kvp.value),
+            Some(&crate::coding::Value::IntValue(2_186_796_243))
+        );
+        assert_eq!(
+            first.extension_headers.get(77).map(|kvp| &kvp.value),
+            Some(&crate::coding::Value::BytesValue(
+                b"traceID:123456".to_vec()
+            ))
+        );
+        assert_eq!(r.split_to(first.payload_length).as_ref(), b"abcd");
+
+        let second = SubgroupObjectExt::decode(&mut r).unwrap();
+        assert_eq!(second.object_id_delta, 0);
+        assert!(second.extension_headers.is_empty());
+        assert_eq!(r.split_to(second.payload_length).as_ref(), b"efgh");
+        assert!(r.is_empty());
+
+        let mut encoded = BytesMut::new();
+        header.encode(&mut encoded).unwrap();
+        first.encode(&mut encoded).unwrap();
+        encoded.extend_from_slice(b"abcd");
+        second.encode(&mut encoded).unwrap();
+        encoded.extend_from_slice(b"efgh");
+        assert_eq!(&encoded[..], wire);
+    }
+
+    /// FEC Source Info (draft-ramadan-moq-fec §5.3) is odd Property 0x11 with a
+    /// fixed 4-byte SS_ID. Next to it is an unknown odd Property whose Delta
+    /// Type needs 2 bytes. Neither is interpreted here; both must round-trip
+    /// byte for byte so a relay forwards them unmodified (§5.4).
+    #[test]
+    fn fec_source_info_and_unknown_odd_property_round_trip() {
+        let wire: &[u8] = &[
+            0x00, 0x0c, // Object ID delta 0, Properties Length 12
+            0x11, 0x04, 0x00, 0x00, 0x01, 0x00, // Type 0x11, SS_ID 256
+            0x83, 0xee, 0x03, 0xaa, 0xbb, 0xcc, // Type 0x3ff (delta 0x3ee), 3 bytes
+            0x02, 0xde, 0xad, // Payload Length 2, payload
+        ];
+        let mut r = Bytes::from_static(wire);
+        let object = SubgroupObjectExt::decode(&mut r).unwrap();
+        assert_eq!(object.object_id_delta, 0);
+        assert_eq!(
+            object.extension_headers.get(0x11).map(|kvp| &kvp.value),
+            Some(&crate::coding::Value::BytesValue(vec![0, 0, 1, 0]))
+        );
+        assert_eq!(
+            object.extension_headers.get(0x3ff).map(|kvp| &kvp.value),
+            Some(&crate::coding::Value::BytesValue(vec![0xaa, 0xbb, 0xcc]))
+        );
+        assert_eq!(r.as_ref(), &[0xde, 0xad]);
+
+        let mut encoded = BytesMut::new();
+        object.encode(&mut encoded).unwrap();
+        encoded.extend_from_slice(&r);
+        assert_eq!(&encoded[..], wire);
+    }
 }

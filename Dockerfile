@@ -51,3 +51,21 @@ COPY deploy/fly-relay.sh .
 
 # Default to moq-relay
 CMD ["moq-relay"]
+
+# PIM harness image: moq-relay-ietf behind the dual-stack-relay launch adapter.
+# Build with --target pim-relay.
+FROM debian:bookworm-slim as pim-relay
+
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends ca-certificates libssl3 openssl && \
+	rm -rf /var/lib/apt/lists/*
+
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.source=https://github.com/Blockcast/moq-rs
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+
+COPY --from=builder /usr/local/cargo/bin/moq-relay-ietf /usr/local/bin/
+COPY deploy/pim-relay-entrypoint.sh /usr/local/bin/pim-relay-entrypoint
+
+ENTRYPOINT ["pim-relay-entrypoint"]

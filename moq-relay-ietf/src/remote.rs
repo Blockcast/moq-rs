@@ -869,8 +869,9 @@ async fn remove_empty_remote_slot(
 /// Clear a cached cross-relay track once it has been unwatched for `timeout`.
 ///
 /// Resolving means the caller should end its subscription to the peer relay. The
-/// slot remains in a closing state until that teardown completes, so a replacement
-/// SUBSCRIBE cannot overtake the old UNSUBSCRIBE.
+/// slot remains in a closing state until the old request stream is cancelled, so
+/// a replacement SUBSCRIBE is not opened first. The peer may still see the
+/// replacement before the cancellation; draft-20 §5.1 allows that overlap.
 ///
 /// The idle re-check happens under the slot lock, which is also where interest
 /// guards are created, so a subscriber racing eviction is either counted here

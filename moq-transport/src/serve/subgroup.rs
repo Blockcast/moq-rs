@@ -219,19 +219,14 @@ impl SubgroupsWriter {
 
     // Helper to increment the group by one.
     pub fn append(&mut self, priority: u8) -> Result<SubgroupWriter, ServeError> {
-        let group_id;
-        let subgroup_id;
-
         // TODO: refactor here... For now, every subgroup is mapped to a new group...
         let start_new_group = true;
 
-        if start_new_group {
-            group_id = self.next_group_id;
-            subgroup_id = 0;
+        let (group_id, subgroup_id) = if start_new_group {
+            (self.next_group_id, 0)
         } else {
-            group_id = self.last_group_id;
-            subgroup_id = self.next_subgroup_id;
-        }
+            (self.last_group_id, self.next_subgroup_id)
+        };
 
         self.create(Subgroup {
             group_id,
@@ -470,6 +465,17 @@ impl SubgroupsReader {
     // Returns the largest group/sequence
     pub fn latest(&self) -> Option<(u64, u64)> {
         self.state.lock().largest_location
+    }
+
+    /// The subgroups still open for writing. This is all the track content a
+    /// relay holds: a subgroup leaves the set when its upstream stream ends.
+    pub fn cached(&self) -> Vec<SubgroupReader> {
+        self.state
+            .lock()
+            .live_subgroups
+            .iter()
+            .map(|live| live.reader.clone())
+            .collect()
     }
 
     /// Check if the subgroups writer has been closed or dropped.
@@ -908,6 +914,11 @@ impl SubgroupReader {
             }
             .await; // Try again when the state changes
         }
+    }
+
+    /// The Objects received so far. An Object's payload may still be arriving.
+    pub fn cached_objects(&self) -> Vec<SubgroupObjectReader> {
+        self.state.lock().objects.clone()
     }
 
     pub fn pos(&self) -> usize {

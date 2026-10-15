@@ -21,8 +21,6 @@
 mod fetch;
 mod fetch_cancel;
 mod fetch_ok;
-mod fetch_type;
-mod filter_type;
 mod go_away;
 mod group_order;
 
@@ -30,11 +28,11 @@ mod namespace;
 mod params;
 mod pubilsh_namespace_done;
 mod publish;
-mod publish_blocked;
 mod publish_done;
 mod publish_namespace;
 mod publish_namespace_cancel;
-mod publish_ok;
+mod publish_skipped;
+mod publish_state_notify;
 mod publisher;
 mod request_error;
 mod request_ok;
@@ -51,8 +49,6 @@ mod unsubscribe;
 pub use fetch::*;
 pub use fetch_cancel::*;
 pub use fetch_ok::*;
-pub use fetch_type::*;
-pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
 
@@ -60,11 +56,11 @@ pub use namespace::*;
 pub use params::*;
 pub use pubilsh_namespace_done::*;
 pub use publish::*;
-pub use publish_blocked::*;
 pub use publish_done::*;
 pub use publish_namespace::*;
 pub use publish_namespace_cancel::*;
-pub use publish_ok::*;
+pub use publish_skipped::*;
+pub use publish_state_notify::*;
 pub use publisher::*;
 pub use request_error::*;
 pub use request_ok::*;
@@ -112,6 +108,10 @@ macro_rules! message_types {
                 <u64 as Decode>::decode_remaining(r, len)?;
                 let mut payload = r.copy_to_bytes(len);
 
+                if INTERNAL_ONLY.contains(&t) {
+                    return Err(DecodeError::InvalidMessage(t));
+                }
+
                 let msg = match t {
                     $($val => {
                         let msg = $name::decode(&mut payload)?;
@@ -136,7 +136,7 @@ macro_rules! message_types {
 
         impl Encode for Message {
             fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-                if !self.parameter_scopes_valid() {
+                if !self.parameter_scopes_valid() || INTERNAL_ONLY.contains(&self.id()) {
                     return Err(EncodeError::InvalidValue);
                 }
 
@@ -181,7 +181,7 @@ macro_rules! message_types {
                     Self::PublishNamespace(m) => &m.params,
                     Self::TrackStatus(m) => &m.params,
                     Self::Publish(m) => &m.params,
-                    Self::PublishOk(m) => &m.params,
+                    Self::PublishStateNotify(m) => &m.params,
                     Self::Fetch(m) => &m.params,
                     Self::FetchOk(m) => &m.params,
                     Self::SubscribeNamespace(m) => &m.params,
@@ -222,7 +222,6 @@ macro_rules! message_types {
                     Self::PublishDone(m) => Some(m.id),
                     Self::PublishNamespaceDone(m) => Some(m.id),
                     Self::Unsubscribe(m) => Some(m.id),
-                    Self::PublishOk(m) => Some(m.id),
                     Self::FetchOk(m) => Some(m.id),
                     _ => None,
                 }
@@ -245,7 +244,17 @@ macro_rules! message_types {
     }
 }
 
-// Wire IDs per draft-ietf-moq-transport-16 Table 1.
+/// Types modelled internally that draft-20 Table 5 does not define. They are
+/// never encoded, and receiving one closes the session like any unknown type:
+/// cancellation and withdrawal use RESET_STREAM / STOP_SENDING (§3.3.3).
+const INTERNAL_ONLY: &[u64] = &[
+    wire_id::PublishNamespaceDone,
+    wire_id::Unsubscribe,
+    wire_id::PublishNamespaceCancel,
+    wire_id::FetchCancel,
+];
+
+// Wire IDs per draft-ietf-moq-transport-20 Table 5, plus INTERNAL_ONLY.
 message_types! {
     // NOTE: Setup messages live in a separate module (setup::Client/Server).
 
@@ -272,8 +281,8 @@ message_types! {
     // ── PUBLISH family ────────────────────────────────────────────────────────
     Publish         = 0x1d,
     PublishDone     = 0xb,
-    PublishOk       = 0x1e,
-    PublishBlocked  = 0x0f,
+    PublishStateNotify = 0x22,
+    PublishSkipped  = 0x0f,
 
     // ── FETCH family ─────────────────────────────────────────────────────────
     Fetch           = 0x16,
@@ -331,14 +340,8 @@ mod tests {
         assert_sequenced(
             Message::Fetch(Fetch {
                 id: 4,
-                fetch_type: FetchType::Standalone,
-                standalone_fetch: Some(StandaloneFetch {
-                    track_namespace: namespace(),
-                    track_name: "track".into(),
-                    start_location: Location::new(0, 0),
-                    end_location: Location::new(0, 1),
-                }),
-                joining_fetch: None,
+                track_namespace: namespace(),
+                track_name: "track".into(),
                 params: KeyValuePairs::default(),
             }),
             4,
@@ -427,10 +430,7 @@ mod tests {
             track_extensions: TrackExtensions::default(),
         }));
 
-        assert_not_sequenced(Message::PublishOk(PublishOk {
-            id: 0,
-            params: KeyValuePairs::default(),
-        }));
+        assert_not_sequenced(Message::PublishStateNotify(PublishStateNotify::default()));
 
         assert_not_sequenced(Message::PublishDone(PublishDone {
             id: 0,
@@ -519,8 +519,27 @@ mod tests {
         ));
     }
 
+    /// Types the draft-20 registry (Table 5) reserves or no longer defines.
+    /// An unknown control message type MUST close the session.
     #[test]
-    fn draft18_wire_layouts_for_control_messages() {
+    fn draft20_retired_message_types_are_rejected() {
+        // 0x1E was PUBLISH_OK through draft-18; 0x20/0x21 were CLIENT/SERVER_SETUP.
+        // 0x09/0x0A/0x0C/0x17 were PUBLISH_NAMESPACE_DONE, UNSUBSCRIBE,
+        // PUBLISH_NAMESPACE_CANCEL and FETCH_CANCEL before draft-18.
+        for retired in [0x09_u8, 0x0a, 0x0c, 0x17, 0x1e, 0x20, 0x21, 0x40, 0x41] {
+            let mut frame = bytes::Bytes::from(vec![retired, 0x00, 0x01, 0x00]);
+            assert!(
+                matches!(
+                    Message::decode(&mut frame),
+                    Err(crate::coding::DecodeError::InvalidMessage(t)) if t == retired as u64
+                ),
+                "type 0x{retired:02x} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn draft20_wire_layouts_for_control_messages() {
         fn encoded(msg: Message) -> Vec<u8> {
             let mut buf = bytes::BytesMut::new();
             msg.encode(&mut buf).unwrap();
@@ -573,30 +592,18 @@ mod tests {
         );
 
         assert_eq!(
-            encoded(Message::PublishOk(PublishOk {
-                id: 0,
-                params: KeyValuePairs::default(),
-            })),
-            vec![0x1e, 0x00, 0x02, 0x00, 0x00]
+            encoded(Message::PublishStateNotify(PublishStateNotify::default())),
+            vec![0x22, 0x00, 0x01, 0x00]
         );
 
         assert_eq!(
             encoded(Message::Fetch(Fetch {
                 id: 0,
-                fetch_type: FetchType::Standalone,
-                standalone_fetch: Some(StandaloneFetch {
-                    track_namespace: ns,
-                    track_name: "t".into(),
-                    start_location: Location::new(0, 0),
-                    end_location: Location::new(0, 1),
-                }),
-                joining_fetch: None,
+                track_namespace: ns,
+                track_name: "t".into(),
                 params: KeyValuePairs::default(),
             })),
-            vec![
-                0x16, 0x00, 0x0d, 0x00, 0x01, 0x01, 0x02, b'n', b's', 0x01, b't', 0x00, 0x00, 0x00,
-                0x01, 0x00
-            ]
+            vec![0x16, 0x00, 0x08, 0x00, 0x01, 0x02, b'n', b's', 0x01, b't', 0x00]
         );
 
         assert_eq!(
@@ -631,7 +638,7 @@ mod tests {
         );
 
         assert_eq!(
-            encoded(Message::PublishBlocked(PublishBlocked {
+            encoded(Message::PublishSkipped(PublishSkipped {
                 track_namespace_suffix: TrackNamespacePrefix::new(),
                 track_name: "t".into(),
             })),

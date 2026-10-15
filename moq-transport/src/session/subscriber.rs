@@ -19,13 +19,13 @@ use crate::{
     data,
     message::{self, Message},
     mlog,
-    serve::{self, FullTrackName, ServeError},
+    serve::{self, ServeError},
 };
 
 use crate::watch::Queue;
 
 use super::{
-    BidiResponse, BidiResponseMap, DoneOutcome, NameRegistry, PublishDoneInfo, PublishReceived,
+    BidiResponse, BidiResponseMap, DoneOutcome, PublishDoneInfo, PublishReceived,
     PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, Session,
     SessionError, Subscribe, SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
 };
@@ -72,14 +72,6 @@ const MAX_CONCURRENT_DRAINS: usize = 256;
 /// [`disarm`](Self::disarm)ed and cleanup passes to `SubscribeNamespaceRecv`,
 /// whose `Drop` removes the entry when the subscription ends.
 struct SubscribeNamespaceCleanup {
-    subscriber: Subscriber,
-    request_id: u64,
-    active: bool,
-}
-
-/// Releases an outbound SUBSCRIBE's track-name reservation until its receive
-/// state is registered and takes ownership of cleanup.
-struct SubscribeCleanup {
     subscriber: Subscriber,
     request_id: u64,
     active: bool,
@@ -191,28 +183,6 @@ impl Drop for SubscribeStreamCleanup {
         }
         if let Some(done) = self.done.take() {
             let _ = done.send(());
-        }
-    }
-}
-
-impl SubscribeCleanup {
-    fn new(subscriber: Subscriber, request_id: u64) -> Self {
-        Self {
-            subscriber,
-            request_id,
-            active: true,
-        }
-    }
-
-    fn disarm(mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for SubscribeCleanup {
-    fn drop(&mut self) {
-        if self.active {
-            self.subscriber.drop_subscribe_name(self.request_id);
         }
     }
 }
@@ -370,9 +340,6 @@ pub struct Subscriber {
     /// registered; bounded by `MAX_PENDING_DATAGRAMS`.
     pending_datagrams: Arc<AtomicUsize>,
 
-    /// Tracks this endpoint subscribes to, for the §5.1 duplicate check.
-    subscriber_names: Arc<Mutex<NameRegistry>>,
-
     /// Transport-side state for inbound PUBLISH requests, keyed by request id.
     publishes_received: Arc<Mutex<HashMap<u64, PublishReceivedRecv>>>,
 
@@ -406,6 +373,9 @@ pub struct Subscriber {
     /// Channel for sending bidi reader futures to `Session::run`, which polls
     /// them cooperatively under structured concurrency (no task is spawned).
     bidi_task_tx: super::BidiTaskSender,
+
+    /// Outbound FETCHes waiting for their data stream.
+    fetches: super::fetch::FetchStreams,
 }
 
 #[derive(Default)]
@@ -465,11 +435,11 @@ impl Subscriber {
             track_alias_map: Default::default(),
             track_alias_notify: Arc::new(Notify::new()),
             pending_datagrams: Default::default(),
-            subscriber_names: Default::default(),
             publishes_received: Default::default(),
             publish_received_queue: Default::default(),
             bidi_task_tx,
             bidi_response_map,
+            fetches: Default::default(),
         }
     }
 
@@ -489,10 +459,6 @@ impl Subscriber {
     ) -> Result<(Session, Self), SessionError> {
         let (session, _, subscriber) = Session::connect(session, None, transport).await?;
         Ok((session, subscriber))
-    }
-
-    pub(super) fn close_session(&self, code: u32, reason: &str) {
-        self.webtransport.close(code, reason);
     }
 
     /// Wait for the next inbound PUBLISH_NAMESPACE from the peer, if any.
@@ -609,6 +575,51 @@ impl Subscriber {
         // TODO(itzmanish): make async and wait for response?
     }
 
+    /// Send a FETCH (draft-20 §10.13) for `params`' LOCATION_FILTER and
+    /// GROUP_ORDER. Objects arrive through [`super::Fetch::next`] while
+    /// `Session::run` is polled; dropping the [`super::Fetch`] cancels it.
+    pub async fn fetch(
+        &mut self,
+        track_namespace: TrackNamespace,
+        track_name: impl Into<TrackName>,
+        params: KeyValuePairs,
+    ) -> Result<super::Fetch, SessionError> {
+        let msg = message::Fetch {
+            id: self.get_next_request_id()?,
+            track_namespace,
+            track_name: track_name.into(),
+            params,
+        };
+        // Reject a malformed filter before anything is sent or registered.
+        msg.params.location_filter()?;
+        msg.params.group_order()?;
+        // Registered first: the data stream can beat the stream open.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .insert(msg.id, tx);
+        let opened = self.open_request_stream(&msg.clone().into()).await;
+        let (mut writer, reader) = match opened {
+            Ok(streams) => streams,
+            Err(err) => {
+                if let Ok(mut fetches) = self.fetches.lock() {
+                    fetches.remove(&msg.id);
+                }
+                return Err(err);
+            }
+        };
+        // No REQUEST_UPDATE follows, so FIN now (§3.3.2).
+        writer.finish()?;
+        super::Fetch::new(
+            self.webtransport.clone(),
+            self.fetches.clone(),
+            &msg,
+            reader,
+            rx,
+        )
+    }
+
     /// Subscribe to a track by creating a new subscribe request to the publisher.  Block until subscription is closed.
     pub async fn subscribe(&mut self, track: serve::TrackWriter) -> Result<(), ServeError> {
         let subscribe = self.subscribe_open(track).await?;
@@ -670,26 +681,6 @@ impl Subscriber {
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
 
-        // §5.1: at most one subscriber-role subscription per track. Outbound
-        // SUBSCRIBE and inbound PUBLISH both make this endpoint the subscriber,
-        // so they share one registry. Reserved before the stream is opened;
-        // `SubscribeCleanup` releases it until the receive state is registered.
-        let full_name = FullTrackName {
-            namespace: track.namespace.clone(),
-            name: track.name.clone(),
-        };
-        {
-            let mut names = self
-                .subscriber_names
-                .lock()
-                .map_err(|_| ServeError::internal_ctx("subscriber_names lock poisoned"))?;
-            if names.contains_name(&full_name) {
-                return Err(ServeError::Duplicate);
-            }
-            names.insert(full_name, request_id);
-        }
-        let cleanup = SubscribeCleanup::new(self.clone(), request_id);
-
         let (mut send, recv, subscribe) =
             match Subscribe::new(self.clone(), request_id, track, params) {
                 Ok(subscribe) => subscribe,
@@ -723,7 +714,6 @@ impl Subscriber {
         match self.subscribes.lock() {
             Ok(mut subscribes) => {
                 subscribes.insert(request_id, recv);
-                cleanup.disarm();
             }
             Err(_) => {
                 tracing::warn!(
@@ -768,6 +758,8 @@ impl Subscriber {
                         SubscribeStreamEvent::Cancel(cancel) => {
                             match cancel {
                                 Ok(code) => {
+                                    // Cancel (§3.3.3): RESET_STREAM our direction and
+                                    // STOP_SENDING the publisher's.
                                     request_writer.reset(code);
                                     response_reader.stop(code);
                                     writing = false;
@@ -823,6 +815,10 @@ impl Subscriber {
                             match response {
                                 Ok(msg) => {
                                     let terminal = matches!(msg, Message::PublishDone(_) | Message::RequestError(_));
+                                    if let Message::PublishStateNotify(notify) = &msg {
+                                        subscriber_clone.recv_publish_state_notify(notify);
+                                        continue;
+                                    }
                                     if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
                                         if let Err(err) = subscriber_clone.recv_message(pub_msg) {
                                             break Err(err);
@@ -941,6 +937,16 @@ impl Subscriber {
         let _ = self.outgoing.push(msg.into());
     }
 
+    /// PUBLISH_STATE_NOTIFY on a subscription this endpoint receives
+    /// (draft-20 §10.10). Informative only: it is never answered.
+    pub(super) fn recv_publish_state_notify(&self, msg: &message::PublishStateNotify) {
+        tracing::debug!(
+            target: "moq_transport::control",
+            params = msg.params.0.len(),
+            "received PUBLISH_STATE_NOTIFY"
+        );
+    }
+
     /// Receive a message from the publisher via the control stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         match &msg {
@@ -956,21 +962,29 @@ impl Subscriber {
             }
             message::Publisher::Publish(msg) => self.recv_publish(msg)?,
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
-            message::Publisher::PublishBlocked(_) => {
+            message::Publisher::PublishSkipped(_) => {
                 return Err(SessionError::ProtocolViolation(
-                    "PUBLISH_BLOCKED is only valid on a SUBSCRIBE_TRACKS stream".to_string(),
+                    "PUBLISH_SKIPPED is only valid on a SUBSCRIBE_TRACKS stream".to_string(),
                 ));
             }
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg)?,
+            // Only valid on a subscription stream from its publisher; those
+            // paths call recv_publish_state_notify directly.
+            message::Publisher::PublishStateNotify(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "PUBLISH_STATE_NOTIFY is only valid on a subscription from its publisher"
+                        .to_string(),
+                ));
+            }
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
             message::Publisher::RequestError(msg) => self.recv_request_error(msg)?,
-            // FETCH_OK is part of draft-16, but FETCH is not implemented here yet.
+            // FETCH_OK belongs on the FETCH's request stream, read by `Fetch`.
             message::Publisher::FetchOk(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     request_id = msg.id,
-                    "received FETCH_OK for unsupported FETCH — ignoring"
+                    "received FETCH_OK outside its request stream — ignoring"
                 );
             }
         }
@@ -1065,14 +1079,7 @@ impl Subscriber {
         if let Ok(mut aliases) = self.track_alias_map.lock() {
             aliases.remove_by_request_id(id);
         }
-        self.drop_subscribe_name(id);
         Some(subscribe)
-    }
-
-    fn drop_subscribe_name(&self, id: u64) {
-        if let Ok(mut names) = self.subscriber_names.lock() {
-            names.remove_by_request_id(id);
-        }
     }
 
     /// Handle an outbound SUBSCRIBE whose request stream ended.
@@ -1499,13 +1506,8 @@ impl Subscriber {
             return Ok(());
         }
 
-        let full_name = FullTrackName {
-            namespace: msg.track_namespace.clone(),
-            name: msg.track_name.clone(),
-        };
-
         // Parse FORWARD and LARGEST_OBJECT before reserving any session state,
-        // so malformed parameters cannot leave stale alias or name entries.
+        // so malformed parameters cannot leave a stale alias entry.
         let initial_forward = msg
             .params
             .forward()
@@ -1513,33 +1515,9 @@ impl Subscriber {
             .unwrap_or(true);
         let largest_location = msg.params.largest_object().map_err(SessionError::Decode)?;
 
-        // Reserve the track name first. The duplicate-subscription check runs
-        // before the alias check on purpose: a duplicate PUBLISH for the same
-        // track is a request error, not a session-closing alias collision.
-        {
-            let mut names = self
-                .subscriber_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            if names.contains_name(&full_name) {
-                drop(names);
-                self.send_request_error(
-                    "publish",
-                    message::RequestError {
-                        id: msg.id,
-                        error_code: message::RequestErrorCode::DuplicateSubscription as u64,
-                        retry_interval: 0,
-                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
-                    },
-                );
-                return Ok(());
-            }
-
-            names.insert(full_name, msg.id);
-        }
-
-        // Reserve the alias without holding subscriber_names, so cleanup and
-        // inbound PUBLISH handling have no lock-order dependency.
+        // §5.1 allows several subscriptions to one track, so a PUBLISH for a
+        // track this endpoint already subscribes to is accepted; only the
+        // alias must be new.
         let alias_result = match self.track_alias_map.lock() {
             Ok(mut aliases) => {
                 if aliases.contains_alias(msg.track_alias) {
@@ -1552,12 +1530,7 @@ impl Subscriber {
             }
             Err(_) => Err(SessionError::Internal),
         };
-        if let Err(err) = alias_result {
-            if let Ok(mut names) = self.subscriber_names.lock() {
-                names.remove_by_request_id(msg.id);
-            }
-            return Err(err);
-        }
+        alias_result?;
 
         // Allocate the track. The transport owns the writer; the application
         // gets the reader from PublishReceived::ok.
@@ -1616,14 +1589,6 @@ impl Subscriber {
     /// [`PublishReceived::ok`] or dropped to reject.
     pub async fn publish_received(&mut self) -> Option<PublishReceived> {
         self.publish_received_queue.pop().await
-    }
-
-    #[cfg(test)]
-    pub(super) fn has_subscriber_name(&self, name: &FullTrackName) -> bool {
-        self.subscriber_names
-            .lock()
-            .map(|names| names.contains_name(name))
-            .unwrap_or(false)
     }
 
     /// Abandon an inbound PUBLISH whose request stream closed without
@@ -1696,10 +1661,6 @@ impl Subscriber {
             .lock()
             .map_err(|_| SessionError::Internal)?
             .remove_by_request_id(request_id);
-        self.subscriber_names
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .remove_by_request_id(request_id);
         Ok(())
     }
 
@@ -1716,7 +1677,6 @@ impl Subscriber {
             }
             // Preserve TIMEOUT as a semantic variant rather than an opaque code.
             c if c == RequestErrorCode::Timeout as u64 => ServeError::Timeout,
-            c if c == RequestErrorCode::DuplicateSubscription as u64 => ServeError::Duplicate,
             c if c == RequestErrorCode::NotSupported as u64 => {
                 ServeError::NotImplemented(msg.reason.0.clone())
             }
@@ -1860,7 +1820,22 @@ impl Subscriber {
             stream_header.header_type
         );
 
-        // No fetch support yet
+        if let Some(fetch_header) = &stream_header.fetch_header {
+            let waiting = self
+                .fetches
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .remove(&fetch_header.request_id);
+            // A cancelled or unknown FETCH: its data is of no interest.
+            let rejected = match waiting {
+                Some(tx) => tx.send(reader).err(),
+                None => Some(reader),
+            };
+            if let Some(mut reader) = rejected {
+                reader.stop(super::fetch::CANCELLED);
+            }
+            return Ok(());
+        }
         if !stream_header.header_type.is_subgroup() {
             return Err(SessionError::unimplemented("non-SUBGROUP stream types"));
         }
@@ -3192,6 +3167,7 @@ mod tests {
                 forward: true,
                 start_location: None,
                 end_group_id: None,
+                end_object_id: None,
             },
         );
         let verify = async move {
@@ -3409,7 +3385,6 @@ mod tests {
         };
 
         assert!(subscriber.subscribes.lock().unwrap().is_empty());
-        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3438,11 +3413,132 @@ mod tests {
             .is_err(),
             "SUBSCRIBE unexpectedly opened without bidi stream credit"
         );
-        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
+    }
+
+    /// PUBLISH_STATE_NOTIFY outside a subscription (e.g. on the control
+    /// stream) closes the session (draft-20 §10.10).
+    #[tokio::test]
+    async fn publish_state_notify_outside_a_subscription_is_a_protocol_violation() {
+        let (client, _server) = loopback_session_pair().await;
+        let mut subscriber = test_subscriber(client);
+        let result = subscriber.recv_message(message::Publisher::PublishStateNotify(
+            message::PublishStateNotify::default(),
+        ));
+        assert!(matches!(result, Err(SessionError::ProtocolViolation(_))));
+    }
+
+    /// A follow-up PUBLISH_STATE_NOTIFY is accepted after an inbound PUBLISH
+    /// (sent by its publisher) and closes the session after an inbound
+    /// SUBSCRIBE (sent by the subscriber).
+    #[tokio::test]
+    async fn publish_state_notify_follow_up_depends_on_request_kind() {
+        async fn follow_up(
+            kind: super::super::BidiRequestKind,
+        ) -> Option<Result<(), SessionError>> {
+            let (client, server) = loopback_session_pair().await;
+            let peer = tokio::spawn(async move {
+                let (send, _recv) = server.open_bi().await.unwrap();
+                let mut writer = Writer::new(send);
+                Session::encode_bidi_response(
+                    &mut writer,
+                    &Message::PublishStateNotify(message::PublishStateNotify::default()),
+                )
+                .await
+                .unwrap();
+                // Keep the stream open so an accepted notice parks the reader.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+            let (_send, recv) = client.accept_bi().await.unwrap();
+            let mut reader = Reader::new(recv);
+            let mut publisher = None;
+            let mut subscriber = Some(test_subscriber(client));
+            let result = tokio::time::timeout(
+                Duration::from_millis(300),
+                Session::read_request_follow_ups(
+                    &mut reader,
+                    0,
+                    kind,
+                    &mut publisher,
+                    &mut subscriber,
+                ),
+            )
+            .await
+            .ok()
+            .map(|r| r.map(|_| ()));
+            peer.abort();
+            result
+        }
+
+        assert!(
+            follow_up(super::super::BidiRequestKind::Publish)
+                .await
+                .is_none(),
+            "an accepted notice keeps reading the PUBLISH stream"
+        );
+        assert!(matches!(
+            follow_up(super::super::BidiRequestKind::Subscribe).await,
+            Some(Err(SessionError::ProtocolViolation(_)))
+        ));
+    }
+
+    /// The publisher of an outbound SUBSCRIBE may send PUBLISH_STATE_NOTIFY
+    /// before SUBSCRIBE_OK; the subscription still opens.
+    #[tokio::test]
+    async fn outbound_subscribe_accepts_publish_state_notify() {
+        let (client, server) = loopback_session_pair().await;
+        let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
+
+        let peer = tokio::spawn(async move {
+            let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            let request_id = match peer_reader.decode::<Message>().await.unwrap() {
+                Message::Subscribe(msg) => msg.id,
+                msg => panic!("unexpected request: {}", msg.name()),
+            };
+            for msg in [
+                Message::PublishStateNotify(message::PublishStateNotify::default()),
+                Message::SubscribeOk(message::SubscribeOk {
+                    id: request_id,
+                    track_alias: 42,
+                    params: Default::default(),
+                    track_extensions: Default::default(),
+                }),
+            ] {
+                Session::encode_bidi_response(&mut peer_writer, &msg)
+                    .await
+                    .unwrap();
+            }
+            // Hold the session and stream open while the subscription is checked.
+            (server, peer_writer, peer_reader)
+        });
+
+        let opening = tokio::spawn(async move {
+            let result = subscriber.subscribe_open(test_track("video")).await;
+            (subscriber, result)
+        });
+        let pump = tokio::time::timeout(Duration::from_secs(2), bidi_task_rx.recv())
+            .await
+            .expect("SUBSCRIBE response pump was not registered")
+            .expect("SUBSCRIBE response pump queue closed");
+        let pump = tokio::spawn(pump);
+
+        let (_subscriber, subscribe) = tokio::time::timeout(Duration::from_secs(2), opening)
+            .await
+            .expect("SUBSCRIBE did not open")
+            .unwrap();
+        assert!(subscribe.is_ok(), "SUBSCRIBE failed: {:?}", subscribe.err());
+        let _keep_open = peer.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !pump.is_finished(),
+            "the notice must not end the subscription"
+        );
+        pump.abort();
     }
 
     #[tokio::test]
-    async fn dropping_accepted_subscribe_sends_unsubscribe_on_request_stream() {
+    async fn dropping_accepted_subscribe_cancels_the_request_stream() {
         let (client, server) = loopback_session_pair().await;
         let (mut subscriber, mut bidi_task_rx) = test_subscriber_with_tasks(client);
 
@@ -3467,11 +3563,11 @@ mod tests {
             .await
             .unwrap();
 
-            let message = Session::decode_bidi_response(&mut peer_reader, request_id)
-                .await
-                .unwrap();
+            // Draft-20 cancellation: the subscriber resets its request
+            // direction; no message is sent. A publisher then ends its own.
+            let request = Session::decode_bidi_response(&mut peer_reader, request_id).await;
             peer_writer.finish().unwrap();
-            message
+            request.map(|m| m.name()).map_err(|e| e.is_stream_error())
         });
 
         let opening = tokio::spawn(async move {
@@ -3487,20 +3583,21 @@ mod tests {
         let (subscriber, subscribe) = opening.await.unwrap();
         drop(subscribe.unwrap());
 
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), peer)
-                .await
-                .expect("peer did not receive UNSUBSCRIBE")
-                .unwrap(),
-            Message::Unsubscribe(message::Unsubscribe { id: 0 })
-        ));
+        let request = tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("peer did not observe the cancellation")
+            .unwrap();
+        assert_eq!(
+            request,
+            Err(true),
+            "request direction must be reset, not sent a frame"
+        );
         tokio::time::timeout(Duration::from_secs(2), pump)
             .await
             .expect("SUBSCRIBE response pump did not stop")
             .unwrap()
             .unwrap();
         assert!(subscriber.subscribes.lock().unwrap().is_empty());
-        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3529,12 +3626,12 @@ mod tests {
             .await
             .unwrap();
 
-            let message = Session::decode_bidi_response(&mut peer_reader, request_id)
-                .await
-                .unwrap();
-            let _ = peer_reader.done().await;
+            let request = Session::decode_bidi_response(&mut peer_reader, request_id).await;
             let response_stopped = peer_writer.closed().await.unwrap();
-            (message, response_stopped)
+            (
+                request.map(|m| m.name()).map_err(|e| e.is_stream_error()),
+                response_stopped,
+            )
         });
 
         let mut subscribe = subscriber
@@ -3551,11 +3648,12 @@ mod tests {
         .await
         .expect("bounded unsubscribe did not reset the request stream");
 
-        let (message, response_stopped) = peer.await.unwrap();
-        assert!(matches!(
-            message,
-            Message::Unsubscribe(message::Unsubscribe { id: 0 })
-        ));
+        let (request, response_stopped) = peer.await.unwrap();
+        assert_eq!(
+            request,
+            Err(true),
+            "request direction must be reset, not sent a frame"
+        );
         assert_eq!(
             response_stopped,
             Some(u8::try_from(super::super::CANCELLED_STREAM_CODE).unwrap())
@@ -3566,7 +3664,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(subscriber.subscribes.lock().unwrap().is_empty());
-        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3700,7 +3797,6 @@ mod tests {
             .expect("PUBLISH_DONE should arm a drain timer");
         assert!(!subscriber.subscribes.lock().unwrap().is_empty());
         assert!(!subscriber.track_alias_map.lock().unwrap().is_empty());
-        assert!(!subscriber.subscriber_names.lock().unwrap().is_empty());
 
         // Session::run drops its collected futures when any session branch ends.
         drop(drain);
@@ -3712,7 +3808,6 @@ mod tests {
         ));
         assert!(subscriber.subscribes.lock().unwrap().is_empty());
         assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
-        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3956,36 +4051,8 @@ mod tests {
         assert_eq!(subgroups.next().await.unwrap().unwrap().priority, 200);
     }
 
-    /// A second PUBLISH for a track we already subscribe to is rejected as a
-    /// request error, leaving the first subscription intact (§5.1).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn duplicate_publish_for_same_track_is_rejected() {
-        let mut subscriber = test_subscriber(loopback_session().await);
-        let publish = |id, alias| message::Publish {
-            id,
-            track_namespace: TrackNamespace::from_utf8_path("test/ns"),
-            track_name: "video".into(),
-            track_alias: alias,
-            params: Default::default(),
-            track_extensions: Default::default(),
-        };
-
-        subscriber.recv_publish(&publish(1, 7)).unwrap();
-        subscriber.recv_publish(&publish(3, 9)).unwrap();
-
-        assert!(
-            !subscriber
-                .publishes_received
-                .lock()
-                .unwrap()
-                .contains_key(&3),
-            "duplicate PUBLISH must not create a second subscription"
-        );
-        assert_eq!(subscriber.track_alias_map.lock().unwrap().get(9), None);
-    }
-
     /// A PUBLISH request stream that dies without PUBLISH_DONE must still
-    /// release its state, or the track writer, alias, and name reservation
+    /// release its state, or the track writer and alias
     /// leak for the life of the session and `closed()` never resolves.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborting_inbound_publish_releases_state_and_unblocks_closed() {
@@ -4012,33 +4079,29 @@ mod tests {
         );
     }
 
-    /// An outbound SUBSCRIBE claims the track name, so a PUBLISH offering the
-    /// same track is rejected rather than creating a second subscriber-role
-    /// subscription for it (§5.1).
+    /// §5.1 allows concurrent subscriptions to one track, so a second PUBLISH
+    /// for a track this endpoint already receives is accepted alongside the
+    /// first, each under its own Request ID and alias.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn publish_for_already_subscribed_track_is_rejected() {
+    async fn publish_for_already_subscribed_track_is_accepted() {
         let mut subscriber = test_subscriber(loopback_session().await);
-        subscriber.subscriber_names.lock().unwrap().insert(
-            FullTrackName {
-                namespace: TrackNamespace::from_utf8_path("test/ns"),
-                name: "video".into(),
-            },
-            0,
-        );
 
-        subscriber
-            .recv_publish(&message::Publish {
-                id: 1,
-                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
-                track_name: "video".into(),
-                track_alias: 7,
-                params: Default::default(),
-                track_extensions: Default::default(),
-            })
-            .unwrap();
+        for (id, track_alias) in [(1, 7), (3, 9)] {
+            subscriber
+                .recv_publish(&message::Publish {
+                    id,
+                    track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                    track_name: "video".into(),
+                    track_alias,
+                    params: Default::default(),
+                    track_extensions: Default::default(),
+                })
+                .unwrap();
+        }
 
-        assert!(subscriber.publishes_received.lock().unwrap().is_empty());
-        assert_eq!(subscriber.track_alias_map.lock().unwrap().get(7), None);
+        assert_eq!(subscriber.publishes_received.lock().unwrap().len(), 2);
+        let aliases = subscriber.track_alias_map.lock().unwrap();
+        assert!(aliases.get(7).is_some() && aliases.get(9).is_some());
     }
 
     /// Track Aliases are session-scoped (§10.1), so a second PUBLISH reusing a
@@ -4193,10 +4256,6 @@ mod tests {
         assert!(
             subscriber.track_alias_map.lock().unwrap().is_empty(),
             "the Track Alias must be released"
-        );
-        assert!(
-            subscriber.subscriber_names.lock().unwrap().is_empty(),
-            "the track name reservation must be released so it can be republished"
         );
     }
 
@@ -4472,6 +4531,130 @@ mod tests {
 
         assert!(subscriber.publishes_received.lock().unwrap().is_empty());
         assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
-        assert!(subscriber.subscriber_names.lock().unwrap().is_empty());
+    }
+
+    /// Dropping a FETCH cancels it with STOP_SENDING(CANCELLED) on the
+    /// request stream, after its own direction was FINed (draft-20 §5.2).
+    #[tokio::test]
+    async fn dropping_a_fetch_stops_its_request_stream() {
+        let (session, peer) = loopback_session_pair().await;
+        let mut subscriber = test_subscriber(session);
+        let fetch = subscriber
+            .fetch(
+                TrackNamespace::from_utf8_path("live"),
+                "video",
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let (mut send, mut recv) = peer.accept_bi().await.unwrap();
+        let mut request = Vec::new();
+        while let Some(chunk) = recv.read(usize::MAX).await.unwrap() {
+            request.extend_from_slice(&chunk);
+        }
+        assert_eq!(request.first(), Some(&(message::wire_id::Fetch as u8)));
+
+        drop(fetch);
+        let stopped = tokio::time::timeout(Duration::from_secs(2), send.closed())
+            .await
+            .expect("no STOP_SENDING")
+            .unwrap();
+        assert_eq!(stopped, Some(1));
+        assert!(subscriber.fetches.lock().unwrap().is_empty());
+    }
+
+    /// FETCH_OK split across reads survives the data stream winning the race
+    /// in `Fetch::next`: no half-read response bytes are lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_fetch_ok_survives_the_data_stream_arriving_first() {
+        use crate::coding::Encode;
+
+        let (session, peer) = loopback_session_pair().await;
+        let mut subscriber = test_subscriber(session.clone());
+        let mut fetch = subscriber
+            .fetch(
+                TrackNamespace::from_utf8_path("live"),
+                "video",
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let (mut send, mut recv) = peer.accept_bi().await.unwrap();
+        while recv.read(usize::MAX).await.unwrap().is_some() {}
+
+        let ok = message::FetchOk {
+            id: fetch.request_id(),
+            end_of_track: true,
+            end_location: crate::coding::Location::new(5, 10),
+            params: KeyValuePairs::default(),
+            track_extensions: Default::default(),
+        };
+        let frame =
+            super::super::Session::encode_bidi_response_frame(&Message::FetchOk(ok.clone()))
+                .unwrap()
+                .freeze();
+        let (head, tail) = frame.split_at(frame.len() / 2);
+        send.write(head).await.unwrap();
+
+        let peer_data = peer.clone();
+        let id = fetch.request_id();
+        let routed = tokio::spawn(async move {
+            // Let `next` park mid-frame on the response before data arrives.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut uni = peer_data.open_uni().await.unwrap();
+            let mut header = bytes::BytesMut::new();
+            data::FetchHeader {
+                header_type: data::StreamHeaderType::Fetch,
+                request_id: id,
+            }
+            .encode(&mut header)
+            .unwrap();
+            uni.write(&header).await.unwrap();
+            uni.finish().unwrap();
+            let stream = session.accept_uni().await.unwrap();
+            subscriber.recv_stream(stream).await.unwrap();
+        });
+
+        let item = tokio::time::timeout(Duration::from_secs(2), fetch.next())
+            .await
+            .expect("FETCH data timed out")
+            .unwrap();
+        assert!(item.is_none(), "empty FETCH stream ends at FIN");
+        routed.await.unwrap();
+
+        send.write(tail).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), fetch.ok())
+            .await
+            .expect("FETCH_OK timed out")
+            .expect("FETCH_OK intact");
+        assert_eq!(got.end_location, ok.end_location);
+        assert!(got.end_of_track);
+    }
+
+    /// Data for a FETCH this endpoint is not waiting on is stopped; the
+    /// session survives, since it can trail a cancel.
+    #[tokio::test]
+    async fn fetch_stream_for_an_unknown_request_is_stopped() {
+        use crate::coding::Encode;
+
+        let (session, peer) = loopback_session_pair().await;
+        let subscriber = test_subscriber(session.clone());
+        let mut send = peer.open_uni().await.unwrap();
+        let mut header = bytes::BytesMut::new();
+        data::FetchHeader {
+            header_type: data::StreamHeaderType::Fetch,
+            request_id: 9,
+        }
+        .encode(&mut header)
+        .unwrap();
+        send.write(&header).await.unwrap();
+
+        let stream = session.accept_uni().await.unwrap();
+        subscriber.recv_stream(stream).await.unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(2), send.closed())
+            .await
+            .expect("no STOP_SENDING")
+            .unwrap();
+        assert_eq!(stopped, Some(1));
     }
 }

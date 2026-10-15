@@ -33,11 +33,13 @@
 //! relay.run().await?;
 //! ```
 
+pub mod admin;
 mod api;
 mod auth;
 mod consumer;
 mod coordinator;
 mod covering_prefix_set;
+mod drain;
 mod interest;
 mod local;
 pub mod metrics;
@@ -52,6 +54,7 @@ pub use api::*;
 pub use auth::*;
 pub use consumer::*;
 pub use coordinator::*;
+pub use drain::*;
 pub use local::*;
 // Re-export moq_transport so callers of the auth API (AuthHook, AuthzOperation,
 // decode_setup_tokens) can use TrackNamespace, KeyValuePairs etc. without
