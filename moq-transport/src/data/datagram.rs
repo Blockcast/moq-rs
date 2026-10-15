@@ -310,7 +310,8 @@ mod tests {
 
     #[test]
     fn classifies_exact_draft_18_type_registry() {
-        for code in 0u8..=0x3f {
+        // Draft-20 keeps the same registry; bit 4, bit 6 and anything >= 128 are invalid.
+        for code in 0u8..=0x7f {
             let mut encoded = Bytes::from(vec![code]);
             let decoded = DatagramType::decode(&mut encoded);
             let expected = VALID_TYPES
@@ -485,5 +486,22 @@ mod tests {
             empty_properties.encode(&mut encoded),
             Err(EncodeError::InvalidValue)
         ));
+    }
+
+    #[test]
+    fn draft_20_type_flags_accept_non_minimal_and_reject_wide_values() {
+        let mut encoded = Bytes::from_static(&[0x80, 0x0c]);
+        assert_eq!(
+            DatagramType::decode(&mut encoded).unwrap(),
+            DatagramType::PayloadDefaultPriority
+        );
+        for value in [0x80_u64, 0x8c, 0x4000, u64::MAX] {
+            let mut encoded = BytesMut::new();
+            value.encode(&mut encoded).unwrap();
+            assert!(matches!(
+                DatagramType::decode(&mut encoded),
+                Err(DecodeError::InvalidDatagramType)
+            ));
+        }
     }
 }

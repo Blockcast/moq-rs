@@ -590,4 +590,85 @@ mod tests {
             EncodeError::InvalidValue
         ));
     }
+
+    /// The first draft-20 §11.6 example: one subgroup, Type Flags 0x14.
+    #[test]
+    fn decodes_draft_20_example_subgroup_with_explicit_id_and_priority() {
+        let wire: &[u8] = &[
+            0x14, 0x02, 0x00, 0x00, 0x00, // header: alias 2, group 0, subgroup 0, priority 0
+            0x00, 0x04, b'a', b'b', b'c', b'd', // Object ID 0
+            0x00, 0x04, b'e', b'f', b'g', b'h', // Object ID 1
+        ];
+        let mut r = Bytes::from_static(wire);
+        let header = StreamHeader::decode(&mut r)
+            .unwrap()
+            .subgroup_header
+            .unwrap();
+        assert_eq!(header.track_alias, 2);
+        assert_eq!(header.group_id, 0);
+        assert_eq!(header.subgroup_id, Some(0));
+        assert_eq!(header.publisher_priority, 0);
+
+        let mut previous = None;
+        for (expected_id, payload) in [(0, b"abcd"), (1, b"efgh")] {
+            let object = SubgroupObject::decode(&mut r).unwrap();
+            let id = decode_object_id_delta(&mut previous, object.object_id_delta).unwrap();
+            assert_eq!(id, expected_id);
+            assert_eq!(r.split_to(object.payload_length).as_ref(), payload);
+        }
+        assert!(r.is_empty());
+
+        let mut encoded = BytesMut::new();
+        header.encode(&mut encoded).unwrap();
+        assert_eq!(&encoded[..], &wire[..5]);
+    }
+
+    /// The second draft-20 §11.6 example: Type Flags 0x35 (properties, explicit
+    /// Subgroup ID, default priority). The draft's printed lengths (Properties
+    /// Length 33, a 21-byte value) do not match its 14-byte "traceID:123456",
+    /// so the lengths here are derived from the printed values.
+    #[test]
+    fn decodes_draft_20_example_subgroup_with_properties() {
+        let wire: &[u8] = &[
+            0x35, 0x02, 0x00, 0x00, // header: alias 2, group 0, subgroup 0; no priority
+            0x00, 0x16, // Object ID 0, Properties Length 22
+            0x04, 0xf0, 0x82, 0x57, 0xdc, 0xd3, // Type 4 = 2186796243
+            0x49, 0x0e, b't', b'r', b'a', b'c', b'e', b'I', b'D', b':', b'1', b'2', b'3', b'4',
+            b'5', b'6', // Type 77, 14 bytes
+            0x04, b'a', b'b', b'c', b'd', 0x00, 0x00, 0x04, b'e', b'f', b'g',
+            b'h', // Object ID 1, no properties
+        ];
+        let mut r = Bytes::from_static(wire);
+        let header = StreamHeader::decode(&mut r)
+            .unwrap()
+            .subgroup_header
+            .unwrap();
+        assert_eq!(header.header_type.value(), 0x35);
+        assert_eq!(header.subgroup_id, Some(0));
+        assert_eq!(header.publisher_priority, DEFAULT_PUBLISHER_PRIORITY);
+
+        let first = SubgroupObjectExt::decode(&mut r).unwrap();
+        assert_eq!(first.object_id_delta, 0);
+        assert_eq!(
+            first.extension_headers.get(4).map(|kvp| &kvp.value),
+            Some(&crate::coding::Value::IntValue(2_186_796_243))
+        );
+        assert_eq!(
+            first.extension_headers.get(77).map(|kvp| &kvp.value),
+            Some(&crate::coding::Value::BytesValue(
+                b"traceID:123456".to_vec()
+            ))
+        );
+        assert_eq!(r.split_to(first.payload_length).as_ref(), b"abcd");
+
+        let second = SubgroupObjectExt::decode(&mut r).unwrap();
+        assert_eq!(second.object_id_delta, 0);
+        assert!(second.extension_headers.is_empty());
+        assert_eq!(r.split_to(second.payload_length).as_ref(), b"efgh");
+        assert!(r.is_empty());
+
+        let mut encoded = BytesMut::new();
+        first.encode(&mut encoded).unwrap();
+        assert_eq!(&encoded[..], &wire[4..4 + encoded.len()]);
+    }
 }
