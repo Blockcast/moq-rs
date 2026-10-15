@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
                 args.mmtp_udp_bind,
                 args.mmtp_udp_source,
                 args.mmtp_udp_iface,
+                args.mmtp_udp_rcvbuf_bytes,
             )
             .await?;
             tracing::info!(addr = %socket.local_addr()?, "listening for datagrams");
@@ -123,12 +124,8 @@ async fn main() -> Result<()> {
     // ---- moq-transport session, retried with backoff on relay session loss ----
 
     let tls = args.tls.load()?;
-    let mut quic_config = quic::Config::new(args.bind, None, tls.clone())?;
     let wire_profile = args.wire_profile.map(WireProfile::from);
-    if let Some(profile) = wire_profile {
-        quic_config = quic_config.with_wire_profiles([WireProfile::Draft16, profile]);
-    }
-    let quic_endpoint = quic::Endpoint::new(quic_config)?;
+    let quic_endpoint = quic::Endpoint::new(quic_config(&args, tls.clone())?)?;
 
     let backoff_min = Duration::from_millis(args.reconnect_backoff_min_ms);
     let backoff_max = Duration::from_millis(args.reconnect_backoff_max_ms);
@@ -136,16 +133,16 @@ async fn main() -> Result<()> {
 
     loop {
         tracing::info!(url = %args.url, attempt, "connecting to relay");
-        let connected = match wire_profile {
-            Some(profile) => {
-                quic_endpoint
-                    .client
-                    .connect_with_profile(&args.url, None, profile)
-                    .await
-            }
-            None => quic_endpoint.client.connect(&args.url, None).await,
-        };
-        let (session, connection_id, transport, selected_version) = match connected {
+        let connected = quic_endpoint
+            .client
+            .connect_with_profile_and_connection(
+                &args.url,
+                None,
+                wire_profile.unwrap_or(WireProfile::Draft16),
+            )
+            .await;
+        let (session, connection_id, transport, selected_version, quic_connection) = match connected
+        {
             Ok(v) => v,
             Err(error) => {
                 reconnect_after_failure(
@@ -221,6 +218,10 @@ async fn main() -> Result<()> {
             }
         };
         tracing::info!(%connection_id, attempt, "connected to relay");
+        // Ends on its own when the connection closes.
+        tokio::spawn(metrics_endpoint::export_datagram_frames_sent(
+            quic_connection,
+        ));
         let connected_at = Instant::now();
 
         // A MoQ session's TracksReader is single-use (handed to exactly one
@@ -764,6 +765,16 @@ fn build_datagram_state(
     Ok(DatagramState::new(track.name.clone(), 0, datagrams))
 }
 
+/// The relay-facing QUIC endpoint config the CLI asks for.
+fn quic_config(args: &Args, tls: moq_native_ietf::tls::Config) -> Result<quic::Config> {
+    let mut config = quic::Config::new(args.bind, None, tls)?
+        .with_datagram_send_buffer_bytes(args.datagram_send_buffer_bytes);
+    if let Some(profile) = args.wire_profile {
+        config = config.with_wire_profiles([WireProfile::Draft16, profile.into()]);
+    }
+    Ok(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +783,40 @@ mod tests {
     use moq_catalog::multicast::{MulticastConfig, MulticastEndpoint, MulticastTrackRef};
     use moq_catalog::{FecAlgorithm, FecDescriptor, MmtpMode, Track};
     use moq_transport::serve::{TrackReaderMode, Tracks};
+
+    #[test]
+    fn quic_config_carries_the_datagram_send_buffer_flag() {
+        let base = [
+            "moq-pub-mmtp",
+            "moqt://localhost:4443",
+            "--name",
+            "example",
+            "--catalog-json",
+            "catalog.json",
+            "--bind",
+            "127.0.0.1:0",
+        ];
+        let tls = || moq_native_ietf::tls::Args::default().load().unwrap();
+
+        let args = Args::try_parse_from(base).unwrap();
+        let config = quic_config(&args, tls()).unwrap();
+        assert_eq!(
+            config.datagram_send_buffer_bytes,
+            quic::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES
+        );
+
+        let args = Args::try_parse_from(
+            base.into_iter()
+                .chain(["--datagram-send-buffer-bytes", "65536"]),
+        )
+        .unwrap();
+        assert_eq!(
+            quic_config(&args, tls())
+                .unwrap()
+                .datagram_send_buffer_bytes,
+            65_536
+        );
+    }
 
     fn ns() -> TrackNamespace {
         TrackNamespace::from_utf8_path("test-broadcast")

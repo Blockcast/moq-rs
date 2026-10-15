@@ -45,7 +45,13 @@ pub async fn open_udp_socket(
     target: SocketAddr,
     source: Option<Ipv4Addr>,
     iface: Option<Ipv4Addr>,
+    rcvbuf_bytes: Option<usize>,
 ) -> Result<UdpSocket> {
+    if rcvbuf_bytes.is_some() && !(is_multicast(target) && source.is_some()) {
+        tracing::warn!(
+            "--mmtp-udp-rcvbuf-bytes applies only to the SSM socket (--mmtp-udp-source); ignored"
+        );
+    }
     if !is_multicast(target) {
         let socket = UdpSocket::bind(target)
             .await
@@ -62,6 +68,9 @@ pub async fn open_udp_socket(
             socket
                 .set_reuse_address(true)
                 .context("set_reuse_address")?;
+            if let Some(requested) = rcvbuf_bytes {
+                set_recv_buffer(&socket, requested)?;
+            }
             let wildcard = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), target.port());
             socket
                 .bind(&wildcard.into())
@@ -116,6 +125,26 @@ pub async fn open_udp_socket(
     }
 }
 
+/// Request SO_RCVBUF and warn if the kernel granted less. Linux doubles the
+/// request for bookkeeping and clamps it to net.core.rmem_max, so a granted
+/// value below the request means the sysctl is the limit, not this flag.
+fn set_recv_buffer(socket: &Socket, requested: usize) -> Result<usize> {
+    socket
+        .set_recv_buffer_size(requested)
+        .with_context(|| format!("set_recv_buffer_size({requested})"))?;
+    let granted = socket.recv_buffer_size().context("recv_buffer_size")?;
+    if granted < requested {
+        tracing::warn!(
+            requested,
+            granted,
+            "SO_RCVBUF clamped by the kernel; raise net.core.rmem_max to get the requested size"
+        );
+    } else {
+        tracing::info!(requested, granted, "SO_RCVBUF set");
+    }
+    Ok(granted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,7 +180,9 @@ mod tests {
     #[tokio::test]
     async fn open_unicast_binds_directly_to_target() {
         let target: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let sock = open_udp_socket(target, None, None).await.expect("open ok");
+        let sock = open_udp_socket(target, None, None, None)
+            .await
+            .expect("open ok");
         let local = sock.local_addr().expect("local_addr");
         // For unicast we bound directly to `target` — IP is loopback.
         assert_eq!(local.ip(), target.ip(), "unicast bind keeps target ip");
@@ -166,7 +197,7 @@ mod tests {
         let port = 26_000 + (std::process::id() % 1000) as u16;
         let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(232, 28, 99, 7)), port);
 
-        let listener = match open_udp_socket(target, None, None).await {
+        let listener = match open_udp_socket(target, None, None, None).await {
             Ok(s) => s,
             Err(e) => {
                 // In sandboxed CI environments multicast may be
@@ -217,10 +248,24 @@ mod tests {
         // target binds directly and ignores the source.
         let target: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let src: Ipv4Addr = "203.0.113.7".parse().unwrap();
-        let sock = open_udp_socket(target, Some(src), None)
+        let sock = open_udp_socket(target, Some(src), None, None)
             .await
             .expect("unicast open ok");
         assert_eq!(sock.local_addr().unwrap().ip(), target.ip());
+    }
+
+    #[test]
+    fn recv_buffer_is_applied_and_clamp_is_reported() {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let default = socket.recv_buffer_size().unwrap();
+        // Small enough to stay under any rmem_max: the kernel grants at least it.
+        let granted = set_recv_buffer(&socket, 16_384).unwrap();
+        assert!(granted >= 16_384, "granted {granted}");
+        assert_eq!(socket.recv_buffer_size().unwrap(), granted);
+        assert_ne!(granted, default, "the request must change SO_RCVBUF");
+        // Far above any rmem_max: the call succeeds and returns the clamp.
+        let clamped = set_recv_buffer(&socket, 1 << 40).unwrap();
+        assert!(clamped < 1 << 40, "kernel must clamp, got {clamped}");
     }
 
     #[tokio::test]
@@ -229,7 +274,7 @@ mod tests {
         // rather than silently do an any-source v6 join.
         let target: SocketAddr = "[ff3e::1234]:5004".parse().unwrap();
         let src: Ipv4Addr = "203.0.113.7".parse().unwrap();
-        let err = open_udp_socket(target, Some(src), None)
+        let err = open_udp_socket(target, Some(src), None, None)
             .await
             .expect_err("v6 SSM must error");
         assert!(err.to_string().contains("IPv4-only"), "got: {err}");
@@ -243,7 +288,7 @@ mod tests {
         let port = 27_000 + (std::process::id() % 1000) as u16;
         let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(232, 28, 99, 8)), port);
         let src: Ipv4Addr = "203.0.113.7".parse().unwrap();
-        match open_udp_socket(target, Some(src), None).await {
+        match open_udp_socket(target, Some(src), None, None).await {
             Ok(sock) => {
                 let local = sock.local_addr().expect("local_addr");
                 assert!(local.ip().is_unspecified(), "SSM listener binds wildcard");

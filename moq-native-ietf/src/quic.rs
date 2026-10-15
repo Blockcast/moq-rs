@@ -113,27 +113,30 @@ fn bind_smart(addr: net::SocketAddr) -> anyhow::Result<(net::UdpSocket, bool)> {
     Ok((socket.into(), is_dual_stack))
 }
 
+// A 1,228-byte Solana shred needs up to 1,234 bytes after MoQ framing.
+// Quinn consumes another 39 bytes at the current raw-QUIC profile, so the
+// controlled shred path must support at least a 1,280-byte UDP payload
+// (1,328-byte IPv6 PMTU). DPLPMTUD can raise this on Ethernet paths and
+// black-hole detection can lower it when the path contract is violated.
+const INITIAL_UDP_PAYLOAD_MTU: u16 = 1_280;
+
+/// Default QUIC datagram send buffer. Datagram media is live and disposable:
+/// keep only a few packets queued so a congestion-limited path discards old
+/// media instead of adding hundreds of milliseconds of FIFO latency (Quinn's
+/// default is 1 MiB). Override per endpoint with
+/// [`Config::with_datagram_send_buffer_bytes`].
+pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = INITIAL_UDP_PAYLOAD_MTU as usize * 4;
+
 /// Build a TransportConfig with our standard settings
 ///
 /// This is used both for the base endpoint config and when creating
 /// per-connection configs with qlog enabled.
-fn build_transport_config() -> quinn::TransportConfig {
-    // A 1,228-byte Solana shred needs up to 1,234 bytes after MoQ framing.
-    // Quinn consumes another 39 bytes at the current raw-QUIC profile, so the
-    // controlled shred path must support at least a 1,280-byte UDP payload
-    // (1,328-byte IPv6 PMTU). DPLPMTUD can raise this on Ethernet paths and
-    // black-hole detection can lower it when the path contract is violated.
-    const INITIAL_UDP_PAYLOAD_MTU: u16 = 1_280;
-    // Datagram media is live and disposable. Keep only a few packets queued so
-    // a congestion-limited path discards old media instead of adding hundreds
-    // of milliseconds of FIFO latency (Quinn's default is 1 MiB).
-    const LIVE_DATAGRAM_SEND_BUFFER_BYTES: usize = INITIAL_UDP_PAYLOAD_MTU as usize * 4;
-
+fn build_transport_config(datagram_send_buffer_bytes: usize) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(time::Duration::from_secs(10).try_into().unwrap()));
     transport.keep_alive_interval(Some(time::Duration::from_secs(4))); // TODO make this smarter
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-    transport.datagram_send_buffer_size(LIVE_DATAGRAM_SEND_BUFFER_BYTES);
+    transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     transport.initial_mtu(INITIAL_UDP_PAYLOAD_MTU);
     transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
     transport
@@ -375,6 +378,9 @@ pub struct Config {
     /// Optional hook to wrap the [`quinn::AsyncUdpSocket`] before endpoint
     /// creation. Defaults to `None` (no wrapping). See [`SocketWrapperFn`].
     pub socket_wrapper: Option<SocketWrapperFn>,
+    /// QUIC datagram send buffer, in bytes. Defaults to
+    /// [`DEFAULT_DATAGRAM_SEND_BUFFER_BYTES`].
+    pub datagram_send_buffer_bytes: usize,
 }
 
 impl Config {
@@ -393,6 +399,7 @@ impl Config {
             tags: HashSet::new(),
             wire_profiles: vec![WireProfile::Draft16],
             socket_wrapper: None,
+            datagram_send_buffer_bytes: DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
         })
     }
 
@@ -418,6 +425,7 @@ impl Config {
             tags: HashSet::new(),
             wire_profiles: vec![WireProfile::Draft16],
             socket_wrapper: None,
+            datagram_send_buffer_bytes: DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
         }
     }
 
@@ -433,6 +441,14 @@ impl Config {
                 self.wire_profiles.push(profile);
             }
         }
+        self
+    }
+
+    /// Override the QUIC datagram send buffer (see
+    /// [`DEFAULT_DATAGRAM_SEND_BUFFER_BYTES`]). Datagrams queued beyond it
+    /// are evicted oldest-first before they reach the wire.
+    pub fn with_datagram_send_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.datagram_send_buffer_bytes = bytes;
         self
     }
 
@@ -480,7 +496,7 @@ impl Endpoint {
         }
 
         // Build transport config with our standard settings
-        let transport = Arc::new(build_transport_config());
+        let transport = Arc::new(build_transport_config(config.datagram_send_buffer_bytes));
         let wire_profiles = config.wire_profiles.clone();
 
         let mut server_config = None;
@@ -530,6 +546,7 @@ impl Endpoint {
             qlog_dir: config.qlog_dir.map(Arc::new),
             base_server_config: Arc::new(base_server_config),
             wire_profiles: wire_profiles.clone(),
+            datagram_send_buffer_bytes: config.datagram_send_buffer_bytes,
         });
 
         let client = Client {
@@ -622,6 +639,7 @@ pub struct Server {
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
     wire_profiles: Vec<WireProfile>,
+    datagram_send_buffer_bytes: usize,
 }
 
 impl Server {
@@ -633,7 +651,8 @@ impl Server {
                     let qlog_dir = self.qlog_dir.clone();
                     let base_server_config = self.base_server_config.clone();
                     let wire_profiles = self.wire_profiles.clone();
-                    self.accept.push(Self::accept_session(conn, qlog_dir, base_server_config, wire_profiles).boxed());
+                    let datagram_send_buffer_bytes = self.datagram_send_buffer_bytes;
+                    self.accept.push(Self::accept_session(conn, qlog_dir, base_server_config, wire_profiles, datagram_send_buffer_bytes).boxed());
                 },
                 res = self.accept.next(), if !self.accept.is_empty() => {
                     match res? {
@@ -653,6 +672,7 @@ impl Server {
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
         wire_profiles: Vec<WireProfile>,
+        datagram_send_buffer_bytes: usize,
     ) -> anyhow::Result<AcceptedSession> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
@@ -665,7 +685,7 @@ impl Server {
             let qlog_path = qlog_dir.join(format!("{}_server.qlog", connection_id_hex));
 
             // Create transport config with our standard settings plus qlog
-            let mut transport = build_transport_config();
+            let mut transport = build_transport_config(datagram_send_buffer_bytes);
 
             let file = File::create(&qlog_path).context("failed to create qlog file")?;
             let writer = BufWriter::new(file);
@@ -877,6 +897,27 @@ impl Client {
         socket_addr: Option<net::SocketAddr>,
         required: WireProfile,
     ) -> anyhow::Result<(web_transport::Session, String, Transport, WireProfile)> {
+        let (session, id, transport, selected, _) = self
+            .connect_with_profile_and_connection(url, socket_addr, required)
+            .await?;
+        Ok((session, id, transport, selected))
+    }
+
+    /// [`Self::connect_with_profile`], also returning a handle to the
+    /// underlying QUIC connection so the caller can read
+    /// [`quinn::Connection::stats`] (e.g. datagram frames actually sent).
+    pub async fn connect_with_profile_and_connection(
+        &self,
+        url: &Url,
+        socket_addr: Option<net::SocketAddr>,
+        required: WireProfile,
+    ) -> anyhow::Result<(
+        web_transport::Session,
+        String,
+        Transport,
+        WireProfile,
+        quinn::Connection,
+    )> {
         anyhow::ensure!(
             self.wire_profiles.contains(&required),
             "required MoQT profile {} is not enabled; supported=[{}]",
@@ -961,6 +1002,7 @@ impl Client {
             .context("CID not captured")?
             .to_string();
 
+        let quic_connection = connection.clone();
         let (session, transport, selected_version) = match url.scheme() {
             "https" => {
                 let request = web_transport_quinn::proto::ConnectRequest::new(url.clone())
@@ -1016,6 +1058,7 @@ impl Client {
             connection_id_hex,
             transport,
             selected_version,
+            quic_connection,
         ))
     }
 
@@ -1132,6 +1175,57 @@ mod tests {
         .unwrap();
         config.server = Some(server);
         config
+    }
+
+    fn datagram_send_buffer_size(transport: &quinn::TransportConfig) -> String {
+        let debug = format!("{transport:?}");
+        let field = debug
+            .split("datagram_send_buffer_size: ")
+            .nth(1)
+            .expect("TransportConfig Debug lists datagram_send_buffer_size");
+        field
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn datagram_send_buffer_defaults_to_four_mtu_and_is_overridable() {
+        assert_eq!(DEFAULT_DATAGRAM_SEND_BUFFER_BYTES, 1_280 * 4);
+
+        let default =
+            Endpoint::new(Config::new("127.0.0.1:0".parse().unwrap(), None, tls_config()).unwrap())
+                .unwrap();
+        assert_eq!(datagram_send_buffer_size(&default.client.transport), "5120");
+        assert_eq!(
+            default.server.as_ref().unwrap().datagram_send_buffer_bytes,
+            5_120
+        );
+
+        let overridden = Endpoint::new(
+            Config::new("127.0.0.1:0".parse().unwrap(), None, tls_config())
+                .unwrap()
+                .with_datagram_send_buffer_bytes(65_536),
+        )
+        .unwrap();
+        assert_eq!(
+            datagram_send_buffer_size(&overridden.client.transport),
+            "65536"
+        );
+        // The per-connection qlog path rebuilds the transport from this value.
+        assert_eq!(
+            overridden
+                .server
+                .as_ref()
+                .unwrap()
+                .datagram_send_buffer_bytes,
+            65_536
+        );
+        assert_eq!(
+            datagram_send_buffer_size(&build_transport_config(65_536)),
+            "65536"
+        );
     }
 
     fn endpoint(profiles: &[WireProfile]) -> Endpoint {

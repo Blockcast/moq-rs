@@ -80,6 +80,20 @@ pub struct Args {
     #[arg(long = "mmtp-udp-iface")]
     pub mmtp_udp_iface: Option<std::net::Ipv4Addr>,
 
+    /// SO_RCVBUF, in bytes, for the source-specific (SSM) input socket
+    /// (--mmtp-udp-source set). The kernel doubles the request and clamps it
+    /// to net.core.rmem_max; a clamp is logged as a warning. Omit to keep the
+    /// kernel default.
+    #[arg(long = "mmtp-udp-rcvbuf-bytes")]
+    pub mmtp_udp_rcvbuf_bytes: Option<usize>,
+
+    /// QUIC datagram send buffer toward the relay, in bytes. Datagrams queued
+    /// beyond it are evicted oldest-first before reaching the wire; compare
+    /// moq_pub_mmtp_sent_datagrams_total with
+    /// moq_pub_mmtp_quic_datagram_frames_sent_total to see evictions.
+    #[arg(long = "datagram-send-buffer-bytes", default_value_t = moq_native_ietf::quic::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES)]
+    pub datagram_send_buffer_bytes: usize,
+
     /// Client-side UDP bind for the QUIC/WebTransport connection to the relay.
     #[arg(long, default_value = "[::]:0")]
     pub bind: std::net::SocketAddr,
@@ -172,6 +186,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.metrics_addr, Some("127.0.0.1:9090".parse().unwrap()));
+    }
+
+    #[test]
+    fn transport_buffer_flags_keep_defaults_and_are_overridable() {
+        let args = Args::try_parse_from(required_args()).unwrap();
+        assert_eq!(args.datagram_send_buffer_bytes, 1_280 * 4);
+        assert!(args.mmtp_udp_rcvbuf_bytes.is_none());
+
+        let args = Args::try_parse_from(required_args().into_iter().chain([
+            "--datagram-send-buffer-bytes",
+            "65536",
+            "--mmtp-udp-rcvbuf-bytes",
+            "8388608",
+        ]))
+        .unwrap();
+        assert_eq!(args.datagram_send_buffer_bytes, 65_536);
+        assert_eq!(args.mmtp_udp_rcvbuf_bytes, Some(8_388_608));
     }
 
     #[test]
