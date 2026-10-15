@@ -5,6 +5,7 @@
 mod error;
 mod fetch;
 mod fetched;
+mod go_away;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -25,6 +26,7 @@ mod writer;
 pub use error::*;
 pub use fetch::{Fetch, FetchError};
 pub use fetched::*;
+pub use go_away::GoAwaySender;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
@@ -278,6 +280,15 @@ pub struct Session {
     /// (draft-18 §10.3.1.4), which the relay's authorization hook decodes.
     /// Empty for sessions created via `connect()`.
     setup_params: KeyValuePairs,
+
+    /// Sends this session's GOAWAY; see [`Session::go_away_sender`].
+    go_away: GoAwaySender,
+
+    /// The GOAWAY the peer sent on the control stream, once it arrives.
+    go_away_received: tokio::sync::watch::Sender<Option<message::GoAway>>,
+
+    /// Whether this endpoint accepted the session (a server, for GOAWAY rules).
+    server: bool,
 }
 
 impl Session {
@@ -397,6 +408,19 @@ impl Session {
     /// [`connect`]: Self::connect
     pub fn setup_params(&self) -> &KeyValuePairs {
         &self.setup_params
+    }
+
+    /// A handle that sends this session's control-stream GOAWAY.
+    pub fn go_away_sender(&self) -> GoAwaySender {
+        self.go_away.clone()
+    }
+
+    /// Resolves to the GOAWAY the peer sent on the control stream.
+    ///
+    /// Holds `None` until one arrives. The session does not migrate on its
+    /// own; the application reads the New Session URI from here.
+    pub fn go_away_received(&self) -> tokio::sync::watch::Receiver<Option<message::GoAway>> {
+        self.go_away_received.subscribe()
     }
 
     /// Log a control message with structured fields for observability.
@@ -638,8 +662,10 @@ impl Session {
         connection_path: Option<String>,
         setup_params: KeyValuePairs,
         request_id: RequestId,
+        server: bool,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
+        let go_away = GoAwaySender::new(outgoing.0.clone(), server);
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
@@ -682,6 +708,9 @@ impl Session {
             bidi_task_rx,
             bidi_response_map,
             setup_params,
+            go_away,
+            go_away_received: tokio::sync::watch::Sender::new(None),
+            server,
         };
 
         (session, publisher, subscriber)
@@ -793,6 +822,7 @@ impl Session {
             // peer's, so there is nothing to retain.
             KeyValuePairs::default(),
             request_id,
+            false,
         );
         // Both roles are always constructed for a client session; propagate
         // rather than panic if that ever stops holding (RFC-022).
@@ -899,6 +929,7 @@ impl Session {
             connection_path,
             client.params,
             request_id,
+            true,
         ))
     }
 
@@ -911,7 +942,7 @@ impl Session {
         let mut reader_tasks: FuturesUnordered<BidiReaderFuture> = FuturesUnordered::new();
 
         let result = tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
+            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.go_away_received, self.server) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
             res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
@@ -1714,7 +1745,8 @@ impl Session {
         mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
-        _outgoing: Queue<Message>,
+        go_away_received: tokio::sync::watch::Sender<Option<message::GoAway>>,
+        server: bool,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
@@ -1791,13 +1823,19 @@ impl Session {
                             "received multiple GOAWAY messages".to_string(),
                         ));
                     }
+                    // §10.4: a client cannot tell a server where to reconnect.
+                    if server && !m.uri.0.is_empty() {
+                        return Err(SessionError::ProtocolViolation(
+                            "client GOAWAY carried a New Session URI".to_string(),
+                        ));
+                    }
                     goaway_received = true;
                     tracing::info!(
                         target: "moq_transport::control",
                         new_uri = %m.uri.0,
                         "received GOAWAY"
                     );
-                    // TODO(itzmanish): trigger session migration.
+                    go_away_received.send_replace(Some(m.clone()));
                 }
                 other => {
                     tracing::warn!(msg_type = other.name(), "received unhandled message type");
@@ -3094,5 +3132,102 @@ mod tests {
         server_run.abort();
         assert!(server_run.await.unwrap_err().is_cancelled());
         drop(client_session);
+    }
+
+    async fn server_go_away_reaches_client(transport: Transport) {
+        let (client_transport, server_transport) = match transport {
+            Transport::WebTransport => test_support::loopback_session_pair().await,
+            Transport::RawQuic => test_support::loopback_raw_session_pair().await,
+        };
+        let (client, server) = tokio::join!(
+            Session::connect(client_transport, None, transport),
+            Session::accept(server_transport, None, transport),
+        );
+        let (client_session, _client_publisher, _client_subscriber) = client.unwrap();
+        let (server_session, _server_publisher, _server_subscriber) = server.unwrap();
+
+        let mut received = client_session.go_away_received();
+        let server_go_away = server_session.go_away_sender();
+        let client_go_away = client_session.go_away_sender();
+        let client_run = tokio::spawn(client_session.run());
+        let server_run = tokio::spawn(server_session.run());
+
+        let uri = "https://relay-b.example.net:4443/live";
+        assert!(server_go_away.send(uri, 250).unwrap());
+        // §10.4: one GOAWAY per control stream; the second is not sent.
+        assert!(!server_go_away.send(uri, 250).unwrap());
+
+        let go_away = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            received.wait_for(Option::is_some),
+        )
+        .await
+        .expect("GOAWAY timed out")
+        .unwrap()
+        .clone()
+        .unwrap();
+        assert_eq!(go_away.uri.0, uri);
+        assert_eq!(go_away.timeout, 250);
+
+        // A client may only send an empty New Session URI.
+        assert!(matches!(
+            client_go_away.send("https://elsewhere.example/", 0),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+        assert!(!client_run.is_finished(), "one GOAWAY must not close the session");
+
+        client_run.abort();
+        server_run.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_go_away_reaches_webtransport_client() {
+        server_go_away_reaches_client(Transport::WebTransport).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_go_away_reaches_raw_quic_client() {
+        server_go_away_reaches_client(Transport::RawQuic).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_rejects_client_go_away_with_new_session_uri() {
+        let (client_transport, server_transport) = test_support::loopback_raw_session_pair().await;
+        // Hand-built client: the real GoAwaySender refuses to send this.
+        let client = async move {
+            let mut control = Writer::new(client_transport.open_uni().await.unwrap());
+            control
+                .encode(&setup::Setup {
+                    params: KeyValuePairs::default(),
+                })
+                .await
+                .unwrap();
+            let _server_control = client_transport.accept_uni().await.unwrap();
+            control
+                .encode(&Message::GoAway(message::GoAway {
+                    uri: crate::coding::SessionUri("https://elsewhere.example/".to_string()),
+                    timeout: 0,
+                }))
+                .await
+                .unwrap();
+            client_transport.closed().await
+        };
+        let server = async move {
+            let (session, _publisher, _subscriber) =
+                Session::accept(server_transport, None, Transport::RawQuic)
+                    .await
+                    .unwrap();
+            session.run().await
+        };
+        let (run_result, _closed) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(server, client) },
+        )
+        .await
+        .expect("server did not reject the client GOAWAY");
+        assert!(
+            matches!(run_result, Err(SessionError::ProtocolViolation(_))),
+            "{run_result:?}"
+        );
     }
 }
