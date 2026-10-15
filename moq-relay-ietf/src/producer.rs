@@ -3452,6 +3452,217 @@ mod tests {
         drop(group);
     }
 
+    /// An MMTP packet: the 12-byte header (V=0, C=0, X=0) then `body`.
+    fn mmtp_packet(fec_type: u8, packet_type: u8, sequence: u32, body: &[u8]) -> bytes::Bytes {
+        let mut packet = vec![fec_type << 3, packet_type, 0x00, 0x01, 0, 0, 0, 0];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(body);
+        bytes::Bytes::from(packet)
+    }
+
+    /// MMTP and AL-FEC objects cross a real relay hop unmodified: an origin
+    /// session publishes, the relay ingests it as a subscriber and serves the
+    /// cached track to a downstream subscriber. The relay knows nothing of
+    /// MMTP or of FEC Source Info (draft-ramadan-moq-fec §5.3), so it must pass
+    /// payloads, Group/Subgroup/Object IDs and every Property, unknown odd
+    /// ones included, through unchanged (§5.4). Source objects carry the SS_ID
+    /// both as Property 0x11 and as the packet's Source FEC Payload ID
+    /// trailer; repair objects sit in a group numbered by SS_Start (§7.5).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mmtp_and_al_fec_objects_cross_the_relay_unmodified() {
+        use moq_transport::{
+            data::ExtensionHeaders,
+            serve::{Subgroup, TrackReaderMode},
+        };
+
+        type Object = (u64, u64, u64, ExtensionHeaders, bytes::Bytes);
+
+        let namespace = TrackNamespace::from_utf8_path("mmt");
+        let ss_start: u32 = 256;
+        let mut expected: HashMap<&str, Vec<Object>> = HashMap::new();
+        for (index, ss_id) in [ss_start, ss_start + 1].into_iter().enumerate() {
+            let mut properties = ExtensionHeaders::new();
+            properties.set_bytesvalue(0x11, ss_id.to_be_bytes().to_vec());
+            properties.set_bytesvalue(0x3ff, vec![0xaa, 0xbb, 0xcc]);
+            let mut body = format!("mfu-{index}").into_bytes();
+            body.extend_from_slice(&ss_id.to_be_bytes());
+            let payload = mmtp_packet(1, 0x00, ss_id, &body);
+            expected
+                .entry("video")
+                .or_default()
+                .push((0, 0, index as u64, properties, payload));
+        }
+        for rs_id in 0u32..2 {
+            let mut body = ss_start.to_be_bytes().to_vec();
+            body.extend_from_slice(&2u32.to_be_bytes()[1..]); // RSB_length
+            body.extend_from_slice(&rs_id.to_be_bytes()[1..]); // RS_ID
+            body.extend_from_slice(&2u32.to_be_bytes()[1..]); // SSB_length
+            body.extend_from_slice(&[rs_id as u8; 8]); // one symbol, T = 8
+            let payload = mmtp_packet(2, 0x03, rs_id, &body);
+            expected.entry("video/repair").or_default().push((
+                ss_start as u64,
+                0,
+                rs_id as u64,
+                ExtensionHeaders::new(),
+                payload,
+            ));
+        }
+        let track_name = |name: &str| -> (TrackNamespace, &'static str) {
+            match name {
+                "video" => (namespace.clone(), "video"),
+                _ => (TrackNamespace::from_utf8_path("mmt/video"), "repair"),
+            }
+        };
+
+        // Origin <-> relay ingress.
+        let (origin_transport, ingress_transport) = loopback_webtransport_pair().await;
+        let (origin, ingress) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                TransportSession::accept(origin_transport, None, Transport::WebTransport),
+                TransportSession::connect(ingress_transport, None, Transport::WebTransport),
+            )
+        })
+        .await
+        .expect("origin setup timed out");
+        let (origin, origin_publisher, _) = origin.expect("accept origin session");
+        let (ingress, _, ingress_subscriber) = ingress.expect("connect ingress session");
+        tokio::spawn(async move { origin.run().await });
+        tokio::spawn(async move { ingress.run().await });
+
+        let mut origin_writers = HashMap::new();
+        let mut origin_readers = HashMap::new();
+        for name in ["video", "video/repair"] {
+            let (ns, track) = track_name(name);
+            let (writer, reader) = Track::new(ns, track).produce();
+            origin_writers.insert(name, writer);
+            origin_readers.insert(name, reader);
+        }
+        let mut origin_publisher = origin_publisher.expect("origin publisher");
+        tokio::spawn(async move {
+            while let Some(subscribed) = origin_publisher.subscribed().await {
+                let full = format!(
+                    "{}/{}",
+                    subscribed.track_namespace.to_utf8_path(),
+                    subscribed.track_name
+                );
+                let name = if full.ends_with("/repair") {
+                    "video/repair"
+                } else {
+                    "video"
+                };
+                let reader = origin_readers[name].clone();
+                tokio::spawn(async move { subscribed.serve(reader).await });
+            }
+        });
+
+        // Relay ingress subscribes upstream and registers the cache locally.
+        let mut ingress_subscriber = ingress_subscriber;
+        let mut locals = Locals::new();
+        let mut registrations = Vec::new();
+        let mut upstream = Vec::new();
+        for name in ["video", "video/repair"] {
+            let (ns, track) = track_name(name);
+            let (writer, reader) = Track::new(ns, track).produce();
+            registrations.push(locals.register_track(None, reader).await.expect("register"));
+            upstream.push(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ingress_subscriber.subscribe_open(writer),
+                )
+                .await
+                .expect("upstream SUBSCRIBE timed out")
+                .expect("upstream SUBSCRIBE"),
+            );
+        }
+
+        // Downstream subscriber on the relay.
+        let (_transport, mut downstream) = spawn_authorized_session(
+            locals,
+            Arc::new(CountingCoordinator::default()),
+            RecordingHook::new(|_| allow()),
+        )
+        .await;
+        let mut readers = HashMap::new();
+        let mut downstream_subscriptions = Vec::new();
+        for name in ["video", "video/repair"] {
+            let (ns, track) = track_name(name);
+            let (writer, reader) = Track::new(ns, track).produce();
+            downstream_subscriptions.push(
+                tokio::time::timeout(Duration::from_secs(5), downstream.subscribe_open(writer))
+                    .await
+                    .expect("downstream SUBSCRIBE timed out")
+                    .expect("downstream SUBSCRIBE"),
+            );
+            readers.insert(name, reader);
+        }
+
+        // Publish at the origin.
+        let mut subgroup_writers = Vec::new();
+        for name in ["video", "video/repair"] {
+            let objects = &expected[name];
+            let mut subgroups = origin_writers
+                .remove(name)
+                .expect("origin writer")
+                .subgroups()
+                .expect("subgroups");
+            let mut subgroup = subgroups
+                .create(Subgroup {
+                    group_id: objects[0].0,
+                    subgroup_id: objects[0].1,
+                    priority: 1,
+                })
+                .expect("subgroup");
+            for (_, _, object_id, properties, payload) in objects {
+                subgroup
+                    .create_with_id(*object_id, payload.len(), Some(properties.clone()))
+                    .expect("object")
+                    .write(payload.clone())
+                    .expect("payload");
+            }
+            subgroup_writers.push((subgroups, subgroup));
+        }
+
+        // Read downstream.
+        for name in ["video", "video/repair"] {
+            let reader = readers.remove(name).expect("reader");
+            let mode = tokio::time::timeout(Duration::from_secs(5), reader.mode())
+                .await
+                .expect("downstream mode timed out")
+                .expect("downstream mode");
+            let TrackReaderMode::Subgroups(mut subgroups) = mode else {
+                panic!("{name}: expected subgroup delivery");
+            };
+            let mut subgroup = tokio::time::timeout(Duration::from_secs(5), subgroups.next())
+                .await
+                .expect("subgroup timed out")
+                .expect("subgroup")
+                .expect("subgroup present");
+            let mut got = Vec::new();
+            while got.len() < expected[name].len() {
+                let mut object = tokio::time::timeout(Duration::from_secs(5), subgroup.next())
+                    .await
+                    .expect("object timed out")
+                    .expect("object")
+                    .expect("object present");
+                let payload = object.read_all().await.expect("payload");
+                got.push((
+                    subgroup.group_id,
+                    subgroup.subgroup_id,
+                    object.object_id,
+                    object.extension_headers.clone(),
+                    payload,
+                ));
+            }
+            assert_eq!(got, expected[name], "{name}");
+        }
+        drop((
+            subgroup_writers,
+            upstream,
+            downstream_subscriptions,
+            registrations,
+        ));
+    }
+
     /// SUBSCRIBE_TRACKS is gated as SubscribeNamespace(3) on its prefix, and a
     /// denial is answered with UNAUTHORIZED before any snapshot is taken.
     #[tokio::test(flavor = "multi_thread")]

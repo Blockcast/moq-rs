@@ -626,7 +626,9 @@ mod tests {
     /// The second draft-20 §11.6 example: Type Flags 0x35 (properties, explicit
     /// Subgroup ID, default priority). The draft's printed lengths (Properties
     /// Length 33, a 21-byte value) do not match its 14-byte "traceID:123456",
-    /// so the lengths here are derived from the printed values.
+    /// so the lengths here are derived from the printed values. 33 is the
+    /// pre-vi64 arithmetic with absolute types (1 + 8 + 2 + 1 + 21); do not
+    /// "fix" this vector toward the printed lengths.
     #[test]
     fn decodes_draft_20_example_subgroup_with_properties() {
         let wire: &[u8] = &[
@@ -668,7 +670,42 @@ mod tests {
         assert!(r.is_empty());
 
         let mut encoded = BytesMut::new();
+        header.encode(&mut encoded).unwrap();
         first.encode(&mut encoded).unwrap();
-        assert_eq!(&encoded[..], &wire[4..4 + encoded.len()]);
+        encoded.extend_from_slice(b"abcd");
+        second.encode(&mut encoded).unwrap();
+        encoded.extend_from_slice(b"efgh");
+        assert_eq!(&encoded[..], wire);
+    }
+
+    /// FEC Source Info (draft-ramadan-moq-fec §5.3) is odd Property 0x11 with a
+    /// fixed 4-byte SS_ID. Next to it is an unknown odd Property whose Delta
+    /// Type needs 2 bytes. Neither is interpreted here; both must round-trip
+    /// byte for byte so a relay forwards them unmodified (§5.4).
+    #[test]
+    fn fec_source_info_and_unknown_odd_property_round_trip() {
+        let wire: &[u8] = &[
+            0x00, 0x0c, // Object ID delta 0, Properties Length 12
+            0x11, 0x04, 0x00, 0x00, 0x01, 0x00, // Type 0x11, SS_ID 256
+            0x83, 0xee, 0x03, 0xaa, 0xbb, 0xcc, // Type 0x3ff (delta 0x3ee), 3 bytes
+            0x02, 0xde, 0xad, // Payload Length 2, payload
+        ];
+        let mut r = Bytes::from_static(wire);
+        let object = SubgroupObjectExt::decode(&mut r).unwrap();
+        assert_eq!(object.object_id_delta, 0);
+        assert_eq!(
+            object.extension_headers.get(0x11).map(|kvp| &kvp.value),
+            Some(&crate::coding::Value::BytesValue(vec![0, 0, 1, 0]))
+        );
+        assert_eq!(
+            object.extension_headers.get(0x3ff).map(|kvp| &kvp.value),
+            Some(&crate::coding::Value::BytesValue(vec![0xaa, 0xbb, 0xcc]))
+        );
+        assert_eq!(r.as_ref(), &[0xde, 0xad]);
+
+        let mut encoded = BytesMut::new();
+        object.encode(&mut encoded).unwrap();
+        encoded.extend_from_slice(&r);
+        assert_eq!(&encoded[..], wire);
     }
 }
