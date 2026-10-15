@@ -21,6 +21,12 @@ jobs:
       - name: REUSE Compliance Check
         uses: fsfe/reuse-action@v5
 
+  pim-relay-entrypoint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh deploy/pim-relay-entrypoint.test.sh
+
   build:
     runs-on: ubuntu-latest
 
