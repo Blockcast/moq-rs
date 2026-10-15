@@ -18,6 +18,12 @@
 // |------|-------------|
 // | `moq_pub_mmtp_dropped_datagrams_total{reason}` | Datagrams dropped by the publisher-side ring buffer. `reason="ring_superseded"` (lagging subscriber) or `reason="over_mtu"` (above the live QUIC datagram limit) — distinct causes with distinct remedies, so they are not summed. A bare selector on this metric returns TWO series (one per reason), deliberately: single-value panels and scalar threshold comparisons must aggregate (`sum without(reason)`) or pick a reason. See moq-transport/src/session/subscribed.rs |
 // | `moq_pub_mmtp_sent_datagrams_total` | Datagrams successfully sent. The denominator for the loss fraction below |
+// | `moq_pub_mmtp_quic_datagram_frames_sent_total` | DATAGRAM frames quinn actually put on the wire (`ConnectionStats::frame_tx.datagram`). `sent_datagrams_total` counts datagrams *queued* to quinn; the difference is datagrams evicted from quinn's send buffer before transmission (see `--datagram-send-buffer-bytes`) |
+//
+// Publisher send-buffer evictions (BLO-45867):
+//
+//   rate(moq_pub_mmtp_sent_datagrams_total[5m])
+//     - rate(moq_pub_mmtp_quic_datagram_frames_sent_total[5m])
 //
 // Loss fraction. `sent` carries no `reason` label, so the drop side must
 // aggregate it away first — PromQL matches binary operands on the full label
@@ -88,6 +94,38 @@ pub fn describe_metrics() {
         .increment(0);
     metrics::counter!(DROPPED_DATAGRAMS_METRIC, "reason" => DROP_REASON_OVER_MTU).increment(0);
     metrics::counter!(SENT_DATAGRAMS_METRIC).increment(0);
+
+    metrics::describe_counter!(
+        QUIC_DATAGRAM_FRAMES_SENT_METRIC,
+        "DATAGRAM frames quinn transmitted to the relay. Subtract from \
+         moq_pub_mmtp_sent_datagrams_total (queued) to get datagrams evicted \
+         from the QUIC send buffer before they reached the wire"
+    );
+    metrics::counter!(QUIC_DATAGRAM_FRAMES_SENT_METRIC).increment(0);
+}
+
+pub const QUIC_DATAGRAM_FRAMES_SENT_METRIC: &str = "moq_pub_mmtp_quic_datagram_frames_sent_total";
+
+/// Add the growth of one connection's `frame_tx.datagram` since the last
+/// sample. Per-connection stats restart at 0 on every reconnect, so the
+/// exported counter is the sum of per-connection deltas, never the raw value.
+fn record_datagram_frames_sent(reported: &mut u64, now: u64) {
+    metrics::counter!(QUIC_DATAGRAM_FRAMES_SENT_METRIC).increment(now.saturating_sub(*reported));
+    *reported = now;
+}
+
+/// Export `frame_tx.datagram` for `conn` once a second until it closes, then
+/// take a final sample so the tail of the connection is not lost.
+pub async fn export_datagram_frames_sent(conn: moq_native_ietf::quinn::Connection) {
+    let mut reported = 0;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => record_datagram_frames_sent(&mut reported, conn.stats().frame_tx.datagram),
+            _ = conn.closed() => break,
+        }
+    }
+    record_datagram_frames_sent(&mut reported, conn.stats().frame_tx.datagram);
 }
 
 /// Install the Prometheus exporter iff `MOQ_PUB_METRICS_ADDR` is set. No-op
@@ -281,12 +319,34 @@ mod tests {
             "moq_pub_mmtp_dropped_datagrams_total{reason=\"ring_superseded\"} 0",
             "moq_pub_mmtp_dropped_datagrams_total{reason=\"over_mtu\"} 0",
             "moq_pub_mmtp_sent_datagrams_total 0",
+            "moq_pub_mmtp_quic_datagram_frames_sent_total 0",
         ] {
             assert!(
                 rendered.contains(expected),
                 "missing {expected:?} in rendered exposition:\n{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn datagram_frames_sent_counts_per_connection_deltas() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            let mut first = 0;
+            record_datagram_frames_sent(&mut first, 10);
+            record_datagram_frames_sent(&mut first, 25);
+            // Reconnect: the new connection's stats restart at 0.
+            let mut second = 0;
+            record_datagram_frames_sent(&mut second, 7);
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("moq_pub_mmtp_quic_datagram_frames_sent_total 32"),
+            "expected 25 + 7 = 32 in:\n{rendered}"
+        );
     }
 
     const ENV_CHILD_MARKER: &str = "MOQ_PUB_METRICS_ENV_ACTIVATION_CHILD";
@@ -358,6 +418,7 @@ mod tests {
             "moq_pub_mmtp_dropped_datagrams_total{reason=\"ring_superseded\"} 0",
             "moq_pub_mmtp_dropped_datagrams_total{reason=\"over_mtu\"} 0",
             "moq_pub_mmtp_sent_datagrams_total 0",
+            "moq_pub_mmtp_quic_datagram_frames_sent_total 0",
         ] {
             assert!(
                 response.contains(expected),

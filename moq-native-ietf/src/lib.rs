@@ -2,4 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod quic;
+// Re-exported so callers can name `quinn::Connection` (e.g. to read `stats()`)
+// without pinning their own quinn version.
+pub use quinn;
 pub mod tls;
