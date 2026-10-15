@@ -133,7 +133,7 @@ fn set_recv_buffer(socket: &Socket, requested: usize) -> Result<usize> {
         .set_recv_buffer_size(requested)
         .with_context(|| format!("set_recv_buffer_size({requested})"))?;
     let granted = socket.recv_buffer_size().context("recv_buffer_size")?;
-    if granted < requested {
+    if is_clamped(requested, granted) {
         tracing::warn!(
             requested,
             granted,
@@ -143,6 +143,17 @@ fn set_recv_buffer(socket: &Socket, requested: usize) -> Result<usize> {
         tracing::info!(requested, granted, "SO_RCVBUF set");
     }
     Ok(granted)
+}
+
+/// Linux reports the doubled value, so an unclamped request reads back as
+/// `2 * requested`; anything less means rmem_max capped it.
+fn is_clamped(requested: usize, granted: usize) -> bool {
+    let expected = if cfg!(target_os = "linux") {
+        requested.saturating_mul(2)
+    } else {
+        requested
+    };
+    granted < expected
 }
 
 #[cfg(test)]
@@ -263,9 +274,23 @@ mod tests {
         assert!(granted >= 16_384, "granted {granted}");
         assert_eq!(socket.recv_buffer_size().unwrap(), granted);
         assert_ne!(granted, default, "the request must change SO_RCVBUF");
-        // Far above any rmem_max: the call succeeds and returns the clamp.
-        let clamped = set_recv_buffer(&socket, 1 << 40).unwrap();
-        assert!(clamped < 1 << 40, "kernel must clamp, got {clamped}");
+        // The largest accepted request is far above any rmem_max: the call
+        // succeeds and the kernel clamps it.
+        let requested = i32::MAX as usize;
+        let clamped = set_recv_buffer(&socket, requested).unwrap();
+        assert!(
+            is_clamped(requested, clamped),
+            "kernel must clamp, got {clamped}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn clamp_detection_accounts_for_linux_doubling() {
+        // rmem_max = 212992: a 300000 request reads back 425984, which is
+        // above the request but still a clamp.
+        assert!(is_clamped(300_000, 425_984));
+        assert!(!is_clamped(16_384, 32_768));
     }
 
     #[tokio::test]

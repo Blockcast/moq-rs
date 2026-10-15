@@ -83,8 +83,8 @@ pub struct Args {
     /// SO_RCVBUF, in bytes, for the source-specific (SSM) input socket
     /// (--mmtp-udp-source set). The kernel doubles the request and clamps it
     /// to net.core.rmem_max; a clamp is logged as a warning. Omit to keep the
-    /// kernel default.
-    #[arg(long = "mmtp-udp-rcvbuf-bytes")]
+    /// kernel default. At most i32::MAX (the kernel takes a C int).
+    #[arg(long = "mmtp-udp-rcvbuf-bytes", value_parser = parse_rcvbuf_bytes)]
     pub mmtp_udp_rcvbuf_bytes: Option<usize>,
 
     /// QUIC datagram send buffer toward the relay, in bytes. Datagrams queued
@@ -140,6 +140,15 @@ pub struct Args {
     /// `--tls-cert`, `--tls-key`, `--tls-root`, `--tls-disable-verify`.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+}
+
+/// SO_RCVBUF is a C int, and socket2 casts with `as`, so larger values wrap.
+fn parse_rcvbuf_bytes(s: &str) -> Result<usize, String> {
+    let bytes: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if bytes == 0 || bytes > i32::MAX as usize {
+        return Err(format!("must be 1..={}", i32::MAX));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -203,6 +212,25 @@ mod tests {
         .unwrap();
         assert_eq!(args.datagram_send_buffer_bytes, 65_536);
         assert_eq!(args.mmtp_udp_rcvbuf_bytes, Some(8_388_608));
+
+        for bad in ["0", "2147483648"] {
+            assert!(
+                Args::try_parse_from(
+                    required_args()
+                        .into_iter()
+                        .chain(["--mmtp-udp-rcvbuf-bytes", bad])
+                )
+                .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        let args = Args::try_parse_from(
+            required_args()
+                .into_iter()
+                .chain(["--mmtp-udp-rcvbuf-bytes", "2147483647"]),
+        )
+        .unwrap();
+        assert_eq!(args.mmtp_udp_rcvbuf_bytes, Some(i32::MAX as usize));
     }
 
     #[test]
