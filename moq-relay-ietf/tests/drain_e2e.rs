@@ -141,6 +141,7 @@ async fn start_with(transports: Transports) -> Harness {
         drain,
         drain_token: Some(TOKEN.to_string()),
         tr_url: None,
+        moq_port: Some(relay_port),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let admin = listener.local_addr().unwrap();

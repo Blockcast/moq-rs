@@ -39,6 +39,10 @@ pub struct AdminConfig {
     /// Traffic Router base URL, asked for the GOAWAY target when the drain
     /// request does not name one.
     pub tr_url: Option<Url>,
+    /// Port of the MoQ listener. The operator HTTP server listens on a
+    /// different port, so a `Host` header fallback for `currentHost` takes
+    /// its host name but this port.
+    pub moq_port: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -47,6 +51,7 @@ struct AdminState {
     drain: Drain,
     drain_token: Option<Arc<str>>,
     tr_url: Option<Url>,
+    moq_port: Option<u16>,
     /// Why the relay reports itself unavailable without having drained.
     unavailable: Arc<Mutex<Option<&'static str>>>,
 }
@@ -67,6 +72,7 @@ pub fn router(config: AdminConfig) -> Router {
         drain: config.drain,
         drain_token: config.drain_token.filter(|t| !t.is_empty()).map(Into::into),
         tr_url: config.tr_url,
+        moq_port: config.moq_port,
         unavailable: Default::default(),
     };
     Router::new()
@@ -160,7 +166,7 @@ async fn drain(
         host: headers
             .get("host")
             .and_then(|h| h.to_str().ok())
-            .map(str::to_string),
+            .and_then(|h| moq_authority(h, state.moq_port)),
     };
 
     let timeout_ms = match request.get("timeoutMs").map(|t| t.parse::<u64>()) {
@@ -222,6 +228,16 @@ fn validate_uri(uri: &str) -> Result<(), &'static str> {
         Ok(url) if matches!(url.scheme(), "https" | "http" | "moqt") && url.has_host() => Ok(()),
         _ => Err("invalid_new_session_uri"),
     }
+}
+
+/// The `Host` header authority with its port replaced by the MoQ port.
+fn moq_authority(host: &str, moq_port: Option<u16>) -> Option<String> {
+    let Some(port) = moq_port else {
+        return Some(host.to_string());
+    };
+    let mut url = Url::parse(&format!("https://{host}")).ok()?;
+    url.set_port(Some(port)).ok()?;
+    Some(format!("{}:{port}", url.host_str()?))
 }
 
 /// Whether `uri` points back at the host being drained.
@@ -383,6 +399,7 @@ mod tests {
             drain: drain.clone(),
             drain_token: token.map(str::to_string),
             tr_url,
+            moq_port: Some(4443),
         }))
         .await;
         (base, drain)
@@ -392,7 +409,8 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{base}/_drain"))
             .header(DRAIN_TOKEN_HEADER, TOKEN)
-            .header("host", "relay-a.example.net:4443")
+            // The operator port, as a real request to `--http-port` carries.
+            .header("host", "relay-a.example.net:9090")
             .json(&body)
             .send()
             .await
@@ -430,7 +448,7 @@ mod tests {
         assert_eq!(q["ip"], "203.0.113.7");
         assert_eq!(q["deliveryServiceId"], "live");
         assert_eq!(q["requestPath"], "/live/ns");
-        // Taken from the Host header when the request does not name it.
+        // Host header's name with the MoQ port, when the request does not name it.
         assert_eq!(q["currentHost"], "relay-a.example.net:4443");
         assert_eq!(q["m"], "MoQ");
     }
@@ -527,5 +545,25 @@ mod tests {
         assert!(!targets_self("https://a.example:4443/", Some("a.example")));
         assert!(!targets_self("https://b.example/", Some("a.example")));
         assert!(!targets_self("https://a.example/", None));
+    }
+
+    #[test]
+    fn host_header_takes_the_moq_port() {
+        assert_eq!(
+            moq_authority("a.example:9090", Some(4443)).unwrap(),
+            "a.example:4443"
+        );
+        assert_eq!(
+            moq_authority("a.example", Some(443)).unwrap(),
+            "a.example:443"
+        );
+        assert_eq!(
+            moq_authority("[2001:db8::1]:9090", Some(4443)).unwrap(),
+            "[2001:db8::1]:4443"
+        );
+        assert_eq!(
+            moq_authority("a.example:9090", None).unwrap(),
+            "a.example:9090"
+        );
     }
 }

@@ -226,6 +226,9 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| Url::parse(&format!("https://{}", cli.bind)).unwrap());
 
+    // The port clients reach the MoQ listener on, for drain self-target checks.
+    let moq_port = relay_url.port_or_known_default();
+
     // Create the coordinator based on CLI arguments
     // Priority: api-url > file coordinator
     let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
@@ -272,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
             drain: relay.drain(),
             drain_token: std::env::var("BLOCKCAST_RELAY_DRAIN_TOKEN").ok(),
             tr_url: cli.tr_url.clone(),
+            moq_port,
         });
         let listener = tokio::net::TcpListener::bind((net::Ipv6Addr::UNSPECIFIED, port))
             .await
