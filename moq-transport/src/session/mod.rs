@@ -3174,7 +3174,10 @@ mod tests {
             client_go_away.send("https://elsewhere.example/", 0),
             Err(SessionError::ProtocolViolation(_))
         ));
-        assert!(!client_run.is_finished(), "one GOAWAY must not close the session");
+        assert!(
+            !client_run.is_finished(),
+            "one GOAWAY must not close the session"
+        );
 
         client_run.abort();
         server_run.abort();
@@ -3219,12 +3222,12 @@ mod tests {
                     .unwrap();
             session.run().await
         };
-        let (run_result, _closed) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async { tokio::join!(server, client) },
-        )
-        .await
-        .expect("server did not reject the client GOAWAY");
+        let (run_result, _closed) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .expect("server did not reject the client GOAWAY");
         assert!(
             matches!(run_result, Err(SessionError::ProtocolViolation(_))),
             "{run_result:?}"

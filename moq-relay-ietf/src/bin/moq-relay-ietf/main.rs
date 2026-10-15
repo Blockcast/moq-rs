@@ -7,12 +7,15 @@ mod file_coordinator;
 use std::sync::Arc;
 use std::{net, path::PathBuf};
 
+use anyhow::Context;
 use clap::Parser;
 use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
+use moq_relay_ietf::{
+    admin, Coordinator, Relay, RelayConfig, SessionConfig, Transports, Web, WebConfig,
+};
 use std::time::Duration;
 
 #[derive(Parser, Clone)]
@@ -102,6 +105,43 @@ pub struct Cli {
     /// When set, serves metrics at http://<addr>/metrics
     #[arg(long)]
     pub metrics_addr: Option<net::SocketAddr>,
+
+    /// Serve the plain-HTTP operator surface on this TCP port: /certificate.sha256,
+    /// /livez, /readyz, POST /_drain and /_astats.
+    ///
+    /// The drain endpoint answers 503 unless BLOCKCAST_RELAY_DRAIN_TOKEN is set;
+    /// callers send that secret in the X-Blockcast-Drain-Token header.
+    #[arg(long, env = "RELAY_HTTP_PORT")]
+    pub http_port: Option<u16>,
+
+    /// Traffic Router base URL, asked for the GOAWAY target when a drain request
+    /// does not name one.
+    #[arg(long, env = "BLOCKCAST_RELAY_TR_URL")]
+    pub tr_url: Option<Url>,
+
+    /// Comma-separated transports to accept: `ietf-wt` (WebTransport),
+    /// `ietf-raw` (raw QUIC), or `ietf` for both.
+    #[arg(long, default_value = "ietf-wt,ietf-raw", value_parser = parse_protocols)]
+    pub protocols: Transports,
+}
+
+fn parse_protocols(value: &str) -> Result<Transports, String> {
+    let mut transports = Transports {
+        web_transport: false,
+        raw_quic: false,
+    };
+    for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        match token {
+            "ietf-wt" => transports.web_transport = true,
+            "ietf-raw" => transports.raw_quic = true,
+            "ietf" => transports = Transports::default(),
+            other => return Err(format!("unsupported protocol family {other:?}")),
+        }
+    }
+    if !transports.web_transport && !transports.raw_quic {
+        return Err("no protocol family enabled".to_string());
+    }
+    Ok(transports)
 }
 
 #[tokio::main]
@@ -218,7 +258,31 @@ async fn main() -> anyhow::Result<()> {
             connection_tagger: None,
         },
         Duration::from_secs(cli.cache_idle_timeout),
-    )?;
+    )?
+    .with_transports(cli.protocols);
+
+    if let Some(port) = cli.http_port {
+        let fingerprint = tls
+            .fingerprints
+            .first()
+            .context("missing certificate fingerprint")?
+            .clone();
+        let router = admin::router(admin::AdminConfig {
+            fingerprint,
+            drain: relay.drain(),
+            drain_token: std::env::var("BLOCKCAST_RELAY_DRAIN_TOKEN").ok(),
+            tr_url: cli.tr_url.clone(),
+        });
+        let listener = tokio::net::TcpListener::bind((net::Ipv6Addr::UNSPECIFIED, port))
+            .await
+            .with_context(|| format!("failed to bind --http-port {port}"))?;
+        tracing::info!("operator HTTP listening on {}", listener.local_addr()?);
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, router).await {
+                tracing::error!(error = %err, "operator HTTP server failed");
+            }
+        });
+    }
 
     if cli.dev {
         // Create a web server too.
@@ -241,6 +305,33 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocols_select_transports() {
+        let parse = |v: &str| Cli::try_parse_from(["moq-relay-ietf", "--protocols", v]);
+        assert_eq!(
+            parse("ietf-raw").unwrap().protocols,
+            Transports {
+                web_transport: false,
+                raw_quic: true
+            }
+        );
+        assert_eq!(
+            parse("ietf-wt").unwrap().protocols,
+            Transports {
+                web_transport: true,
+                raw_quic: false
+            }
+        );
+        assert_eq!(parse("ietf").unwrap().protocols, Transports::default());
+        assert_eq!(
+            Cli::try_parse_from(["moq-relay-ietf"]).unwrap().protocols,
+            Transports::default()
+        );
+        // moq-lite is a different protocol; refuse rather than silently ignore it.
+        assert!(parse("ietf-wt,ietf-raw,moq-lite").is_err());
+        assert!(parse("").is_err());
+    }
 
     #[test]
     fn max_request_id_flag_overrides_default() {

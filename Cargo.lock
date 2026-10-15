@@ -1741,6 +1741,7 @@ dependencies = [
  "moq-transport",
  "p256",
  "rcgen",
+ "reqwest",
  "rustls 0.23.31",
  "secrecy",
  "serde",

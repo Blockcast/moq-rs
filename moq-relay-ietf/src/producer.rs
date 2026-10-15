@@ -3461,8 +3461,11 @@ mod tests {
     }
 
     /// MMTP and AL-FEC objects cross a real relay hop unmodified: an origin
-    /// session publishes, the relay ingests it as a subscriber and serves the
-    /// cached track to a downstream subscriber. The relay knows nothing of
+    /// session publishes, a relay-side subscriber feeds the `Locals` cache, and
+    /// the relay's `Producer` serves that cache to a downstream subscriber. The
+    /// ingress is wired by hand (`subscribe_open` + `Locals::register_track`),
+    /// not through `Consumer`/`RemoteManager`, so this covers the cache and
+    /// egress serving, not the relay's own ingest wiring. The relay knows nothing of
     /// MMTP or of FEC Source Info (draft-ramadan-moq-fec §5.3), so it must pass
     /// payloads, Group/Subgroup/Object IDs and every Property, unknown odd
     /// ones included, through unchanged (§5.4). Source objects carry the SS_ID
@@ -3559,10 +3562,12 @@ mod tests {
         let mut ingress_subscriber = ingress_subscriber;
         let mut locals = Locals::new();
         let mut registrations = Vec::new();
+        let mut ingress_readers = HashMap::new();
         let mut upstream = Vec::new();
         for name in ["video", "video/repair"] {
             let (ns, track) = track_name(name);
             let (writer, reader) = Track::new(ns, track).produce();
+            ingress_readers.insert(name, reader.clone());
             registrations.push(locals.register_track(None, reader).await.expect("register"));
             upstream.push(
                 tokio::time::timeout(
@@ -3622,38 +3627,44 @@ mod tests {
             subgroup_writers.push((subgroups, subgroup));
         }
 
-        // Read downstream.
-        for name in ["video", "video/repair"] {
-            let reader = readers.remove(name).expect("reader");
-            let mode = tokio::time::timeout(Duration::from_secs(5), reader.mode())
-                .await
-                .expect("downstream mode timed out")
-                .expect("downstream mode");
-            let TrackReaderMode::Subgroups(mut subgroups) = mode else {
-                panic!("{name}: expected subgroup delivery");
-            };
-            let mut subgroup = tokio::time::timeout(Duration::from_secs(5), subgroups.next())
-                .await
-                .expect("subgroup timed out")
-                .expect("subgroup")
-                .expect("subgroup present");
-            let mut got = Vec::new();
-            while got.len() < expected[name].len() {
-                let mut object = tokio::time::timeout(Duration::from_secs(5), subgroup.next())
+        // Read the ingress cache first, then downstream, so a failure says
+        // which hop changed the objects: both hops share SubscribedSerializer.
+        for (hop, readers) in [
+            ("ingress", &mut ingress_readers),
+            ("downstream", &mut readers),
+        ] {
+            for name in ["video", "video/repair"] {
+                let reader = readers.remove(name).expect("reader");
+                let mode = tokio::time::timeout(Duration::from_secs(5), reader.mode())
                     .await
-                    .expect("object timed out")
-                    .expect("object")
-                    .expect("object present");
-                let payload = object.read_all().await.expect("payload");
-                got.push((
-                    subgroup.group_id,
-                    subgroup.subgroup_id,
-                    object.object_id,
-                    object.extension_headers.clone(),
-                    payload,
-                ));
+                    .expect("mode timed out")
+                    .expect("mode");
+                let TrackReaderMode::Subgroups(mut subgroups) = mode else {
+                    panic!("{hop} {name}: expected subgroup delivery");
+                };
+                let mut subgroup = tokio::time::timeout(Duration::from_secs(5), subgroups.next())
+                    .await
+                    .expect("subgroup timed out")
+                    .expect("subgroup")
+                    .expect("subgroup present");
+                let mut got = Vec::new();
+                while got.len() < expected[name].len() {
+                    let mut object = tokio::time::timeout(Duration::from_secs(5), subgroup.next())
+                        .await
+                        .expect("object timed out")
+                        .expect("object")
+                        .expect("object present");
+                    let payload = object.read_all().await.expect("payload");
+                    got.push((
+                        subgroup.group_id,
+                        subgroup.subgroup_id,
+                        object.object_id,
+                        object.extension_headers.clone(),
+                        payload,
+                    ));
+                }
+                assert_eq!(got, expected[name], "{hop} {name}");
             }
-            assert_eq!(got, expected[name], "{name}");
         }
         drop((
             subgroup_writers,
