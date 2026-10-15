@@ -34,7 +34,8 @@ while [ "$i" -lt "$n" ]; do
 	--log-level=*) : "${RUST_LOG:=${a#*=}}" ;;
 	--generate-cert | --generate-cert=*) ;;
 	--catalog-probe-deadline-ms)
-		echo "pim-relay-entrypoint: ignoring $a ${1:-}: no catalog probe in moq-relay-ietf" >&2
+		[ "$i" -lt "$n" ] || { echo "pim-relay-entrypoint: $a needs a value" >&2; exit 2; }
+		echo "pim-relay-entrypoint: ignoring $a $1: no catalog probe in moq-relay-ietf" >&2
 		shift
 		i=$((i + 1))
 		;;
@@ -56,7 +57,8 @@ if [ "$have_cert" = false ]; then
 	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 		-days 10 -subj "/CN=localhost" \
 		-addext "subjectAltName=DNS:localhost,DNS:$(hostname),IP:127.0.0.1,IP:::1" \
-		-keyout "$dir/key.pem" -out "$dir/cert.pem" 2>/dev/null
+		-keyout "$dir/key.pem" -out "$dir/cert.pem" 2>"$dir/openssl.err" ||
+		{ echo "pim-relay-entrypoint: cert generation failed" >&2; cat "$dir/openssl.err" >&2; exit 1; }
 	set -- "$@" --tls-cert "$dir/cert.pem" --tls-key "$dir/key.pem"
 fi
 

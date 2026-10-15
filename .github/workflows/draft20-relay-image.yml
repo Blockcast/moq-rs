@@ -53,8 +53,10 @@ jobs:
           test "$(docker image inspect "$REF" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
           docker run --rm "$REF" --help | grep -q -- --http-port
           # moq-lite is a different protocol: the relay must refuse it at startup.
-          if docker run --rm "$REF" --protocols ietf-wt,moq-lite; then
-            echo "::error::relay accepted moq-lite"; exit 1
+          # timeout: a regressed refusal would otherwise serve until the job times out.
+          rc=0; err=$(timeout 30 docker run --rm "$REF" --protocols ietf-wt,moq-lite 2>&1) || rc=$?
+          if [ "$rc" -ne 2 ] || ! printf '%s' "$err" | grep -q moq-lite; then
+            echo "::error::moq-lite not refused by the relay (rc=$rc): $err"; exit 1
           fi
           {
             echo "## Published draft-20 PIM relay image"

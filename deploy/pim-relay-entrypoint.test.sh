@@ -41,4 +41,5 @@ echo "$out" | grep -q generate-cert && fail "--generate-cert leaked: $out"
 echo "$out" | grep -qx moq-lite || fail "moq-lite must reach the relay so it refuses it: $out"
 
 run --log-level >/dev/null && fail "--log-level without a value accepted"
+run --tls-cert /c --catalog-probe-deadline-ms >/dev/null && fail "--catalog-probe-deadline-ms without a value accepted"
 echo "pim-relay-entrypoint: ok"
