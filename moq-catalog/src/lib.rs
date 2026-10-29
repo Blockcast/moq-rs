@@ -164,6 +164,15 @@ pub struct Track {
         skip_serializing_if = "Option::is_none"
     )]
     pub keyframe_interval_ticks: Option<u64>,
+    /// Signed track timestamp of shared presentation time zero
+    /// (draft-ramadan-moq-mmt-01 §4.4.1). REQUIRED on synchronized
+    /// audio/video tracks (§12.1 Table 5); an absent value means a local
+    /// origin of 0. Forbidden on `fec-repair` tracks.
+    #[serde(
+        rename = "presentationAnchorTicks",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub presentation_anchor_ticks: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec: Option<FecDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -470,6 +479,7 @@ impl Root {
             || track.group_duration_ticks.is_some()
             || track.keyframe_interval_ms.is_some()
             || track.keyframe_interval_ticks.is_some()
+            || track.presentation_anchor_ticks.is_some()
             || track.fec.is_some()
         {
             return Err(CatalogValidationError::InvalidRepairTrack {
@@ -710,6 +720,39 @@ mod tests {
         );
         assert_eq!(root.tracks[0].codec.as_deref(), Some("avc1.640028"));
         assert_eq!(root.tracks[0].framerate, Some(29.97));
+    }
+
+    #[test]
+    fn accepts_signed_presentation_anchor_ticks_on_media_tracks() {
+        let root = parse_and_validate(
+            r#"{
+            "version":1,"streamingFormat":"mmtp","streamingFormatVersion":"x",
+            "tracks":[
+              {"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationTicks":180000,"presentationAnchorTicks":0},
+              {"name":"a","packaging":"mmtp","mmtpMode":"mfu","timescale":48000,"groupDurationTicks":96000,"presentationAnchorTicks":-1024}
+            ]
+        }"#,
+        );
+        assert_eq!(root.tracks[0].presentation_anchor_ticks, Some(0));
+        assert_eq!(root.tracks[1].presentation_anchor_ticks, Some(-1024));
+    }
+
+    #[test]
+    fn rejects_presentation_anchor_ticks_on_repair_track() {
+        let root: Root = serde_json::from_str(
+            r#"{
+            "version":1,"streamingFormat":"mmtp","streamingFormatVersion":"x",
+            "tracks":[
+              {"name":"v","packaging":"mmtp","mmtpMode":"mfu","timescale":90000,"groupDurationMs":1000,"presentationAnchorTicks":0,"fec":{"algorithm":"raptorq","sourceSymbols":8,"repairSymbols":4,"symbolSize":1312,"repairTrack":"v-repair"}},
+              {"name":"v-repair","packaging":"fec-repair","priority":240,"presentationAnchorTicks":0}
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            root.validate(),
+            Err(CatalogValidationError::InvalidRepairTrack { .. })
+        ));
     }
 
     #[test]
