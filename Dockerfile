@@ -137,6 +137,7 @@ FROM debian:bookworm-slim as moq-pub
 
 # Install required utilities and ffmpeg
 RUN apt-get update && \
+    apt-get upgrade -y --no-install-recommends && \
     apt-get install -y ffmpeg wget
 
 # Copy the publish script into the image
@@ -174,7 +175,10 @@ FROM image-provenance
 
 ARG PROFILE_KIND="default"
 
+# BLO-51928: -slim tags lag the -security suite; without an upgrade, base
+# packages (perl-base, zlib1g) ship with already-fixed CVEs.
 RUN apt-get update && \
+	apt-get upgrade -y --no-install-recommends && \
 	apt-get install -y --no-install-recommends ca-certificates curl libssl3 && \
 	rm -rf /var/lib/apt/lists/*
 
