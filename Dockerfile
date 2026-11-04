@@ -132,8 +132,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       cp /build/target/release/moq-pub-mmtp /usr/local/cargo/bin/moq-pub-mmtp; \
     fi
 
-# Create a pub image that also contains ffmpeg and a helper script
-FROM debian:bookworm-slim as moq-pub
+# Create a pub image that also contains ffmpeg and a helper script.
+# trixie, not bookworm, for every runtime stage: bookworm zlib1g 1.2.13 carries
+# CVE-2023-45853, which Debian will never fix there; trixie ships 1.3.1
+# (BLO-51951). The builder stays on bookworm: its glibc 2.36 binaries run on
+# trixie's 2.41, same as libmmt#695.
+FROM debian:trixie-slim as moq-pub
 
 # Install required utilities and ffmpeg
 RUN apt-get update && \
@@ -151,7 +155,7 @@ CMD [ "publish" ]
 
 # Validate image provenance in an independent stage so the contract can be
 # tested without compiling the Rust workspace.
-FROM debian:bookworm-slim AS image-provenance
+FROM debian:trixie-slim AS image-provenance
 ARG SOURCE_REVISION
 ARG BASE_REVISION
 
@@ -179,7 +183,7 @@ ARG PROFILE_KIND="default"
 # packages (perl-base, zlib1g) ship with already-fixed CVEs.
 RUN apt-get update && \
 	apt-get upgrade -y --no-install-recommends && \
-	apt-get install -y --no-install-recommends ca-certificates curl libssl3 && \
+	apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 && \
 	rm -rf /var/lib/apt/lists/*
 
 LABEL org.opencontainers.image.source=https://github.com/Blockcast/moq-rs
