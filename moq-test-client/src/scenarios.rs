@@ -37,6 +37,15 @@ const PUBLISH_NAMESPACE: &str = "moq-test/publish";
 /// Track name used for direct PUBLISH test operations
 const PUBLISH_TRACK: &str = "published-track";
 
+/// `base`, or `base/<suffix>` when --namespace-suffix is set, so repeated runs
+/// against one relay do not collide with a track a previous run left registered.
+fn test_namespace(args: &Args, base: &str) -> TrackNamespace {
+    match args.namespace_suffix.as_deref() {
+        Some(suffix) => TrackNamespace::from_utf8_path(&format!("{base}/{suffix}")),
+        None => TrackNamespace::from_utf8_path(base),
+    }
+}
+
 /// Helper to connect to a relay and establish a session
 /// Returns (session, connection_id, transport) so we can report CIDs for mlog correlation
 async fn connect(
@@ -113,7 +122,7 @@ pub async fn test_publish_namespace_only(args: &Args) -> Result<TestConnectionId
             .await
             .context("SETUP exchange failed")?;
 
-        let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
+        let namespace = test_namespace(args, TEST_NAMESPACE);
         let (_, _, reader) = Tracks::new(namespace.clone()).produce();
 
         tracing::info!("Sending PUBLISH_NAMESPACE for: {}", TEST_NAMESPACE);
@@ -231,7 +240,7 @@ pub async fn test_publish_namespace_subscribe(args: &Args) -> Result<TestConnect
             .await
             .context("subscriber SETUP failed")?;
 
-        let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
+        let namespace = test_namespace(args, TEST_NAMESPACE);
 
         let (mut pub_writer, _, pub_reader) = Tracks::new(namespace.clone()).produce();
         let _track_writer = pub_writer.create(TEST_TRACK);
@@ -294,7 +303,7 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
             .await
             .context("SETUP exchange failed")?;
 
-        let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
+        let namespace = test_namespace(args, TEST_NAMESPACE);
         let (_, _, reader) = Tracks::new(namespace.clone()).produce();
 
         tracing::info!("Sending PUBLISH_NAMESPACE: {}", TEST_NAMESPACE);
@@ -339,7 +348,7 @@ pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
             .await
             .context("publisher SETUP failed")?;
 
-        let namespace = TrackNamespace::from_utf8_path(PUBLISH_NAMESPACE);
+        let namespace = test_namespace(args, PUBLISH_NAMESPACE);
         let (track_writer, track_reader) = Track::new(namespace.clone(), PUBLISH_TRACK).produce();
 
         tracing::info!(
@@ -401,7 +410,7 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
                 .await
                 .context("subscriber SETUP failed")?;
 
-        let namespace = TrackNamespace::from_utf8_path(PUBLISH_NAMESPACE);
+        let namespace = test_namespace(args, PUBLISH_NAMESPACE);
         let (track_writer, track_reader) = Track::new(namespace.clone(), PUBLISH_TRACK).produce();
         let (mut sub_tracks, _, mut sub_reader) = Tracks::new(namespace.clone()).produce();
         let sub_track = sub_tracks
@@ -492,7 +501,7 @@ pub async fn test_subscribe_before_publish_namespace(args: &Args) -> Result<Test
             .await
             .context("subscriber SETUP failed")?;
 
-        let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
+        let namespace = test_namespace(args, TEST_NAMESPACE);
 
         let (mut sub_writer, _, _sub_reader) = Tracks::new(namespace.clone()).produce();
         let sub_track = sub_writer

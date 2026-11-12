@@ -59,6 +59,10 @@ pub struct Args {
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
 
+    /// Append this path segment to every test namespace (e.g. a per-attempt id)
+    #[arg(long, env = "MOQ_TEST_NAMESPACE_SUFFIX")]
+    pub namespace_suffix: Option<String>,
+
     /// Enable verbose output
     #[arg(short, long, env = "VERBOSE")]
     pub verbose: bool,
