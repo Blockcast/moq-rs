@@ -44,11 +44,11 @@ jobs:
     name: Resolve immutable source commit
     # BLO-39688: measured 9-26s of work over 10 green runs, against 0.7h-8.5h
     # queued on `default`. One `gh api` call and a regex -- no toolchain, no
-    # docker, no checkout. Moved to `arc-light` on work shape, not on a claim
+    # docker, no checkout. Moved off `default` on work shape, not on a claim
     # about that pool's latency.
-    runs-on:
-      group: public-repo-ci
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     # arc-light uses ARC's `eventual` update strategy: on a spec change no new
     # job for the scale set starts org-wide until the old EphemeralRunnerSet
     # drains, and this cap is the longest one job can pin that drain. The
@@ -215,9 +215,9 @@ jobs:
     needs: [resolve-source, capture]
     # BLO-39688: one `gh api .../statuses` POST. Measured 0s of work on every
     # run that reached it. Same reasoning as resolve-source above.
-    runs-on:
-      group: public-repo-ci
-      labels: arc-light
+    # GitHub-hosted: group 26 (public-repo-ci) admits only default-branch
+    # workflow refs, so a pull_request run cannot start there (BLO-55992).
+    runs-on: ubuntu-latest
     # Same arc-light drain-tolerance cap as resolve-source; see the note there.
     timeout-minutes: 5
     permissions:
