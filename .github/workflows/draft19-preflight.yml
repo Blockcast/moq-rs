@@ -115,7 +115,7 @@ jobs:
     name: Capture ${{ matrix.role }} draft-19 preflight
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: [resolve-source]
-    runs-on: default
+    runs-on: ubuntu-latest  # BLO-56666: PR-triggered; public repo leaves org group 1
     # A cargo build plus up to 8 publisher invocations, each with a 5s inner poll. A wedged
     # capture would otherwise hold an ARC runner for the 6h default.
     timeout-minutes: 30

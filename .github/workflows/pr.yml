@@ -17,7 +17,7 @@ env:
 
 jobs:
   reuse:
-    runs-on: default
+    runs-on: ubuntu-latest  # BLO-56666: PR-triggered; public repo leaves org group 1
     permissions:
       contents: read
     steps:
@@ -26,7 +26,7 @@ jobs:
         uses: fsfe/reuse-action@v5
 
   build:
-    runs-on: default
+    runs-on: ubuntu-latest  # BLO-56666: PR-triggered; public repo leaves org group 1
 
     steps:
       - uses: actions/checkout@v3
@@ -65,7 +65,7 @@ jobs:
       - run: cargo machete
 
   heap-profile-image:
-    runs-on: default
+    runs-on: ubuntu-latest  # BLO-56666: PR-triggered; public repo leaves org group 1
 
     steps:
       - uses: actions/checkout@v4
