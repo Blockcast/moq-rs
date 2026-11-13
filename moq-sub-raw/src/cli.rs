@@ -40,6 +40,13 @@ pub struct Args {
     #[arg(long)]
     pub await_namespace: bool,
 
+    /// Also write one line per received object to this file:
+    /// `track group subgroup object size sha256 ext=<hex>`, tab-separated.
+    /// Lets two subscribers' captures be compared object by object,
+    /// extension headers included.
+    #[arg(long, value_name = "PATH")]
+    pub object_log: Option<PathBuf>,
+
     /// Client-side UDP bind for the QUIC/WebTransport connection.
     #[arg(long, default_value = "[::]:0")]
     pub bind: std::net::SocketAddr,
