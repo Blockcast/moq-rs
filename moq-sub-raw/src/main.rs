@@ -14,7 +14,9 @@ mod cli;
 mod subscribe;
 
 use cli::Args;
-use subscribe::{drain_track_to_writer, namespace_published, validate_track_output_pairs};
+use subscribe::{
+    drain_track_to_writer, namespace_published, validate_track_output_pairs, ObjectLog,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,6 +67,14 @@ async fn main() -> Result<()> {
         None
     };
 
+    let object_log = match &args.object_log {
+        Some(path) => Some(ObjectLog::new(
+            std::fs::File::create(path)
+                .with_context(|| format!("creating object log `{}`", path.display()))?,
+        )),
+        None => None,
+    };
+
     let (mut tracks_writer, _request, mut tracks_reader) = Tracks::new(namespace.clone()).produce();
 
     // For each (track, output) pair: create the producer-side
@@ -90,11 +100,12 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("TracksReader::subscribe returned None for `{name}`"))?;
         let path = path.clone();
         let name = name.clone();
+        let object_log = object_log.clone();
         tasks.spawn(async move {
             let mut file = tokio::fs::File::create(&path)
                 .await
                 .with_context(|| format!("creating output `{}`", path.display()))?;
-            let n = drain_track_to_writer(track_reader, &mut file)
+            let n = drain_track_to_writer(track_reader, &mut file, object_log.as_ref())
                 .await
                 .with_context(|| format!("draining track `{name}`"))?;
             tracing::info!(

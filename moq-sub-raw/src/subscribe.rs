@@ -6,15 +6,61 @@
 // implementations; the real binary wires these into a session in
 // main.rs.
 
-use std::path::PathBuf;
+use std::{
+    io::Write,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use moq_transport::{
-    coding::TrackNamespace,
+    coding::{Encode, TrackNamespace},
+    data::ExtensionHeaders,
     serve::{TrackReader, TrackReaderMode},
     session::NamespaceEvent,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+/// One line per received object, shared by every track of a run:
+/// `track group subgroup object size sha256(payload) ext=<hex>`, tab-separated.
+/// `subgroup` is `-` for datagrams; `ext` is the wire encoding of the object's
+/// extension headers (`00` when there are none). Two subscribers' logs of one
+/// track can be joined on (track, group, object) to tell whether a relay
+/// changed any object's payload or extension headers in transit.
+#[derive(Clone)]
+pub struct ObjectLog(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl ObjectLog {
+    pub fn new(w: impl Write + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Box::new(w))))
+    }
+
+    pub fn record(
+        &self,
+        track: &dyn std::fmt::Display,
+        group: u64,
+        subgroup: Option<u64>,
+        object: u64,
+        payload: &[u8],
+        ext: &ExtensionHeaders,
+    ) -> Result<()> {
+        let mut enc = bytes::BytesMut::new();
+        ext.encode(&mut enc)
+            .map_err(|e| anyhow!("encode extension headers: {e:?}"))?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, payload);
+        let sub = subgroup.map_or_else(|| "-".to_string(), |s| s.to_string());
+        let mut w = self.0.lock().map_err(|_| anyhow!("object log poisoned"))?;
+        writeln!(
+            w,
+            "{track}\t{group}\t{sub}\t{object}\t{}\t{}\text={}",
+            payload.len(),
+            hex::encode(digest),
+            hex::encode(&enc)
+        )?;
+        w.flush()?;
+        Ok(())
+    }
+}
 
 /// Drain a track's payload bytes into `out`, in arrival order.
 ///
@@ -31,9 +77,11 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 ///
 /// Returns when the track's writer side closes (clean EOF) or the
 /// underlying reader is dropped.
+/// With `log`, every object is also recorded there (see [`ObjectLog`]).
 pub async fn drain_track_to_writer<W: AsyncWrite + Unpin>(
     track: TrackReader,
     out: &mut W,
+    log: Option<&ObjectLog>,
 ) -> Result<u64> {
     let mut bytes_written: u64 = 0;
     let mode = track.mode().await.context("track mode")?;
@@ -41,9 +89,23 @@ pub async fn drain_track_to_writer<W: AsyncWrite + Unpin>(
         TrackReaderMode::Subgroups(mut groups) => {
             while let Some(mut group) = groups.next().await.context("subgroups.next")? {
                 while let Some(mut object) = group.next().await.context("subgroup object.next")? {
+                    let mut payload = Vec::new();
                     while let Some(chunk) = object.read().await.context("object.read chunk")? {
                         out.write_all(&chunk).await.context("out.write_all chunk")?;
                         bytes_written += chunk.len() as u64;
+                        if log.is_some() {
+                            payload.extend_from_slice(&chunk);
+                        }
+                    }
+                    if let Some(log) = log {
+                        log.record(
+                            &track.name,
+                            group.group_id,
+                            Some(group.subgroup_id),
+                            object.info.object_id,
+                            &payload,
+                            &object.info.extension_headers,
+                        )?;
                     }
                 }
             }
@@ -54,6 +116,16 @@ pub async fn drain_track_to_writer<W: AsyncWrite + Unpin>(
                     .await
                     .context("out.write_all datagram")?;
                 bytes_written += datagram.payload.len() as u64;
+                if let Some(log) = log {
+                    log.record(
+                        &track.name,
+                        datagram.group_id,
+                        None,
+                        datagram.object_id,
+                        &datagram.payload,
+                        &datagram.extension_headers,
+                    )?;
+                }
             }
         }
         // Stream mode is not emitted by any in-repo publisher.
@@ -197,7 +269,7 @@ mod tests {
         drop(subgroups);
 
         let mut buf: Vec<u8> = Vec::new();
-        let n = drain_track_to_writer(track_reader, &mut buf)
+        let n = drain_track_to_writer(track_reader, &mut buf, None)
             .await
             .expect("drain ok");
         assert_eq!(n, b"alphabetagamma".len() as u64);
@@ -242,7 +314,7 @@ mod tests {
         };
 
         let mut buf: Vec<u8> = Vec::new();
-        let consumer = drain_track_to_writer(track_reader, &mut buf);
+        let consumer = drain_track_to_writer(track_reader, &mut buf, None);
 
         let (_, consumer_res) = tokio::join!(producer, consumer);
         consumer_res.expect("drain ok");
@@ -259,7 +331,7 @@ mod tests {
         drop(subgroups);
 
         let mut buf: Vec<u8> = Vec::new();
-        let n = drain_track_to_writer(track_reader, &mut buf)
+        let n = drain_track_to_writer(track_reader, &mut buf, None)
             .await
             .expect("drain ok");
         assert_eq!(n, 0);
@@ -292,10 +364,67 @@ mod tests {
         drop(datagrams);
 
         let mut buf: Vec<u8> = Vec::new();
-        let n = drain_track_to_writer(track_reader, &mut buf)
+        let n = drain_track_to_writer(track_reader, &mut buf, None)
             .await
             .expect("drain ok");
         assert_eq!(n, b"alphabetagamma".len() as u64);
         assert_eq!(buf, b"alphabetagamma");
+    }
+
+    /// A `Write` that hands its bytes back to the test.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn object_log_records_ids_payload_digest_and_extension_headers() {
+        let (track_writer, track_reader, _tw, _tr) = make_track_pair("v");
+        let mut subgroups = track_writer.subgroups().expect("subgroups mode");
+        let mut subgroup = subgroups
+            .create(Subgroup {
+                group_id: 7,
+                subgroup_id: 2,
+                priority: 0,
+            })
+            .expect("create subgroup");
+        subgroup
+            .write(Bytes::from_static(b"alpha"))
+            .expect("write 1");
+        let mut ext = ExtensionHeaders::new();
+        ext.set_intvalue(0x0a, 5);
+        let mut obj = subgroup.create(4, Some(ext)).expect("object 1");
+        obj.write(Bytes::from_static(b"be")).expect("chunk 1");
+        obj.write(Bytes::from_static(b"ta")).expect("chunk 2");
+        drop(obj);
+        drop(subgroup);
+        drop(subgroups);
+
+        let sink = Shared::default();
+        let log = ObjectLog::new(sink.clone());
+        let mut buf: Vec<u8> = Vec::new();
+        drain_track_to_writer(track_reader, &mut buf, Some(&log))
+            .await
+            .expect("drain ok");
+        assert_eq!(buf, b"alphabeta");
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let sha = |p: &[u8]| hex::encode(ring::digest::digest(&ring::digest::SHA256, p));
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(
+            lines[0],
+            format!("v\t7\t2\t0\t5\t{}\text=00", sha(b"alpha"))
+        );
+        // chunks of one object are hashed as one payload; the extension is kept
+        let f: Vec<&str> = lines[1].split('\t').collect();
+        assert_eq!(&f[..6], ["v", "7", "2", "1", "4", &sha(b"beta")]);
+        assert_ne!(f[6], "ext=00", "{text}");
     }
 }
